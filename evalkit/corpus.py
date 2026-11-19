@@ -51,7 +51,10 @@ class MemCorpus:
 
 
 class MemDirect:
-    """BM25 (k1 1.2, b 0.75) over leaf text and cosine over the stub embedding, fused by RRF (k 60, window 50)."""
+    """BM25 (k1 1.2, b 0.75) over leaf TEXT only and cosine over the stub embedding, fused by RRF (k 60, window 50).
+    The Elasticsearch leaf search also matches the title and entities fields (code-built, top terms of the leaf), which this
+    stand-in leaves out on purpose: the planted-advantage text fixture is built on that difference and does not transfer to
+    Elasticsearch (tests/security/test_eval_tenant_es.py runs the real stack and says what holds there)."""
 
     def __init__(self, leaves: Sequence[LeafRec], k1: float = 1.2, b: float = 0.75):
         self._leaves, self._k1, self._b = list(leaves), k1, b
