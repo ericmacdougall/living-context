@@ -789,8 +789,8 @@ owner: who labels).
 Every probe runs against the real gateway and real Elasticsearch with
 security on, drives the real writer (LAB-R9), asserts the number of checks run
 and no skips (LAB-R8), and has a broken-implementation control that must turn
-it red for its stated reason. Fixture: tenants `ta` and `tb`, each with classes
-`base` < `restricted`, plus a third tenant `tbx` whose name extends `tb`
+it red for its stated reason. Fixture: tenants `tena` and `tenb`, each with classes
+`base` < `restricted`, plus a third tenant `tenbx` whose name extends `tenb`
 (look-alike; ASSUMPTION), each with planted marker strings and marker vectors
 in every artefact kind, including authz records and query text.
 
@@ -805,13 +805,13 @@ durations).
 
 | Probe | What | N | Pass | Broken control that must fail |
 |---|---|---|---|---|
-| T1 read | with `ta`'s gateway session and, separately, with each of `ta`'s raw keys: search, get, mget, msearch, count, kNN, percolate, terms lookup, `_cat/indices`, `_field_caps`, `_mapping`, wildcard and comma index lists, alias names, against every `tb` and `tbx` index kind including `lc-tb-authz`; plus the cluster APIs `_cluster/state`, `_cat/shards`, `_cat/aliases`, `_tasks?detailed`, `_resolve/index`, `_search_shards`, `_nodes/stats`, `_cluster/stats` | every API x kind x direction, plus 300 randomised gateway requests with forged tenant fields and pointers | 0 results, 0 counts, 0 names, no query descriptions; 403 or the typed `unavailable` | role descriptor `lc-*`; gateway that reads tenant from the body; a key holding `cluster: monitor` (must leak through the cluster APIs) |
-| T2 write | `ta` writes into `tb` indices or names `tb` in a body | as T1 | refused | same |
-| T3 enumeration | does any normalised response, error, size, total or count differ when `tb` has 0 vs 10,000 leaves? | 300 paired requests | identical after normalisation | error text that names the index |
-| T4 routing and links | `ta`'s fan-out never asks a `tb` holder; no edge, member or note links across tenants | every recall in the stub loop | 0 | edge writer that resolves endpoints across tenants |
-| T5 availability | `ta` floods (8 idle connections, a 3 GiB line, 8 MiB lines, 2,000 concurrent recalls, model-bound tasks, a disk-fill write flood up to its byte cap); `tb`'s writes must succeed and `tb`'s recall p95 must stay under 1.5x its unloaded p95. Runs with a latency-injecting model stub that enforces one global concurrency of 2 and one shared embedder (the real contention points) | 3 runs of 10 minutes per flood kind | pass all; `ta` refused at its byte cap before the disk reaches the flood-stage watermark | no per-tenant caps; parse before admission (LAB-R5); no fair queue at the model port; no fair queue at the embedding port; no per-tenant byte cap |
+| T1 read | with `tena`'s gateway session and, separately, with each of `tena`'s raw keys: search, get, mget, msearch, count, kNN, percolate, terms lookup, `_cat/indices`, `_field_caps`, `_mapping`, wildcard and comma index lists, alias names, against every `tenb` and `tenbx` index kind including `lc-tenb-authz`; plus the cluster APIs `_cluster/state`, `_cat/shards`, `_cat/aliases`, `_tasks?detailed`, `_resolve/index`, `_search_shards`, `_nodes/stats`, `_cluster/stats` | every API x kind x direction, plus 300 randomised gateway requests with forged tenant fields and pointers | 0 results, 0 counts, 0 names, no query descriptions; 403 or the typed `unavailable` | role descriptor `lc-*`; gateway that reads tenant from the body; a key holding `cluster: monitor` (must leak through the cluster APIs) |
+| T2 write | `tena` writes into `tenb` indices or names `tenb` in a body | as T1 | refused | same |
+| T3 enumeration | does any normalised response, error, size, total or count differ when `tenb` has 0 vs 10,000 leaves? | 300 paired requests | identical after normalisation | error text that names the index |
+| T4 routing and links | `tena`'s fan-out never asks a `tenb` holder; no edge, member or note links across tenants | every recall in the stub loop | 0 | edge writer that resolves endpoints across tenants |
+| T5 availability | `tena` floods (8 idle connections, a 3 GiB line, 8 MiB lines, 2,000 concurrent recalls, model-bound tasks, a disk-fill write flood up to its byte cap); `tenb`'s writes must succeed and `tenb`'s recall p95 must stay under 1.5x its unloaded p95. Runs with a latency-injecting model stub that enforces one global concurrency of 2 and one shared embedder (the real contention points) | 3 runs of 10 minutes per flood kind | pass all; `tena` refused at its byte cap before the disk reaches the flood-stage watermark | no per-tenant caps; parse before admission (LAB-R5); no fair queue at the model port; no fair queue at the embedding port; no per-tenant byte cap |
 | T6 key space | a constructed collision in a 32-bit hash of tenant plus principal | 1 constructed pair plus 10,000 random | no shared lock, cache, rate or idempotency slot | 32-bit hash key (LAB-R1) |
-| T7 key invalidation | after invalidating `ta`'s keys, each fails within a fixed bound of 5 s (ASSUMPTION, fixed now; P6 measures the actual latency, and a measurement above 5 s fails T7 and is reported, the bound is not moved) | 100 | 0 successes after the bound; the gateway's own path refuses at once | gateway that caches an authenticated client |
+| T7 key invalidation | after invalidating `tena`'s keys, each fails within a fixed bound of 5 s (ASSUMPTION, fixed now; P6 measures the actual latency, and a measurement above 5 s fails T7 and is reported, the bound is not moved) | 100 | 0 successes after the bound; the gateway's own path refuses at once | gateway that caches an authenticated client |
 
 ### 9.2 Access classes (SEC-A)
 
