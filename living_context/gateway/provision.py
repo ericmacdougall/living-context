@@ -22,6 +22,9 @@ from .es import EsClient
 from .indices import (CLASS_KINDS, REGISTRY, TENANT_CLS, TENANT_KINDS, class_index, class_patterns, check_id,
                       may_provision, physical_name, role_pattern_is_safe, shards_per_tenant, tenant_index)
 
+# The erase role has no `manage` privilege, so the expunge threshold of every physical index is fixed when the index is
+# created: a segment with any deleted document is then a candidate for `only_expunge_deletes` (DESIGN 14.5).
+PURGE_SETTINGS = {"index.merge.policy.expunge_deletes_allowed": "0"}
 SLOWLOG_OFF = {f"index.{k}.slowlog.threshold.{q}.{lvl}": "-1"
                for k, qs in (("search", ("query", "fetch")), ("indexing", ("index",)))
                for q in qs for lvl in ("warn", "info", "debug", "trace")}
@@ -120,7 +123,7 @@ def provision_tenant(admin: EsClient, tenant: str, classes: list[str], *, key_di
     for alias, kind in names:
         phys = physical_name(alias)
         st, body = admin.request("PUT", f"/{phys}", {
-            "settings": {"number_of_shards": 1, "number_of_replicas": replicas, **SLOWLOG_OFF},
+            "settings": {"number_of_shards": 1, "number_of_replicas": replicas, **SLOWLOG_OFF, **PURGE_SETTINGS},
             "mappings": mapping_for(kind), "aliases": {alias: {}}})
         if st != 200:
             raise ProvisionRefused(f"create index failed ({st})")

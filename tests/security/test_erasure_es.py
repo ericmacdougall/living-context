@@ -102,6 +102,12 @@ class ErasureOnElasticsearch(unittest.TestCase):
         self.assertEqual(self.tree.levels, 2)
         Publisher(lambda: self.gate.client(T, "structure"), T, "base").publish(self.tree, watermark=30)
         self.admin.request("POST", f"/lc-{T}-*/_refresh")
+        # DESIGN 14.2: an upper node carries only `lin_nodes` and is reached by the upward walk. The build also copies the
+        # subject tokens upward (so a subject query alone would find it); strip them so only the walk can reach it.
+        st, r = self.admin.request("POST", f"/lc-{T}-base-node/_update_by_query?refresh=true&conflicts=proceed", {
+            "query": {"term": {"level": 2}}, "script": {"source": "ctx._source.lin_subjects = []", "lang": "painless"}})
+        self.assertEqual(st, 200, r)
+        self.assertGreaterEqual(r["updated"], 1, "the scenario has no upper node")
         return recs
 
     def executor(self, **kw):
@@ -158,6 +164,13 @@ class ErasureOnElasticsearch(unittest.TestCase):
         self.assertTrue(untouched, "unrelated nodes were rewritten too")
         self.assertEqual(self.writer().remember("tok", "base", f"again {self.email}").status, wmod.REFUSED)
         self.assertEqual(self.journal.last_seq, 1)
+
+    def test_every_physical_index_is_created_with_the_expunge_threshold(self):
+        st, r = self.admin.request("GET", f"/lc-{T}-*/_settings/index.merge.policy.expunge_deletes_allowed?flat_settings=true")
+        self.assertEqual(st, 200)
+        self.assertGreaterEqual(len(r), 6)
+        for name, v in r.items():
+            self.assertEqual(v["settings"].get("index.merge.policy.expunge_deletes_allowed"), "0", name)
 
     def test_broken_closure_without_the_upward_walk_leaves_an_upper_node(self):
         self.scenario()

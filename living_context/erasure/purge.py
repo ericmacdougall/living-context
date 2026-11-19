@@ -37,11 +37,25 @@ def deleted_count(es: EsClient, index: str) -> int:
     return int(r["_all"]["primaries"]["docs"]["deleted"])
 
 
+def ensure_expunge_threshold(es: EsClient, index: str) -> None:
+    """The threshold must be 0, or a segment holding under the default 10 percent deleted documents is never merged and the
+    count stays above zero for ever. The erase key cannot change settings (no `manage`); provisioning sets the value at
+    creation. A refused change is therefore accepted only when the index already carries 0; anything else is an error,
+    never a silent skip (the first build ignored the status and left one source index non-deterministically stuck)."""
+    st, _ = es.request("PUT", f"/{index}/_settings", {"index.merge.policy.expunge_deletes_allowed": "0"})
+    if st == 200:
+        return
+    st, r = es.request("GET", f"/{index}/_settings/index.merge.policy.expunge_deletes_allowed?flat_settings=true")
+    got = next(iter(r.values()), {}).get("settings", {}).get("index.merge.policy.expunge_deletes_allowed") if st == 200 and isinstance(r, dict) else None
+    if got not in ("0", 0):
+        raise PurgeError("the index does not carry expunge_deletes_allowed 0 and the key may not set it")
+
+
 def purge_index(es: EsClient, index: str, *, deadline_s: float = DEFAULT_DEADLINE_S, interval_s: float = DEFAULT_INTERVAL_S,
                 single_pass: bool = False, clock: Callable[[], float] = time.monotonic,
                 sleep: Callable[[float], None] = time.sleep) -> PurgeResult:
     """`single_pass` is the BROKEN variant used by tests: one expunge pass and no wait."""
-    es.request("PUT", f"/{index}/_settings", {"index.merge.policy.expunge_deletes_allowed": "0"})
+    ensure_expunge_threshold(es, index)
     es.request("POST", f"/{index}/_refresh")
     es.request("POST", f"/{index}/_flush")
     t0, passes = clock(), 0
