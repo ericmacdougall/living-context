@@ -31,6 +31,8 @@ from . import claude_cli, corpus, dataset as ds
 REGISTERED_S2 = (2391, 5454)           # EXPERIMENT 10.3
 # mean latency per call kind measured in S1 (EXPERIMENT 14.2), seconds: a FLOOR for real-size prompts
 LATENCY_S = {"route": 2.54, "organise": 3.80, "build_l1": 10.21, "build_upper": 3.00}
+# mean total input and output tokens per call measured in S1 (EXPERIMENT 14.2; fixture-sized inputs, so lower bounds for input)
+MEASURED_TOKENS = {"route": (2865, 98), "organise": (1255, 404), "build_l1": (2415, 1724), "build_upper": (2090, 176)}
 REGISTERED_PARTS = {"build": (381, 574), "edges": (330, 1100), "A1 recalls": (750, 1800), "SHUFFLED recalls": (750, 1800), "judge": (180, 180)}
 
 
@@ -113,6 +115,12 @@ def main(argv: Optional[list] = None) -> int:
     print("  S2 H1 calls: %d to %d; with the retry allowance up to %d" % (lo, hi, hi + retry_allow))
     print("  registered S2 row (all arms, edges, judge): %d to %d; its H1 part (build + two recall sets): %d to %d" % (
         REGISTERED_S2[0], REGISTERED_S2[1], rep["registered_h1_part"][0], rep["registered_h1_part"][1]))
+    print("  by kind (calls low to high | S1-measured mean input/output tokens and latency per call):")
+    by = {"build_l1": (shape["l1_calls"], shape["l1_calls"]), "build_upper": (shape["upper_calls"], shape["upper_calls"]),
+          "route": (recalls * band["route_min"], recalls * band["route_max"]), "organise": (0, recalls * band["organise_max"])}
+    for k, (l, h) in by.items():
+        print("    %-12s %5d to %5d | %5d in, %5d out | %.2f s" % (k, l, h, MEASURED_TOKENS[k][0], MEASURED_TOKENS[k][1], LATENCY_S[k]))
+    rep["by_kind"] = {k: {"low": l, "high": h} for k, (l, h) in by.items()}
     print("  wall time floor at the S1-measured latencies: %.1f to %.1f h at concurrency 1 (the port serialises calls), %.1f to %.1f h at the "
           "registered concurrency 2; real prompts are larger than S1's, so these are floors" % (
               rep["hours_floor_concurrency_1"][0], rep["hours_floor_concurrency_1"][1], rep["hours_floor_concurrency_2"][0],
