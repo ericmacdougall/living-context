@@ -95,6 +95,23 @@ class TreeBuild(unittest.TestCase):
         up = [n for n in tree.nodes.values() if n.level == 2]
         self.assertTrue(all(n.lin_nodes and not n.lin_leaf_ids for n in up))  # upper nodes reach leaves transitively
 
+    def test_runtime_sentinel_every_node_title_comes_from_build_title(self):
+        from unittest import mock
+        with mock.patch.object(title, "build_title", lambda *a, **k: "SENTINELTITLE"):
+            with tempfile.TemporaryDirectory() as d:
+                tree = build.build_tree(self.leaves[:300], port(d), "tena", "base")
+        self.assertTrue(tree.nodes)
+        self.assertEqual({n.title for n in tree.nodes.values()}, {"SENTINELTITLE"})
+
+    def test_no_content_title_mode_gives_empty_node_titles(self):
+        title.set_mode(title.MODE_NO_CONTENT)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                tree = build.build_tree(self.leaves[:300], port(d), "tena", "base")
+        finally:
+            title.set_mode(title.MODE_TFIDF)
+        self.assertEqual({n.title for n in tree.nodes.values()}, {""})
+
     def test_a_single_upper_node_is_dropped_and_a_failed_call_aborts(self):
         small = [l for l in self.leaves[:200]]
         with tempfile.TemporaryDirectory() as d:

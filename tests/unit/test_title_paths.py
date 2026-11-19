@@ -45,8 +45,17 @@ def title_writes(source: str) -> list[int]:
             for k, v in zip(n.keys, n.values):
                 if isinstance(k, ast.Constant) and k.value == "title" and not is_allowed_value(v):
                     bad.append(k.lineno)
+        elif isinstance(n, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+            t = n.target
+            if isinstance(t, ast.Name) and t.id == "title" and n.value is not None and not is_allowed_value(n.value):
+                bad.append(n.lineno)
+            if (isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant) and t.slice.value == "title"
+                    and n.value is not None and not is_allowed_value(n.value)):
+                bad.append(n.lineno)
         elif isinstance(n, ast.Assign):
             for t in n.targets:
+                if isinstance(t, (ast.Tuple, ast.List)) and any(isinstance(e, ast.Name) and e.id == "title" for e in t.elts):
+                    bad.append(n.lineno)  # unpacking into `title` hides the source of the value
                 if isinstance(t, ast.Name) and t.id == "title" and not is_allowed_value(n.value):
                     bad.append(n.lineno)
                 if (isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant) and t.slice.value == "title"
@@ -67,7 +76,8 @@ class TitlePaths(unittest.TestCase):
     def test_the_scan_sees_planted_second_paths(self):
         for planted in ('d = {"title": model_text}', 'doc["title"] = summary', "make(title=text[:40])",
                         'x = {"title": build_title(a) + "x"}', 'x = {"title": src.get("summary")}', 'x = {"title": e["summary"]}', 'x = {"title": "free text"}',
-                        'x = {"title": e["title"] if e else summary}', "title = text[:40]"):
+                        'x = {"title": e["title"] if e else summary}', "title = text[:40]", "title: str = summary", "title += summary", "title, x = a, b", "(title := summary)",
+                        'doc.update(dict(title=summary))'):
             self.assertTrue(title_writes(planted), planted)
         for fine in ('d = {"title": build_title(t)}', "make(title=title.build_title(t))", 'x = r.get("title")', 'x = {"title": src.get("title", "")}', 'm = {"title": {"type": "text"}}',
                      'x = {"title": e["title"]}', 'x = {"title": ""}', 'x = {"title": e["title"] if e else ""}', "title = build_title(t)", 'x = make(title=title)'):
