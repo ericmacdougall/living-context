@@ -1223,3 +1223,25 @@ Nothing in these revisions was run except the dataset measurements marked
 MEASURED, the gate simulation of 7.3 (`evalkit/gate_power.py`) and the budget
 arithmetic of 10.3 (`evalkit/budget.py`), both plain Python with no model
 calls; their printed numbers are quoted as printed.
+
+## 14. Amendments
+
+Each amendment is committed alone, before the run it affects, and moves no hypothesis, arm definition, threshold, statistic or
+control of sections 1 to 8.
+
+### 14.1 DEVIATION (order only): S1 before S0 (2026-11-19)
+
+- Registered: S0 (both checkpoints) passes before S1 (section 10, order in 10.3).
+- Amended: stage S1 runs before S0 completes. Reason: the owner asked, in chat on 2026-11-19, for the first question (H1,
+  tree with agent routing against flat search) to be measurable in parallel with the security and plan-order build, and approved
+  the 25-call canary for it. S1 touches no tenant data and no security-relevant path; its question is whether each task kind
+  returns schema-valid output through the real model client and what each call costs.
+- Scope: stage S1 only, the canary of section 10, on the synthetic fixture (no dataset content), with the headless CLI on the
+  subscription and the Sonnet tier (X5, X7). Hard cap of 25 real model calls in total, enforced by the durable counter that is
+  charged before every call; call 26 is refused without starting a process. This amendment approves nothing after S1: S2, S3,
+  S6-H1 and every later stage still need the owner's approval of that stage and its cap, and the fresh set stays unreleased.
+- What it does not change: S0 must still pass in full before any stage that the registered order places after it relies on a
+  security claim; S1's results make no security claim.
+- Consequence for reading S1: its figures describe the client and the prompts on a fixture of synthetic notes, where token counts
+  per character differ from English text. Section 10.2 is replaced by measured figures only through the separate amendment that
+  follows the run, which states the prompt sizes beside each figure.
