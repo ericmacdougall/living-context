@@ -1299,3 +1299,16 @@ stage do not change, because S1 measures tokens and time, not how many calls a s
 The hours are a floor and not a promise: the measured latencies come from 22 sequential calls on short prompts, the subscription's
 sustained limits were not exercised (no call was throttled), and S2 measures calls per 5-hour window (section 10, S2 gate).
 The rest of 10.3 (S6-H2 and the loop stages) is not restated here.
+
+### 14.3 DEVIATION (order only): S2 and S3 before S0 completes (2026-11-19)
+
+- Registered: S0 (both checkpoints) passes before S1, and the stages follow in the order of 10.3. Amendment 14.1 moved S1 ahead of S0.
+- Amended: stages S2 and S3 also run before S0 completes, for the H1 arms only (the part of each stage's row that the first question
+  needs). Reason: the owner approved stages S2, S3 and S6-H1 in chat on 2026-11-19 after seeing their call ranges and caps (S2 5,454,
+  S3 17,252, S6-H1 35,574 calls; Sonnet through the headless CLI on the subscription), to measure H1 in parallel with the security
+  and plan-order build. The caps are hard and each stage still has its own start, so S6-H1 does not start with S2 and S3.
+- Scope: S2 and S3 as rows of section 10, H1 arms only. Not covered by the amended runs and not claimed: A2 and edge typing, the relevance
+  judge on three pools, C1 and C2, and the S2 holder-log check (RUN-S2). Their figures are exploratory development figures on the pilot
+  split (7.4) and decide nothing.
+- What it does not change: S0 must still pass in full before any stage that relies on a security claim; these stages make none. No
+  hypothesis, arm, threshold or statistic moves, and the held-out and fresh question sets stay unloaded.
