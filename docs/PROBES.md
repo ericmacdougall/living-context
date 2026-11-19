@@ -78,3 +78,9 @@ server).
 Not verified: multi-node behaviour of P6, P8, P9, P10 and P14; a real disk
 (the P14 volume is a tmpfs); the gateway's behaviour under the P14 blocks
 (Step 15).
+
+## Measured limits
+
+| Item | Measurement | Limit |
+|---|---|---|
+| Keystore `VACUUM` after each destroy (`Keystore.destroy`) | fleet host, Python 3.12, ext4, 64-byte payloads, five destroys each: 3 ms at 1,000 keys (217 KB file); 167 to 184 ms at 100,000 keys (20 MB file) | A destroy rewrites the whole file, so its cost grows linearly with the keys of that tenant (about 1.7 microseconds per key). One call destroys a whole set of leaves with one `VACUUM` (`leaf_ids=`), and a call that finds no key does none. A tenant with millions of keys needs the keystore split by class or a different residue-free delete; not built. |
