@@ -3,14 +3,15 @@
   python -m evalkit.run_h1 --stage DEV-STUB ...   no model call; stub model and stub embedder; a smoke of the data path on development
                                                   questions, never a stage result
   python -m evalkit.run_h1 --stage S2 ...         refuses to start until ALL of: the owner's approval of S2 with its call cap is passed in
-                                                  (`--approved-cap`, `--approval-ref`), a real embedding port exists (it does not yet: the
+                                                  (`--approved-cap`, `--approval-ref`), the pinned real embedder is in use (`--embed-dir`; the
                                                   stub's hashed bag of words would hand flat search a weakened baseline and bias H1 toward A1),
-                                                  the commit is named, the run directory holds no earlier stamp, and the questions are
-                                                  development (pilot) questions
+                                                  the commit is named, the run directory holds no earlier stamp (or `--resume` of the same stamp:
+                                                  same commit, cap and question count) and no stop file, and the questions are development
+                                                  (pilot) questions; the body of the stage is `run_s2`
 
 Scope of the S2 runner: arms A0, A1, A1-tree-only and SHUFFLED-SUMMARIES on the pilot haystack pool, with the registered statistics
 labelled EXPLORATORY (EXPERIMENT 7.4: development numbers decide nothing). A2, the relevance judge on three pools and C1/C2 of the S2
-row are not part of this runner (A2 and the judge belong to the other build stream; C1 and C2 are Step 21). A0+LEN is reported only when
+row are not part of this runner (docs/RUN-S2.md says what each would take). A0+LEN is reported only when
 a beta fitted on development is passed (S3 fits it and freezes it).
 
 All model calls go through `claude_cli.CappedPort` over one durable counter whose cap is the approved cap. The held-out and fresh
@@ -26,7 +27,7 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
-from living_context.embed import stub as embed_stub
+from living_context.embed import e5, stub as embed_stub
 
 from . import arms, dataset as ds, stats
 from .score import question_scores, write_result
@@ -36,6 +37,7 @@ SEED = ds.SPLIT_SEED
 
 
 def check_prereqs(a, *, embed=embed_stub.embed) -> List[str]:
+    """`embed` is the embedder object the stage would use (anything but a pinned real embedder is refused in S2)."""
     """Reasons the run must not start. An empty list means every guard passed."""
     why: List[str] = []
     if a.stage not in STAGES:
@@ -47,17 +49,32 @@ def check_prereqs(a, *, embed=embed_stub.embed) -> List[str]:
             why.append("S2 needs the owner's approval of the stage with its call cap (--approved-cap)")
         if not (a.approval_ref or "").strip():
             why.append("S2 needs a reference to the owner's approval (--approval-ref)")
-        if embed is embed_stub.embed:
-            why.append("PREREQUISITE MISSING: the real embedding port (multilingual-e5-small at the pinned revision, BUILD-PLAN 1.3) is not "
-                       "built; the stub embedder weakens flat search and biases H1")
+        try:
+            e5.require_real(embed, stage="S2")
+        except e5.PinError:
+            why.append("the pinned real embedder (multilingual-e5-small, BUILD-PLAN 1.3) is required; the stub embedder weakens flat search and "
+                       "biases H1")
         if not (a.commit or "").strip():
             why.append("S2 needs the commit under test (--commit)")
         if a.model_kind != "claude":
             why.append("S2 uses the real model port (--model-kind claude)")
-        if a.n_questions > 30:
+        if a.n_questions != 30:
             why.append("S2 is registered on 30 pilot questions")
-    if (Path(a.run_dir) / "STAMP.json").exists() and not a.resume:
+        if getattr(a, "a0_fields", "strong") not in ("strong", "text"):
+            why.append("--a0-fields must be strong or text")
+    stamp = Path(a.run_dir) / "STAMP.json"
+    if stamp.exists() and not a.resume:
         why.append("a stamped run already exists in the run directory (one stamped run per stage; --resume continues the same run)")
+    if stamp.exists() and a.resume and a.stage == "S2":
+        try:
+            old = json.loads(stamp.read_text())
+        except ValueError:
+            old = {}
+        for k, now in (("commit", a.commit), ("cap", a.approved_cap), ("n_questions", a.n_questions), ("a0_fields", getattr(a, "a0_fields", "strong"))):
+            if old.get(k) != now:
+                why.append("--resume must continue the same run: %s differs from the stamp (a new cap needs a new approval and a new run)" % k)
+    if a.stage == "S2" and (Path(a.run_dir) / "STOP").exists():
+        why.append("a stop file is present in the run directory; remove it to start or resume")
     return why
 
 
@@ -97,11 +114,27 @@ def main(argv: Optional[list] = None) -> int:
     ap.add_argument("--commit", default="")
     ap.add_argument("--beta", type=float, default=None)
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--embed-dir", default="", help="directory of the pinned multilingual-e5-small files (S2; checksums are verified)")
+    ap.add_argument("--threads", type=int, default=6)
+    ap.add_argument("--a0-fields", default="strong", choices=["strong", "text"],
+                    help="BM25 fields of A0 and of A1's direct list: strong = text,title,entities (default, the stronger baseline); text = text only")
+    ap.add_argument("--max-retries", type=int, default=3, help="throttle retries per call before the stage pauses")
+    ap.add_argument("--base-delay", type=float, default=30.0, help="first throttle back-off in seconds (doubles, capped at 600)")
     a = ap.parse_args(argv)
-    why = check_prereqs(a)
+    embedder = None
+    if a.stage == "S2" and a.embed_dir:
+        try:
+            embedder = e5.E5Embedder(a.embed_dir, threads=a.threads)
+        except e5.PinError as e:
+            print("REFUSED:\n  the embedder files are not the pinned ones: %s" % e)
+            return 2
+    why = check_prereqs(a, **({"embed": embedder} if a.stage == "S2" else {}))
     if why:
         print("REFUSED:\n  " + "\n  ".join(why))
         return 2
+    if a.stage == "S2":
+        from . import run_s2
+        return run_s2.run(a, pick_questions, embedder=embedder)
     run_dir = Path(a.run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "STAMP.json").write_text(json.dumps({"stage": a.stage, "commit": a.commit, "started": time.time()}))

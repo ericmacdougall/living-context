@@ -152,14 +152,16 @@ class TreeRetriever:
     """Runs the real fan-out (`Recall`) over a pinned view through a model port; returns the tree list only. Any typed
     failure of the whole recall (refusal, budget) is a failed recall (scores 0, counted), never a silent empty list."""
 
-    def __init__(self, port, view, tenant: str, cls: str, principal: str, consts: Optional[Constants] = None, *, salt: str = "lc"):
+    def __init__(self, port, view, tenant: str, cls: str, principal: str, consts: Optional[Constants] = None, *, salt: str = "lc",
+                 workers: int = 8):
         self.port, self.view, self.tenant, self.cls, self.principal = port, view, tenant, cls, principal
-        self.consts, self.salt = consts, salt
+        self.consts, self.salt, self.workers = consts, salt, workers      # workers 1 makes the call order deterministic (resume)
         self.failures = 0
 
     def __call__(self, query: str) -> TreeOut:
         try:
-            res = Recall(self.port, self.tenant, self.cls, self.principal, consts=self.consts, salt=self.salt).recall(query, self.view)
+            res = Recall(self.port, self.tenant, self.cls, self.principal, consts=self.consts, salt=self.salt,
+                         workers=self.workers).recall(query, self.view)
         except (PortRefused, BudgetExceeded) as e:
             self.failures += 1
             return TreeOut([], False, type(e).__name__)

@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from evalkit import run_h1
-from living_context.embed import stub as embed_stub
+from living_context.embed import e5, stub as embed_stub
 
 
 def args(**kw):
@@ -16,29 +16,54 @@ def args(**kw):
     return argparse.Namespace(**base)
 
 
-def real_embed(text):          # stands in for a real embedding port; any callable that is not the stub
-    return [0.0]
+class RealEmbed:               # stands in for the pinned real embedder (the guard checks the pin, not the model)
+    is_real, model_id = True, e5.MODEL_ID
+    def passage(self, t): return [0.0]
+    query = passage
+
+
+real_embed = RealEmbed()
 
 
 class Guards(unittest.TestCase):
     def test_s2_with_everything_but_a_real_embedding_port_is_refused_for_that_reason(self):
         why = run_h1.check_prereqs(args())
         self.assertEqual(len(why), 1)
-        self.assertIn("real embedding port", why[0])
+        self.assertIn("pinned real embedder", why[0])
 
     def test_s2_with_every_prerequisite_passes_the_guards(self):
         self.assertEqual(run_h1.check_prereqs(args(), embed=real_embed), [])
 
+    def test_the_stub_embedder_cannot_be_selected_in_a_real_stage(self):
+        for emb in (embed_stub, embed_stub.embed, None, object()):
+            why = run_h1.check_prereqs(args(), embed=emb)
+            self.assertTrue(any("pinned real embedder" in w for w in why), emb)
+
+    def test_resume_must_continue_the_same_run(self):
+        import json
+        d = tempfile.mkdtemp()
+        Path(d, "STAMP.json").write_text(json.dumps({"commit": "abc1234", "cap": 6000, "n_questions": 30, "a0_fields": "strong"}))
+        self.assertEqual(run_h1.check_prereqs(args(run_dir=d, resume=True), embed=real_embed), [])
+        for kw, word in ((dict(commit="zzz"), "commit"), (dict(approved_cap=9000), "cap"), (dict(a0_fields="text"), "a0_fields")):
+            why = " ".join(run_h1.check_prereqs(args(run_dir=d, resume=True, **kw), embed=real_embed))
+            self.assertIn("differs from the stamp", why)
+            self.assertIn(word, why)
+
+    def test_a_stop_file_blocks_start_and_resume(self):
+        d = tempfile.mkdtemp()
+        Path(d, "STOP").write_text("")
+        self.assertTrue(any("stop file" in w for w in run_h1.check_prereqs(args(run_dir=d), embed=real_embed)))
+
     def test_each_missing_prerequisite_is_named(self):
         for kw, word in ((dict(approved_cap=0), "call cap"), (dict(approval_ref=""), "approval"), (dict(commit=""), "commit"),
-                         (dict(model_kind="stub"), "real model port"), (dict(n_questions=31), "30 pilot"),
+                         (dict(model_kind="stub"), "real model port"), (dict(n_questions=31), "30 pilot"), (dict(n_questions=12), "30 pilot"),
                          (dict(splits=["test"]), "pilot split"), (dict(splits=["pilot", "held_back"]), "pilot split")):
             why = " ".join(run_h1.check_prereqs(args(**kw), embed=real_embed))
             self.assertIn(word, why, kw)
 
     def test_a_second_stamped_run_is_refused_and_resume_is_allowed(self):
         d = tempfile.mkdtemp()
-        Path(d, "STAMP.json").write_text("{}")
+        Path(d, "STAMP.json").write_text('{"commit": "abc1234", "cap": 6000, "n_questions": 30, "a0_fields": "strong"}')
         self.assertTrue(any("stamped run" in w for w in run_h1.check_prereqs(args(run_dir=d), embed=real_embed)))
         self.assertEqual(run_h1.check_prereqs(args(run_dir=d, resume=True), embed=real_embed), [])
 
