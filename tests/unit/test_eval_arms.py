@@ -113,7 +113,7 @@ class Scorers(unittest.TestCase):
 
     def test_abstention_questions_are_excluded_and_a_failed_call_scores_zero_and_is_counted(self):
         outs = {"q1": ArmOut([], ["S1"]), "q2": ArmOut([], [], failed=True), "q3_abs": ArmOut([], ["S9"])}
-        gold = {"q1": ["S1"], "q2": ["S2"], "q3_abs": []}
+        gold = {"q1": ["S1"], "q2": ["S2"], "q3_abs": ["S9"]}   # an abstention question that still lists a gold session
         sc, failed = question_scores(outs, gold, {"q3_abs"})
         self.assertEqual((sc, failed), ({"q1": 1.0, "q2": 0.0}, 1))
         self.assertIn("q3_abs", question_scores(outs, gold, {"q3_abs"}, broken_include_abstention=True)[0])
@@ -173,7 +173,7 @@ class Statistics(unittest.TestCase):
 
     def test_wilson_is_refused_for_a_measure_not_declared_binary(self):
         with self.assertRaises(stats.StatsError):
-            stats.wilson(stats.Measure("opens_per_recall", "count"), 120, 100)
+            stats.wilson(stats.Measure("opens_per_recall", "count"), 50, 100)
         lo, hi = stats.wilson(stats.Measure("tree_only", "binary"), 0, 100)
         self.assertEqual(lo, 0.0)
         self.assertAlmostEqual(hi, 3.84 / 103.84, places=3)   # EXPERIMENT 7.4: 3.7% at N = 100
