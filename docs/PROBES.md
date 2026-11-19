@@ -52,7 +52,7 @@ Elasticsearch 9.5.6, Linux 6.8.
 | Id | Verdict | N | Observed |
 |---|---|---|---|
 | P1 | PASS | 10 | rrf, linear, DLS, FLS refused with a licence error; `semantic_text` mapping accepted but indexing refused (403); `bbq_disk`, lexical percolate, int8_hnsw kNN at 384 dims, alias and force merge work |
-| P2 | FAIL | 94 | as above (names-only `_mget` channel on an alias); decision record `docs/decisions/P2-names-only-channel.md`, `main, ASSUMPTION`, awaiting the owner |
+| P2 | FAIL | 94 | as above (names-only `_mget` channel on an alias); decision record `docs/decisions/P2-names-only-channel.md`, accepted by the owner with mitigations |
 | P3 | PASS | 1 | the credential file authenticates; 0 container log lines and 0 environment values hold it |
 | P4 | PASS | 3 | storing a `knn` query in a percolator field is refused ("the [knn] query is unsupported inside a percolator query"), top level and inside `bool`; a stored match query is accepted (control) |
 | P5 | PASS | 200 | 200 refresh rounds under 6 writers, 0 acknowledged writes missing after a returned refresh, 0 retirement updates invisible; the broken variant without the refresh is red (millions of misses counted); realtime GET works without refresh |

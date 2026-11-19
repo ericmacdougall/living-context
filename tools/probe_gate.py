@@ -8,7 +8,8 @@ A result file `tools/probes/results/<id>.json` is current when
 All of P1 to P16 must be current for any step 1 to 22. A verdict other than
 PASS (FAIL, LIMITED, ERROR) for a probe the step depends on is accepted only
 for FAIL and LIMITED, and only when a decision record exists in docs/decisions/
-naming the probe id, the verdict, the mitigation and "main, ASSUMPTION".
+naming the probe id, the verdict, the mitigation and a `Decided by:` line that
+names who decided (the project owner or main).
 Verdicts are stated relative to the probe's expected result (P4 returning
 "unsupported" is a PASS; see probe_p4_percolate_knn.py).
 
@@ -43,12 +44,13 @@ def pinned_digest(root: Path) -> str | None:
 
 
 def decision_ok(root: Path, pid: str, verdict: str) -> bool:
-    """A decision record is a file in docs/decisions naming the probe, the verdict, a mitigation and `main, ASSUMPTION`."""
+    """A decision record is a file in docs/decisions naming the probe, the verdict, a mitigation and a `Decided by:` line
+    that names the owner or main. A record with no such line, or one naming anyone else, is refused."""
     d = root / "docs" / "decisions"
     for f in sorted(d.glob("*.md")) if d.is_dir() else []:
         t = f.read_text()
         if (re.search(rf"^Probe:\s*{pid}\s*$", t, re.M) and re.search(rf"^Verdict:\s*{verdict}\s*$", t, re.M)
-                and re.search(r"^Mitigation:\s*\S", t, re.M) and "main, ASSUMPTION" in t):
+                and re.search(r"^Mitigation:\s*\S", t, re.M) and re.search(r"^Decided by:.*\b(owner|main)\b", t, re.M | re.I)):
             return True
     return False
 

@@ -3,7 +3,6 @@
 Probe: P2
 Verdict: FAIL
 Decided by: the project owner: accept with mitigations (relayed by the coordinating agent; the owner's wording is held in the ticket record)
-Earlier label: main, ASSUMPTION (superseded by the owner's decision; the phrase stays because the probe gate looks for it in a record of a FAIL)
 Status: decided. The probe still reports FAIL as worded and its result file is unchanged. P2 no longer forces `S0 INCOMPLETE`; every other open item still does.
 
 ## What failed

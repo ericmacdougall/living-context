@@ -30,7 +30,7 @@ def make_root(verdicts=None):
     return root
 
 
-def write_decision(root, pid, verdict, mitigation="gateway never forwards the error", who="main, ASSUMPTION"):
+def write_decision(root, pid, verdict, mitigation="gateway never forwards the error", who="main (ASSUMPTION)"):
     d = root / "docs" / "decisions"
     d.mkdir(exist_ok=True)
     (d / f"{pid}.md").write_text(f"Probe: {pid}\nVerdict: {verdict}\nDecided by: {who}\nMitigation: {mitigation}\n")
@@ -78,12 +78,21 @@ class GateTests(unittest.TestCase):
 
     def test_decision_must_carry_every_field(self):
         root = make_root({"P2": "FAIL"})
-        write_decision(root, "P2", "FAIL", who="the owner")  # not labelled main, ASSUMPTION
+        write_decision(root, "P2", "FAIL", who="somebody else")  # names neither the owner nor main
         self.assertTrue(probe_gate.gate(root, 5))
+        write_decision(root, "P2", "FAIL", who="the project owner")  # the owner may decide
+        self.assertEqual(probe_gate.gate(root, 5), [])
         write_decision(root, "P2", "FAIL", mitigation="")
         self.assertTrue(probe_gate.gate(root, 5))
         write_decision(root, "P2", "LIMITED")  # wrong verdict named
         self.assertTrue(probe_gate.gate(root, 5))
+
+    def test_fail_with_no_decision_line_is_refused(self):
+        root = make_root({"P2": "FAIL"})
+        d = root / "docs" / "decisions"
+        d.mkdir(exist_ok=True)
+        (d / "P2.md").write_text("Probe: P2\nVerdict: FAIL\nMitigation: gateway never forwards the error\nmain owner ASSUMPTION\n")
+        self.assertTrue(any("P2" in w and "decision" in w for w in probe_gate.gate(root, 5)))
 
     def test_error_verdict_is_never_excused_by_a_decision(self):
         root = make_root({"P15": "ERROR"})
