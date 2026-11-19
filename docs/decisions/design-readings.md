@@ -30,3 +30,21 @@ Each entry names the passages, the reading the build follows and the test that k
   `epsilon / n` is the same number when epsilon is the number of exploration slots in the digest, and wrong when epsilon is read
   as the share (0.1) and k is above 1. The code logs k / n; `tests/unit/test_exploration.py` checks the logged value against the
   measured inclusion frequency and shows the share-over-n variant red.
+
+## Edge construction (DESIGN 5.5, 7.7, 8.6, 16; main-accepted reading ASSUMPTION, listed by the Step 12 owner)
+
+- 7.7 types "the top 3 by similarity" but also draws candidates from "leaves sharing an entity". The build ranks entity-sharing
+  candidates first for the three typing slots, then by similarity; an edge to a shared-entity leaf of low similarity would
+  otherwise never be typed. The A2 gain test (`tests/security/test_edges_es.py`) depends on it and RANDOM-EDGES removes the gain.
+- 5.5 says the erased edge version "which the tombstone records" keeps a re-created edge's counter above it. The build keeps the
+  counter in its own `ec:<edge_id>` document (ids and one number, kind `counter`, which erasure keeps), written by compare-and-set
+  at every new version, so the counter is above every version that ever existed whether or not an erasure deleted the documents.
+  Step 14 may mirror the highest erased version into the tombstone; the test deletes the version and re-creates the edge.
+- Entities come from code (`graph/entities.py`: a capitalised word of four letters or more that does not start a sentence), the
+  stub's stand-in for a model-extracted list; the leaf projection stores them in `entities`.
+- 8.6 gives "type weight x weight x decay x specificity": the build reads type weight as the type's initial weight of 16.2 and
+  weight as the stored (confirmable) weight; decay is 1.0 until the decay interface is built after H1.
+- The degree count and the supersedes-cycle check read searchable edges plus the writer's own unrefreshed writes (one gateway
+  process holds the writer); a second writer process would need a realtime source for both.
+- 16.3 "set valid_to on the older leaf's head" is not built in Step 12; a `supersedes` edge is written and the expander returns the
+  superseding partner with a superseded leaf.

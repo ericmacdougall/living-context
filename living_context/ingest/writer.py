@@ -35,6 +35,7 @@ from ..gateway import validator
 from ..gateway.gate import NoGate
 from ..gateway.es import EsClient
 from ..gateway.indices import TENANT_CLS, class_index, tenant_index
+from ..graph import entities
 from ..ids import new_leaf_id
 from ..keystore.store import Keystore, KeystoreError
 from . import segment, subjects, title
@@ -78,7 +79,8 @@ def _now() -> str:
 class Writer:
     def __init__(self, es: Callable[[], EsClient], keystore: Keystore, tenant: str, guard: subjects.Guard, *,
                  consts: Optional[Constants] = None, embed: Callable[[str], list] = embed_stub.embed,
-                 pause: Optional[Callable[[str], None]] = None, use_cas: bool = True, gate=None):
+                 pause: Optional[Callable[[str], None]] = None, use_cas: bool = True, gate=None, write_path=None):
+        self._wp = write_path  # a structure.watermark.WritePath: a job opens at allocation and stays open until the link job finishes
         self._es_fn, self._ks, self.tenant, self._guard = es, keystore, tenant, guard
         self._c = consts or Constants()
         self._embed, self._pause, self._use_cas = embed, pause or (lambda step: None), use_cas
@@ -194,16 +196,22 @@ class Writer:
             leaf_id, lv, seq = claim
         else:
             leaf_id, lv, seq = new_leaf_id(), 1, self.next_seq()
-        self._pause("allocated")
-        tokens = sorted({self._ks.subject_token(s) for s in declared + subjects.identifiers(text)})
-        self._append_source(cls, leaf_id, lv, seq, text, tokens, source_ref)
-        self._pause("source")
-        self._project(cls, leaf_id, lv, seq, text, tokens)
-        self._pause("projection")
-        self.advance_head(cls, leaf_id, lv)
-        self._pause("head")
-        self._enqueue(cls, leaf_id, lv, seq)
-        self._pause("queued")
+        job = self._wp.begin(seq) if self._wp is not None else None
+        try:
+            self._pause("allocated")
+            tokens = sorted({self._ks.subject_token(s) for s in declared + subjects.identifiers(text)})
+            self._append_source(cls, leaf_id, lv, seq, text, tokens, source_ref)
+            self._pause("source")
+            self._project(cls, leaf_id, lv, seq, text, tokens)
+            self._pause("projection")
+            self.advance_head(cls, leaf_id, lv)
+            self._pause("head")
+            self._enqueue(cls, leaf_id, lv, seq)
+            self._pause("queued")
+        except BaseException:
+            if job is not None:
+                self._wp.finish(job, ok=False)   # a failed write-path job is counted and no longer holds P back
+            raise
         if refresh:
             self._es.request("POST", f"/{class_index(self.tenant, cls, 'leaf')}/_refresh")
         if claim is not None:
@@ -336,7 +344,7 @@ class Writer:
 
     def _project(self, cls, leaf_id, lv, seq, text, tokens) -> None:
         doc = self._base("leaf", cls, lin_subjects=tokens, lin_leaf_ids=[leaf_id], src_seq=seq, text=text,
-                         title=title.build_title(text, n=self._c.title_terms), entities=[],
+                         title=title.build_title(text, n=self._c.title_terms), entities=entities.extract(text),
                          size_tokens=segment.tokens_of(text, self._c.chars_per_token_bound),
                          embedding=self._embed(text), embed_model=EMBED_MODEL, valid_from=_now(),
                          content_hash=self._ks.digest("content", text.encode()))
