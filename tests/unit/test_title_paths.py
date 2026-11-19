@@ -23,6 +23,14 @@ def is_allowed_value(node) -> bool:
         return True
     if isinstance(node, ast.Attribute) and node.attr == "title":  # reading a stored title off a hit
         return True
+    if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant) and node.slice.value == "title":
+        return True  # `entry["title"]`: a stored title passed through (output shaping), not a second source of titles
+    if isinstance(node, ast.Name) and node.id == "title":
+        return True  # a parameter or local named title: every assignment to such a name is scanned below
+    if isinstance(node, ast.Constant) and node.value == "":
+        return True  # the empty placeholder (an erased node's title, a missing entry) carries no text
+    if isinstance(node, ast.IfExp):
+        return is_allowed_value(node.body) and is_allowed_value(node.orelse)
     return isinstance(node, ast.Dict) and any(isinstance(k, ast.Constant) and k.value == "type" for k in node.keys)
 
 
@@ -39,6 +47,8 @@ def title_writes(source: str) -> list[int]:
                     bad.append(k.lineno)
         elif isinstance(n, ast.Assign):
             for t in n.targets:
+                if isinstance(t, ast.Name) and t.id == "title" and not is_allowed_value(n.value):
+                    bad.append(n.lineno)
                 if (isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant) and t.slice.value == "title"
                         and not is_allowed_value(n.value)):
                     bad.append(n.lineno)
@@ -56,9 +66,11 @@ class TitlePaths(unittest.TestCase):
 
     def test_the_scan_sees_planted_second_paths(self):
         for planted in ('d = {"title": model_text}', 'doc["title"] = summary', "make(title=text[:40])",
-                        'x = {"title": build_title(a) + "x"}', 'x = {"title": src.get("summary")}'):
+                        'x = {"title": build_title(a) + "x"}', 'x = {"title": src.get("summary")}', 'x = {"title": e["summary"]}', 'x = {"title": "free text"}',
+                        'x = {"title": e["title"] if e else summary}', "title = text[:40]"):
             self.assertTrue(title_writes(planted), planted)
-        for fine in ('d = {"title": build_title(t)}', "make(title=title.build_title(t))", 'x = r.get("title")', 'x = {"title": src.get("title", "")}', 'm = {"title": {"type": "text"}}'):
+        for fine in ('d = {"title": build_title(t)}', "make(title=title.build_title(t))", 'x = r.get("title")', 'x = {"title": src.get("title", "")}', 'm = {"title": {"type": "text"}}',
+                     'x = {"title": e["title"]}', 'x = {"title": ""}', 'x = {"title": e["title"] if e else ""}', "title = build_title(t)", 'x = make(title=title)'):
             self.assertEqual(title_writes(fine), [], fine)
 
     def test_build_title_is_defined_once(self):
