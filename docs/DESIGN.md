@@ -1,8 +1,11 @@
 # living-context: design
 
-Status: design of record for the first build, revised once after an
-adversarial review (findings F1 to F21, M1 to M5; EXPERIMENT.md section 13
-maps each to its fix). Nothing below has been run.
+Status: design of record for the first build, revised twice after
+adversarial reviews (first review: findings F1 to F21, M1 to M5, cited as
+"review F<n>"; second review: findings F1 to F14, cited as "review 2, F<n>";
+EXPERIMENT.md section 13 maps each to its fix). The second revision removed
+mechanism where it could (the evaluation cache, the betting confidence
+sequence, gists in returned pointers). Nothing below has been run.
 Every claim about behaviour is a target until the experiment in
 [EXPERIMENT.md](EXPERIMENT.md) or a probe in [BUILD-PLAN.md](BUILD-PLAN.md)
 records it.
@@ -127,17 +130,24 @@ https://arxiv.org/html/2410.14052v3), is also COMPARISON only (arm C2).
 - INV-6 Immutable versions. Leaf versions, node versions, edge versions and
   manifests are never edited, with one sanctioned exception: an erasure
   rewrite (section 14.4), which is recorded.
-- INV-7 Pointers only. Recall returns pointers with titles, gists, sizes and
-  short reasons, never leaf content; a reason is at most 12 words and shares no
-  5-gram with the facts, gists or leaf text it was produced from (8.2); content
-  is reached only by a logged lookup.
+- INV-7 Pointers only. A returned pointer carries the pointer, a title, the
+  size, the holder path, a reason and a confidence, nothing else: no gist, no
+  fact, no leaf text (review 2, F11). Titles and reasons are at most 12 words,
+  and every title, reason and organise outline label shares no 5-gram with the
+  leaf text, facts or gists it derives from (8.2, 8.3). Gists and facts stay
+  inside holders, which see their children's entries. Content is reached only
+  by a logged lookup. Remaining limit: a very short leaf (a few words) can be
+  guessed from its title (20).
 - INV-8 Tombstones are honoured by every path that can write, rebuild,
   replay, restore or re-ingest, through one shared guard (LAB-R4). Tombstones
   live in a journal outside the snapshot timeline as well as in the store, so
   no restore can predate them (14.6).
 - INV-9 No principal's request is cancelled, blocked or terminated because of
-  another principal's request, with one exception: revoking a principal
-  discards that principal's own unsent output. Revocation never waits on, and
+  another principal's request, with two exceptions: revoking a principal
+  discards that principal's own unsent output; and an erasure's publication
+  step holds its own tenant's write gate, which delays (never refuses) that
+  tenant's commits for at most `B_ERASE` (14.3; never another tenant's).
+  Revocation never waits on, and
   never depends on, any action of the revoked party; it is one fixed statement
   on a table the gateway owns (4.4; LAB-R2, LAB-R3).
 - INV-10 Every lock, cache, rate-limit and idempotency key embeds the tenant id
@@ -191,8 +201,10 @@ These are woven through the data model (5), both paths (7, 8) and the loop
   trimmed set; edges in the join class's index; one typed `unavailable` for
   forbidden, erased and missing (8.7).
 - Revocation the revoked party cannot block: one unconditional update of an
-  authority epoch in a table the gateway owns in memory (journalled locally,
-  persisted to Elasticsearch best-effort), checked at every request, every
+  authority epoch in a table the gateway owns in memory (`revoke` returns once
+  memory denies; durability in a bounded per-tenant local journal is reported
+  separately, and a journal failure closes that tenant; persisted to
+  Elasticsearch best-effort), checked at every request, every
   fan-out wave and under a send fence before every hand-off to the socket, on a
   reserved admission lane; an operator break-glass revoke; two administrators to
   revoke an administrator or revoker; no self-grant; class-grant removal bumps
@@ -206,18 +218,23 @@ These are woven through the data model (5), both paths (7, 8) and the loop
 
 - Lineage from every derived artefact to its source leaves and subjects is in
   the artefact itself, written atomically with it (INV-4, 5).
-- Erasing a subject or item: tombstone, redact set at once, fence, key
+- Erasing a subject or item: under the tenant's write gate, compute the full
+  closure, then publish the tombstone and the complete redact set together in
+  one step (the erasure boundary, within `B_ERASE` of the request); then key
   destruction, deletion, in-code rewrite of every affected node in every
   retained generation, purge, verification with a positive control, receipt
-  (14). It reaches summaries up the tree, edges, the offered/opened/used log,
+  (14). "Erased" is promised from the boundary, not from the request. It
+  reaches summaries up the tree, edges, the offered/opened/used log,
   stored queries and their embeddings, reflection notes, judge labels, cached
   model outputs, old generations, replay sets, authz records, and every
   artefact shaped by the person's queries or by others' queries that mention
-  them (14.2). A class relabel is an erasure of the old-class copy at once
-  (14.1).
+  them (14.2). A class relabel is an erasure of the old-class copy,
+  effective when the relabel call returns at its boundary (14.1).
 - Restores cannot resurrect: tombstones are kept in a journal outside the
-  snapshot timeline and applied to every restore of Elasticsearch and of the
-  keystore before anything is served (14.6).
+  snapshot timeline; every restore of Elasticsearch or of the keystore applies
+  it, replays the erasure closure over every restored index (authz and control
+  included), and passes the independent verifier's residue checks before the
+  tenant is enabled (14.6).
 - Verified by a separate verifier with planted canaries that it must first
   find, including canaries in query text, authz records and plaintext logs
   (14.7; EXPERIMENT 9.4).
@@ -225,14 +242,17 @@ These are woven through the data model (5), both paths (7, 8) and the loop
 ### VERSIONING
 
 - What is versioned: leaves, nodes, edges, members, whole structures
-  (generations per class and family; edges and members carry generation
-  ranges, so a pinned reader sees a stable tree and a stable graph) (13.1).
+  (generations per class and family; each edge and member version carries
+  `src_seq` or `gen_from` plus a `gen_to` set, so a pinned reader sees a
+  stable tree and a stable graph) (13.1).
 - Pinning: a task pins generations at its first recall; leaf pointers never
   depend on the tree; node pointers resolve in their generation, then `moved`
   or `expired`; edges and members are visible by the task's pinned write-path
   watermark (write-path versions) or the pinned generation's ancestry (rebuild
   and reorganiser versions), so a candidate's edges are invisible until the gate adopts it
-  (13.2).
+  (13.2). P and generation heads are published only after the documents they
+  cover are searchable, and ancestry ids are kept for the life of the class
+  (5.6), so the visible set cannot change under a pinned task.
 - Coexistence with erasure: per-version source keys erase all source versions
   and their snapshots; derived history is rebuildable and holds ids, not
   content; the one place where they conflict, erasure wins (14.4,
@@ -281,7 +301,8 @@ These are woven through the data model (5), both paths (7, 8) and the loop
   (SOURCE: https://www.elastic.co/blog/lucenes-handling-of-deleted-documents),
   so a key kept there could not be destroyed within a stated bound.
 - Also outside Elasticsearch, both owned by the gateway: the authority-epoch
-  table (authoritative in memory, with a local append-only journal; 4.4) and
+  table (authoritative in memory, with a bounded, preallocated local journal
+  per tenant; 4.4) and
   the per-tenant tombstone journal (append-only, hash-chained, replicated to a
   second location outside the snapshot timeline; 14.6). Everything else,
   including the encrypted source log, sessions, grants, a best-effort copy of
@@ -349,26 +370,63 @@ atomic with the send.
 
 - The epoch table is the gateway's own. Each (tenant, principal) has an
   authority epoch held in gateway memory. `revoke` is one gateway call that,
-  under the exclusive side of that principal's send fence, increments the epoch
-  and sets status revoked in memory, appends the change to the gateway's local
-  append-only epoch journal (fsync), and returns. Persisting the epoch to
-  `lc-<t>-authz` is best-effort and retried; no step of `revoke` waits on
-  Elasticsearch. On start, the gateway rebuilds the table from the journal and
-  from `lc-<t>-authz`, taking the higher epoch of the two. No lock that the
+  under the exclusive side of that principal's send fence, increments the epoch,
+  sets status revoked and discards the principal's gateway-owned unsent
+  buffers, all in memory; it then releases the fence and returns `denied`
+  (review 2, F9). No revocation or send fence is held across any disk or
+  network I/O. Durability is reported separately: after the return, outside
+  any fence, the change is appended to the tenant's epoch journal and fsynced;
+  the revoke receipt records `denied_at` (set before the call returns) and
+  `durable_at` (set when the fsync completes), and the revoking administrator
+  or tool reads both. A revoke without `durable_at` is re-issued (revoke is
+  idempotent). Persisting the epoch to `lc-<t>-authz` is best-effort and
+  retried; no step of `revoke` waits on Elasticsearch. No lock that the
   revoked principal can hold, no compare-and-set it could contend, no eviction
   protocol (LAB-R2, LAB-R3). PENDING_REAL_TEST P14: revoke still takes effect
   at once with `lc-<t>-authz` blocked read-only and with the disk at flood
   stage.
+- The epoch journal is bounded (review 2, F9). The epoch state is a small map
+  (principal token to epoch and status; at most `N_PRINCIPALS = 10,000` per
+  tenant, ASSUMPTION), so each tenant has one preallocated journal file of
+  fixed size (`J_SIZE = 4 MiB`, ASSUMPTION, allocated at provisioning, so
+  another tenant filling the disk cannot take its space): a snapshot of the
+  map followed by checksummed change records. When the records fill half the
+  file, compaction writes a fresh snapshot into a second preallocated file,
+  fsyncs it and renames it over the first; the file never grows. The gateway
+  appends a start record when it opens the journal and, on a clean stop, a
+  shutdown record written only after every pending append and fsync has
+  completed; a stop that cannot drain them within `D_FSYNC` writes no
+  shutdown record, so the tenant is closed on start.
+- Fail closed. A tenant is closed (every principal of the tenant denied) when
+  an append or fsync of its journal fails (no space, I/O error) or does not
+  complete within `D_FSYNC = 2 s` (ASSUMPTION), or when on start its journal is
+  incomplete: a torn or checksum-failing record, a half-written compaction, or
+  no shutdown record after the last start record, which is what any crash
+  leaves. So a crash between denial in memory and the append cannot quietly
+  re-admit a revoked principal. A closed tenant stays closed until a tenant
+  administrator re-establishes grants: the operator's break-glass call reopens
+  the closed tenant to its administrators' grant calls only, and they re-grant
+  or confirm every other principal. Other tenants are unaffected (their
+  journals are separate files). The operational cost, every tenant closed
+  after an unclean gateway restart, is a stated limit (20). On a complete
+  journal, the gateway rebuilds the table from the journal and from
+  `lc-<t>-authz`, taking the higher epoch of the two.
 - Send fence, per principal (review F14b). Every hand-off of response bytes to
   the kernel takes the shared side of the principal's fence, re-checks the
-  epoch, and makes one non-blocking socket write; whatever the kernel does not
+  epoch and, for a response that read tenant content, the tenant's published
+  tombstone sequence (if an erasure boundary published after the response's
+  reads covers any item the response carries, 14.3, the response is aborted:
+  its unsent bytes are discarded and the request ends with a typed failure,
+  counted, INV-11, which the client may re-issue; a boundary that covers
+  nothing in the response, such as one in a class outside the reader's read
+  set, changes nothing), and makes one non-blocking socket write; whatever the kernel does not
   accept stays in a gateway-owned buffer and is sent by later hand-offs, each
   with the same check. No blocking I/O happens under the fence, so a slow or
   stalled reader cannot hold it; its duration is bounded by the gateway's own
   code (target under 1 ms), not by the peer. `revoke` takes the exclusive side
   (writer-preferring, so new hand-offs cannot starve it), flips the epoch,
-  discards that principal's gateway-owned unsent buffers and closes its
-  connections. Consequence: after the flip, no byte of any response is handed
+  discards that principal's gateway-owned unsent buffers, releases the fence
+  and only then closes its connections. Consequence: after the flip, no byte of any response is handed
   to the kernel for the revoked principal; bytes handed over before the flip
   (at most the socket send buffer, set to 64 KiB, ASSUMPTION) may still arrive.
   A test hook injects a delay between the epoch check and the hand-off, so the
@@ -467,7 +525,9 @@ later shapes (an artefact whose `lin_queries` or `evidence` names it).
   The cap is never exceeded (section 7.2).
 - `_id = leaf_id:lv`. `leaf_id` is 128 random bits, stable for life, never
   reused. `lv` is an integer version.
-- Fields: plaintext `text` (english analyser), `title`, `entities` keyword[],
+- Fields: plaintext `text` (english analyser), `title` (the code-built title,
+  the leaf's top 4 tf-idf terms, set at store, 7.4; it cannot contain a
+  5-gram of the text, 8.2), `entities` keyword[],
   `size_tokens`, `embedding` dense_vector (384 dims, cosine, `index_options`
   pinned to `int8_hnsw`; SOURCE: dense-vector reference says `bbq_disk`
   needs Enterprise, so never rely on the default), `embed_model` (id and
@@ -581,10 +641,18 @@ later shapes (an artefact whose `lin_queries` or `evidence` names it).
   whose placement the build summarised; a batch rebuild sets it to the
   write-path watermark P read at its start, and a reorganiser candidate copies
   its parent's W, also on rebase, so W never decreases along an ancestry), the
-  parent generation, its ancestry (the chain of adopted
-  generation numbers within retention), status (building, candidate, live,
-  rejected, retired), the builder job, and the tombstone sequence it honours.
-  Generation numbers are allocated by a per-class counter and never reused.
+  parent generation, its ancestry (every adopted generation number of that
+  class and family since its first generation), status (building, candidate,
+  live, rejected, retired), the builder job, and the tombstone sequence it
+  honours. Generation numbers are allocated by a per-class counter and never
+  reused.
+- Ancestry ids are kept for the life of the class, independently of content
+  retention (review 2, F5): they are a list of integers, one per adopted
+  generation, and the visibility rule (13.2) needs all of them, because an
+  adopted edge or member can outlive its `gen_from` generation and a retired
+  one must stay retired after its `gen_to` generation expires. Retention expiry
+  (13.2) removes the content of expired generations (their unshared node
+  documents), never ancestry ids.
 - The head (`_id = hd:<family>`, in the class's control index) names the live
   generation and is flipped only by compare-and-set on
   `if_seq_no`/`if_primary_term`.
@@ -593,10 +661,20 @@ later shapes (an artefact whose `lin_queries` or `evidence` names it).
   every write-path job (placement 7.5, link creation 7.7) for every sequence up
   to s has finished: written, or failed and counted (INV-11). A job still open
   after `D_WP` (10 minutes, ASSUMPTION) is cancelled in process and joined, so it can write
-  nothing more; then the documents it wrote are deleted and it counts as
-  failed, and only then does P move past it. P never decreases. Because the
+  nothing more; then the documents it wrote are deleted, it counts as
+  failed, the searchable-publication refresh below runs after those deletes,
+  and only then does P move past it. P never decreases. Because the
   source sequence is per tenant, one P serves every class, including edges
   stored in a join class.
+- Searchable publication (review 2, F4). Members and edges are found by search
+  (terms queries), which sees a write only after a refresh. So P is advanced,
+  and a generation head is flipped (by a build, an adoption or a rollback),
+  only after an explicit `_refresh` of every member, edge and node index that
+  the covered writes touched (including `gen_to` retirement updates) has
+  returned. Acknowledgement of a write is never taken as visibility. With this
+  barrier, a task that pins P and a head sees the same members and edges for
+  its whole life (13.2). PENDING_REAL_TEST P5 (extended): a refresh that has
+  returned makes every write acknowledged before it searchable.
 - Readers pin a generation by reading the head once per task, and read P once
   at the same time; everything below the roots is reached by explicit
   versioned ids, so a pinned reader sees an unchanging tree regardless of later
@@ -658,8 +736,10 @@ later shapes (an artefact whose `lin_queries` or `evidence` names it).
   (LAB-R4; the trade-off is that keeping an HMAC lets the erasure role confirm
   that a given identifier was erased; open question O-5), and the highest
   erased version of each erased edge id (5.5). Tombstones stay in the tenant's
-  `lc-<t>-ctl` (they hold ids and HMACs, no class and no content) and are
-  written first to the tenant's tombstone journal (14.6).
+  `lc-<t>-ctl` (they hold ids and HMACs, no class and no content), are
+  appended to the tenant's tombstone journal at the erasure boundary (14.3,
+  14.6), and are held in gateway memory for the guard (loaded from the journal
+  at start).
 
 ### 5.10 Authz indices (`lc-<t>-authz`) and the tenant registry (`lc-sys-registry`)
 
@@ -761,7 +841,9 @@ above 80% of `cluster.max_shards_per_node` (ASSUMPTION threshold).
 ### 6.5 Settings
 
 - `refresh_interval` 1 s; `number_of_replicas` 0 on the single-node test
-  cluster; dense vectors 384 dims, cosine, `int8_hnsw`.
+  cluster; dense vectors 384 dims, cosine, `int8_hnsw`. Correctness never
+  relies on the periodic refresh: publication of P and heads (5.6) and the
+  erasure boundary (14.3) refresh explicitly first.
 - `index.merge.policy.expunge_deletes_allowed` set to 0 on erasable indices if
   accepted (PENDING_REAL_TEST P9; fallback copy-and-swap).
 - `search.allow_expensive_queries` must stay true for percolate (SOURCE:
@@ -850,7 +932,8 @@ it performs.
    leaf_id, lv, subject tokens).
 2. Append the ciphertext source document (`lc-<t>-src`).
 3. Embed outside Elasticsearch (stub or E5; section 18.3).
-4. Index the plaintext leaf projection with lineage (`lc-<t>-<c>-leaf`).
+4. Index the plaintext leaf projection with lineage and its code-built title
+   (5.2) (`lc-<t>-<c>-leaf`).
 5. Create or advance the leaf head with compare-and-set.
 6. Enqueue the leaf for placement and linking (a dirty-queue document in ctl).
 
@@ -884,8 +967,9 @@ with expiry) so one builder runs at a time.
    generation's W is that P (5.6).
 2. For each level-1 node with pending members: one build call over the full
    text of its new children (at most `F_MAX` leaves, about 18k to 37k tokens)
-   returns, for each new child, a title, a one- or two-line gist, entities and
-   up to three verbatim facts; the node summary is refreshed when it has 4 or
+   returns, for each new child, a title (at most 12 words, checked against
+   the leaf text as in 8.2), a one- or two-line gist, entities and up to three
+   verbatim facts (gists and facts are for holders only, INV-7); the node summary is refreshed when it has 4 or
    more new children or its size changed by 25% or more (ASSUMPTION; SOURCE
    pattern: update only the ancestor path, HLTM,
    https://arxiv.org/html/2604.26197v1). Otherwise the node gets a new version
@@ -896,19 +980,28 @@ with expiry) so one builder runs at a time.
    record maps old node id to new node ids for G+1. Members of the old nodes
    get G+1 added to their `gen_to`; members of the new nodes are written with
    `gen_from` = G+1 (5.3).
-4. Propagate new versions up the ancestor path (path copying); apply the
+4. Propagate new versions up the ancestor path (path copying), each new
+   node version's title built and checked as in 8.2; apply the
    index-of-indexes rule at the top.
-5. Write the manifest for G+1 (status building), then compare-and-set the
-   head from G to G+1. If the compare-and-set fails, another builder won: this
-   builder discards its unshared node versions and re-runs from the new head
+5. Write the manifest for G+1 (status building), refresh the indices written
+   (searchable publication, 5.6), then compare-and-set the head from G to
+   G+1. If the compare-and-set fails, another builder won: this builder
+   discards its unshared node versions and re-runs from the new head
    (rebase). Leaves written after W stay pending for the next batch.
-6. Before the flip, the builder checks the tenant's tombstone sequence: if any
-   tombstone newer than the one it started with intersects its inputs'
-   lineage, it aborts (erasure fence, section 14.3).
+6. The commit (the writes of steps 3 to 5) runs under the shared side of the
+   tenant's write gate (14.3). Before the flip, the builder checks the
+   tenant's published tombstone sequence: if any tombstone newer than the one
+   it started with intersects its inputs' lineage, it aborts.
 
-A failed build call leaves the node at its previous version with
-`summary_status=failed`; the leaves stay reachable by the direct search and by
-their pending membership. Failures are counted (INV-11).
+A generation never publishes a W that it does not represent (review 2, F6).
+If the build call for any level-1 node with pending members up to W fails
+(timeout, refusal, malformed output), the whole generation is aborted: no
+head flip, its unshared documents are deleted, and the batch is retried
+later. The members stay pending (their `src_seq` is above the live W), so
+holders still see them as pending entries and tree-only recall still reaches
+them; the direct search finds them as before. Failures are counted (INV-11).
+A node whose build keeps failing therefore holds W back for its class: the
+tree stays complete but its titles and gists stay stale (limit, 20).
 
 ### 7.7 Link creation on write (OWNER "relational cross linking";
 "run background searches ... while doing memory addition/updates")
@@ -952,13 +1045,21 @@ All three touch only indices of classes in the read set (INV-2).
 - Reasons (review F11): at most 12 words by schema. A reason that shares any
   5-gram (after lowercasing and tokenising) with the facts, gists or leaf text
   in that holder's input is dropped and counted as a typed reason failure; the
-  selection itself stands. So leaf sentences cannot travel up the tree without
+  selection itself stands. Titles get the same check when they are built
+  (7.6): a title is at most 12 words and shares no 5-gram with its leaf's
+  text; a title that fails is replaced by the code-built title (the leaf's
+  top 4 tf-idf terms, which cannot contain a 5-gram) and counted (review 2,
+  F11). This covers every title a node holds for a child, leaf or node, at
+  every level (7.6 steps 2 and 4), checked against the leaf text, facts and
+  gists the child derives from; a leaf's own stored `title` (5.2) is the
+  code-built title. Gists and facts are holder input only; they are never copied into
+  what a holder returns. So leaf sentences cannot travel up the tree without
   a logged lookup (INV-7).
 - Pending members (placed since the last batch: `src_seq` above W of the
   pinned generation and at most the pinned P, so without a title or gist yet;
   review M1) are shown to holders as entries with a code-built title (the
-  leaf's top tf-idf terms), its size, and the flag `pending`; no gist and no
-  facts.
+  leaf's top 4 tf-idf terms, which cannot contain a 5-gram), its size, and the
+  flag `pending`; no gist and no facts.
 - A node with more child entries than fit `H_CTX` (for example many pending
   members between rebuilds, or a node over `F_MAX` awaiting a split) is asked
   in chunks of at most `F_MAX` entries, in parallel; the chunks' answers are
@@ -998,11 +1099,15 @@ All three touch only indices of classes in the read set (INV-2).
   (OWNER "size and total size"), and, if two or more children returned
   non-empty results, one organise call groups the pointers into a short
   labelled outline with one-line reasons (OWNER "summing and organizing").
+  Outline labels and reasons pass the same 5-gram check as holder reasons
+  (8.2) against the facts, gists and leaf text in the organise call's input;
+  a failing label is replaced by the holder path and counted.
   A holder with a single non-empty child passes its result up unchanged
   (ASSUMPTION, to save calls; ablation "organise at every parent").
-- What travels up is pure reference: pointer, title, gist, size, the path of
-  holder ids, reasons (checked as in 8.2) and confidences. No leaf text leaves
-  the holder.
+- What travels up is pure reference: pointer, title, size, the path of
+  holder ids, reasons (checked as in 8.2) and confidences. No gist, fact or
+  leaf text leaves the holder (review 2, F11: a one-sentence leaf's gist is the
+  whole leaf, so returning gists would hand over content without a lookup).
 - Sizes, totals and counts are computed over what was presented to that
   holder, which is already trimmed to the reader's classes (INV-2). No "N
   hidden items" figure exists anywhere.
@@ -1010,9 +1115,13 @@ All three touch only indices of classes in the read set (INV-2).
 ### 8.4 The digest and what the originating agent can do
 
 The digest (the owner's "tight summary") holds: the organised outline, the
-pointer list in rank order, sizes and the total, node pointers for unopened
-branches, the pinned generations, and a section per source (tree, direct
-search, linked). Rank order (pre-registered in EXPERIMENT 5.1; review F9):
+pointer list in rank order (each pointer with the fields of INV-7 only:
+pointer, title, size, path, reason, confidence), sizes and the total, node
+pointers for unopened branches (with the node's title from its parent's
+child entry, its size and total), the pinned generations, and a section per
+source (tree, direct search, linked). Pointers from the direct and linked
+sources carry the leaf's stored title, never its text; a leaf that the tree
+also offered shows the tree's child title. Rank order (pre-registered in EXPERIMENT 5.1; review F9):
 the tree list (holder confidence, then shallower depth, then path order), the
 direct list (8.5) and the linked list (8.6, by edge score) are each cut at 50
 and fused by client-side RRF with k = 60, ties broken by a salted hash of the
@@ -1085,7 +1194,7 @@ the `linked` section, tagged `edge`.
 | Errors | one typed `unavailable` for forbidden, erased, relabelled away and missing |
 | Logs and notes | log rows and notes take the join class (INV-3), so a low-class reorganiser never sees a high-class query |
 | Model cache | entry class = join of prompt and inputs; prompt-bearing entries scoped per principal, so neither content nor cache-hit timing crosses classes or principals (5.8) |
-| Holder reasons | at most 12 words, no 5-gram shared with the input's facts, gists or text (8.2) |
+| Holder reasons, titles, outline labels | no gist or fact is returned; titles and reasons at most 12 words; none shares a 5-gram with the leaf text, facts or gists it derives from (8.2, 8.3); a very short leaf can still be guessed from its title (20) |
 | Receipts | an erasure requester sees totals over its own read set only (4.3) |
 | Cluster-level APIs | no gateway or tenant key has a cluster privilege (6.3) |
 | Elasticsearch and gateway log files | no request bodies, slow logs off, grepped by the verifier (6.5, 14.7) |
@@ -1133,9 +1242,14 @@ mentions, and the offered item's subjects; 5), lin_leaves`.
   inserted in the last `L` insert batches (so new leaves are not favoured by
   being new; review F5), so examination propensity per slot can be measured
   instead of assumed.
-- A row is written in the same gateway step that returns the digest; if the
-  write fails, the digest is still returned and the failure is counted
-  (ASSUMPTION: availability over completeness of the log; the miss is visible).
+- A row is written for every digest returned, but the digest never waits for
+  it: if the write fails, or the gateway stops before it, the digest stands
+  and the failure is counted (ASSUMPTION: availability over completeness of
+  the log; the miss is visible). The row write is a commit, so it takes the
+  shared side of the tenant's write gate (14.3): while an erasure holds the
+  gate the row waits in gateway memory (at most `B_ERASE`, so the backlog is
+  bounded by the tenant's request rate over that time) and, when written, is
+  checked against the published tombstones like every commit that waited.
 
 ## 10. Reflection (OWNER; AGREED separate judge)
 
@@ -1221,7 +1335,10 @@ capped sample of leaves each cycle chosen as follows (review F13, F3d):
   class is percolated against the stored queries added since the last cycle
   (batched percolate requests) and every such stored query's vector is used in
   a kNN over leaf vectors to depth 50 (the semantic half). This gives, per
-  leaf, the past searches it may have been relevant to, with scores.
+  leaf, the past searches it may have been relevant to, with scores. A
+  leaf's candidate searches and their judge labels accumulate across cycles
+  (they are stored as notes), so support can come from searches made in
+  different cycles.
 - Judge sample: at most `N_AUDIT = 100` leaves per cycle per class, and at
   most `K_CAND = 5` candidate searches per leaf (ASSUMPTION). Leaves are
   ranked by (number of candidate searches for which the tree did not offer
@@ -1253,10 +1370,17 @@ The steps per audited leaf:
    leaf version offered by the tree (`offered_by_tree`), at what rank, opened,
    used. For synthetic queries (variant only), replay them against the served
    generation.
-4. Per-leaf miss rate = 1 - offered by the tree / relevant, with a Wilson interval
+4. Per-leaf miss rate = 1 - offered by the tree / relevant, over all
+   accumulated judged-relevant past searches, reported with a Wilson interval
    (INFERRED design; no published estimator was found). A leaf is flagged for
-   re-filing only when the miss rate is high and at least 5 relevant queries
-   support it (ASSUMPTION thresholds).
+   re-filing when at least `S_MIN = 2` distinct past searches judged relevant
+   to it were missed by the tree and its miss rate is at least 0.5
+   (ASSUMPTION thresholds; review 2, F3: the earlier support of 5 is withdrawn,
+   because the registered H4 workload gives a planted leaf only two in-stream
+   searches, so 5 made repair impossible by construction). A leaf with fewer
+   than 2 missed relevant past searches is not eligible; decoys are built to
+   have no constructed relevant search (EXPERIMENT 3.6), so they are
+   ineligible unless unrelated searches happen to be judged relevant.
 
 Pruning rules (SOURCE: research recommendation; never delete for low usage,
 because low exposure is the bias being repaired): archive a leaf (cold tier,
@@ -1274,7 +1398,7 @@ generation; it never deletes the source.
 |---|---|---|
 | Leaf | `lv` per correction or relabel; immutable documents | `leaf_id` for life |
 | Index node | `nv` per change; immutable; shared across generations | `node_id` until split or merge; then forwarding |
-| Edge | `ev` per change; each version is bound to generations by `src_seq` (insert-time) or `gen_from` (reorganiser), and `gen_to` (review F18; 13.2) | `edge_id` (deterministic from endpoints and type); versions after an erasure start above the erased ones |
+| Edge | `ev` per change; each version is bound to generations by `src_seq` (insert-time) or `gen_from` (rebuild, reorganiser), and `gen_to` (review F18; 13.2) | `edge_id` (deterministic from endpoints and type); versions after an erasure start above the erased ones |
 | Member | bound by `src_seq` (placement) or `gen_from` (rebuild, reorganiser), retired by its `gen_to` set (13.2) | (parent, child) |
 | Structure | generation per (class, family); manifest written last; head flipped by compare-and-set | generation number |
 | Log rows, stored queries, notes | immutable, append-only | their ids |
@@ -1293,11 +1417,11 @@ generation; it never deletes the source.
     anc(G).
   Write-path versions never take a generation number, so a rejected candidate
   cannot strand them (review F18, second round). P and anc(G) are fixed for
-  the task, so the visible set cannot change under it.
-  A rejected or rebased
-  candidate's unshared documents (nodes, members, edges) are deleted when it is
-  rejected, so anything older than the retained chain that still exists was
-  adopted. Consequences: edges of a candidate are invisible before the gate
+  the task, and the visible set cannot change under it because P and heads
+  are published only after the documents they cover are searchable (5.6;
+  review 2, F4) and anc(G) is never truncated (5.6; review 2, F5). A rejected
+  or rebased candidate's unshared documents (nodes, members, edges) are
+  deleted when it is rejected. Consequences: edges of a candidate are invisible before the gate
   adopts it (no gate bypass), a pinned reader sees a stable graph as well as a
   stable tree, and rollback (13.3 step 5) removes the candidate's edges along
   with its nodes.
@@ -1305,7 +1429,9 @@ generation; it never deletes the source.
   in the leaf index, so reorganisation never breaks them.
 - Node pointers resolve within their generation while it is retained
   (`R_GEN` = last 5 generations or 14 days, whichever is longer; ASSUMPTION);
-  after that they return `moved` (with forwarding) or `expired`.
+  after that they return `moved` (with forwarding) or `expired`. Retention
+  expiry deletes an expired generation's unshared node documents; it keeps
+  the ancestry ids (5.6).
 - Erasure is the one thing that can change what a pinned generation shows: a
   rewritten node (14.4) keeps its id, so a pinned reader may see a redacted
   summary mid-task. Erased leaves return `unavailable`. This is intended.
@@ -1325,7 +1451,17 @@ the method.
    generated from the changed leaves, judge-filtered and tagged synthetic.
    Gate-only queries are never stored as past searches and never used as
    evaluation probes. Each is re-run against the candidate and against the
-   current generation.
+   current generation. Clusters, the statistical unit (review 2, F12): one
+   cluster per operation of the candidate (a move, an added membership, a
+   re-summary, a split or merge, an edge change), holding every replay query
+   generated from a leaf that operation changed (its membership, its title or
+   gist, or the summary of a node on its path) and every held-out search whose
+   judged-relevant items include such a leaf; operations that share a replay
+   query are merged into one cluster, so dependent queries stay together.
+   The 60 queries are spread over as many clusters as possible (one query per
+   cluster in turn, held-out searches first, before any cluster gets a second),
+   and a cluster holds at most 6 (ASSUMPTION). A candidate is the whole batch
+   of operations of one learning cycle.
 3. Primary: tree-source recall of judged-relevant items within the top 10.
    Items the candidate offers that were never judged are judged at replay by
    the same blind judge, inside the stage budget, so new items are neither
@@ -1335,14 +1471,33 @@ the method.
    regressions, and a general replay of the 20 most recent held-out searches in
    which at most 2 searches lose a judged-relevant item from the top 10 and
    losses do not exceed gains (ASSUMPTION).
-4. Decision: a one-sided anytime-valid confidence sequence for the mean
-   per-search difference in [-1, 1] (betting confidence sequence; SOURCE:
-   https://arxiv.org/abs/2010.09686), alpha 0.05, minimum 20 searches, at most
-   60 targeted searches, checked after every search; adopt when the lower
-   bound passes 0, otherwise "no decision, keep current". Simulated power is in
-   EXPERIMENT 7.3 (for example 0.86 at a net effect of 0.25 with 60 searches).
-   This replaces the first version's bootstrap plus sequential rule, which were
-   incompatible and under-covered at 20 searches.
+4. Decision (review 2, F12; it replaces the betting confidence sequence of the
+   previous revision, whose per-search unit treated correlated paraphrases as
+   independent): one fixed-horizon test per candidate, evaluated once, with no
+   repeated looks. Per replay query q, d_q = sign(r_cand(q) - r_curr(q)), in
+   {-1, 0, +1}, where r is the primary above. With clusters k = 1..K of n_k
+   queries:
+
+   ```
+   D_k = (1/n_k) * sum over q in k of d_q
+   T   = (1/K)   * sum over k of D_k
+   p   = #{ e in {-1,+1}^K : (1/K) * sum_k e_k * D_k >= T } / 2^K
+   ```
+
+   Adopt only if K >= 8, p < 0.05 and the general-replay guard of step 3
+   passes; otherwise "no decision, keep current". p is computed exactly by
+   counting signed sums (every D_k is a multiple of 1/60 because n_k <= 6, so
+   there are at most 120 K + 1 sums; under 0.1 s at K = 60, depending on the
+   machine). The test is
+   exact when cluster means are symmetric about 0 under no change and clusters
+   are independent; any dependence inside a cluster is allowed. When symmetry
+   fails it can be anti-conservative: with frequent small gains and rare large
+   losses of mean 0 it adopts 0.17 at K = 8 and about 0.07 at K = 60
+   (EXPERIMENT 7.3; limit, 20). Scoring each
+   query by the sign of its difference keeps the exact count small; raw
+   fractional differences made one exact evaluation take up to 100 s in a
+   trial. Null coverage and power are simulated in EXPERIMENT 7.3
+   (`evalkit/gate_power.py`).
 5. Adoption = compare-and-set of the head; rollback = compare-and-set back to
    the previous generation, which is retained; by the visibility rule (13.2) the
    rollback also hides the candidate's members and edges.
@@ -1364,11 +1519,12 @@ what others said about the person (LAB decision carried over; ASSUMPTION for
 this repository).
 
 Upward relabel (review F19c): moving a leaf to a class that a former reader
-may not read is an erasure of the old-class copy, at once: a tombstone with
-scope (leaf id, old class), the redact set written immediately (step 2), then
-the usual delete, rewrite and purge of every old-class artefact derived from
-it. Old pointers return `unavailable` to readers without the new class from the
-moment the relabel returns. The new version is written in the new class with a
+may not read is an erasure of the old-class copy: a tombstone with scope
+(leaf id, old class) published with its redact set at the erasure boundary
+(14.3), then the usual delete, rewrite and purge of every old-class artefact
+derived from it. The relabel call returns at that boundary, so old pointers
+return `unavailable` to readers without the new class from the moment the
+relabel returns. The new version is written in the new class with a
 new `lv`. Downward relabel (declassification) is an ordinary new write into
 the lower class by a principal holding both classes.
 Legal hold wins: the erasure is queued and the delay is written in the
@@ -1409,32 +1565,63 @@ them. Handling:
   generation gets its placement-rule parent back, computed by code without a
   model call;
 - node versions re-summarised from an erased search: returned to the
-  code-built placeholder of step 2 in every retained generation (no model
+  code-built placeholder of step 3 in every retained generation (no model
   call).
 
 ### 14.3 Steps
 
-1. Tombstone first: allocate tombstone sequence s, append it to the tenant's
-   tombstone journal (fsync, replicated; 14.6), then record it in `lc-<t>-ctl`
-   with scope and erased identifier HMACs. If the subject is also a principal,
-   it is revoked first (4.4). From this moment the shared guard refuses re-ingest,
-   lookup, rebuild, restore and replay of the scope (INV-8), and the gateway
-   filters search results against tombstones with a realtime multi-get
-   (results are post-checked here only to close the 1 s refresh window; this
-   is not access trimming).
-2. Closure and redact set, immediately and without model calls: compute the
-   closure (14.2) and write its node versions into a redact set in ctl
-   (realtime readable). From then on, whenever the gateway hands a node to a
-   holder, an organise call, a reflection pass or a reader, it replaces any
-   node in the redact set by a code-built placeholder: the erased child entries
-   and facts removed, the summary replaced by the remaining children's titles,
-   sizes and totals recomputed. This closes the window between the tombstone
-   and the rewrite (redaction at read for erasure only; access classes are
-   still trimmed before retrieval, INV-2).
-3. Fence: every background job records the tombstone sequence at its start
-   and aborts its commit if a newer tombstone intersects its inputs (7.6 step
-   6). The executor waits until no job lease older than s is alive (lease
-   expiry bounds the wait; ASSUMPTION: 15 minutes).
+Revised after review 2, F7: the previous revision published the tombstone
+first and computed the closure afterwards, so a concurrent recall could read
+an upper node (reached only through transitive `lin_nodes` lineage) before its
+redact-set entry existed, while the design promised invisibility from the
+tombstone. There is now one publication boundary, and "erased" is promised
+from it, not from the request.
+
+1. Request: `erase` records the request under an idempotent erasure id. If the
+   subject is also a principal, it is revoked first (4.4). Under a legal hold
+   the request is queued (14.1). Nothing is promised to readers yet: until the
+   boundary, old content may still be served.
+2. Closure under the write gate, without model calls. The executor takes the
+   exclusive side of the tenant's write gate (a readers-writer gate in the
+   gateway, one per tenant; the copy-and-swap purge, 14.5, pauses writes to
+   one index the same way). Every commit of the tenant
+   (a `remember`, a placement or link job, a rebuild, reorganiser or
+   reflection commit, a log row, a publication of P or of a head) takes the
+   shared side, so commits in progress finish and new ones wait; none is
+   refused. Under the gate the executor refreshes every index of the tenant,
+   computes the full closure (14.2), including every ancestor reached through
+   transitive `lin_nodes` lineage in every retained generation, and writes
+   the closure's node versions as a redact set into the class control indices,
+   tagged with the new tombstone sequence s (not yet consulted, because s is
+   above the published sequence).
+3. Boundary, one publication step: append tombstone s (scope, erased
+   identifier HMACs, erased edge versions) to the tenant's tombstone journal
+   (fsync, replicated; 14.6), record it in `lc-<t>-ctl`, refresh, then advance
+   the gateway's in-memory published tombstone sequence to s. That single
+   in-memory step makes the tombstone and its complete redact set effective
+   together; the gate is then released. From the boundary: the shared guard
+   refuses re-ingest, lookup, rebuild, restore and replay of the scope (INV-8);
+   search results are post-checked against the gateway's in-memory tombstone
+   table (a post-check for erasure only; access is still trimmed before
+   retrieval, INV-2); every commit that waited at the gate checks the
+   published tombstones when it commits, so a background job whose inputs
+   intersect s aborts (7.6 step 6) and a log row naming an erased item is
+   stripped as in step 5; and whenever the gateway hands a node to a holder,
+   an organise call, a reflection pass or a reader, it replaces any node in the
+   redact set by a code-built placeholder: the erased child entries and facts
+   removed, the summary replaced by the remaining children's titles, sizes and
+   totals recomputed; a response whose reads preceded the boundary and that
+   carries an item the boundary covers is aborted at its next send hand-off
+   (4.4, 14.5). `erase` (and a relabel) returns at
+   the boundary; the
+   receipt states the request and boundary times. Bound: request to boundary
+   at most `B_ERASE = 60 s` (ASSUMPTION; measured by EXPERIMENT E7 and E8),
+   which is also the longest delay the gate imposes on the tenant's commits
+   (INV-9). Crash: if the gateway stops after the journal append and before
+   the in-memory step, the journal is authoritative: on start, every journal
+   tombstone is published (closure recomputed, redact set rewritten) before
+   the tenant is served. A crash before the append leaves no tombstone, and
+   the request is retried from step 1.
 4. Destroy keys: delete the keystore rows of every leaf version in scope
    (source log and its snapshots become unreadable).
 5. Delete: leaves, source documents, members, edges, log rows, stored
@@ -1447,7 +1634,7 @@ them. Handling:
    M4).
 6. Rewrite, in code, no model calls: every node version in the redact set, in
    every retained generation, is rewritten under the same `_id` with the
-   placeholder content of step 2 and `erasure_rewrite = s`,
+   placeholder content of step 3 and `erasure_rewrite = s`,
    `summary_status = stale` (14.4). Generations past retention are retired and
    their unshared node documents deleted. A model re-summary of the stale
    nodes happens lazily, only in the live generation, as part of the next
@@ -1476,7 +1663,8 @@ them. Handling:
 - Restore from snapshot: restore src, ctl and authz, re-apply every tombstone
   from the newest tombstone journal (not from the snapshot's own `ctl`, which
   may predate an erasure), destroy every keystore row named by any tombstone,
-  rebuild projections, and only then serve (14.6).
+  replay the erasure closure over every restored index, rebuild projections,
+  pass the verifier's residue checks, and only then enable the tenant (14.6).
 
 ### 14.5 Purge on live indices
 
@@ -1496,10 +1684,15 @@ Erasable indices stay live, so:
   (the erased documents are already deleted, so they are not copied), flips
   the alias, and deletes the old physical index (deleting an index removes
   its files).
-- Bounds (targets, measured in EXPERIMENT 9.4): logical invisibility to
-  readers at tombstone time (gateway guard); search invisibility within the
-  refresh interval; physical purge within `P_PURGE = 1 hour` of the erasure
-  request (ASSUMPTION); keystore backup copies of destroyed keys age out
+- Bounds (targets, measured in EXPERIMENT 9.4): nothing is promised between
+  the request and the boundary; the boundary follows the request within
+  `B_ERASE = 60 s` (14.3); from the boundary, erased content is served by no
+  read path (guard, in-memory tombstone post-check, redact set), and a
+  response whose reads preceded the boundary and that carries an item the
+  boundary covers is aborted at its next hand-off (4.4), so only bytes handed to the kernel by a hand-off whose check
+  preceded the boundary (at most the socket send buffer, 64 KiB) may still
+  arrive; physical purge
+  within `P_PURGE = 1 hour` of the boundary (ASSUMPTION); keystore backup copies of destroyed keys age out
   within `R_KEYS = 35 days` (ASSUMPTION), stated in every receipt.
 
 ### 14.6 Backups and snapshots
@@ -1519,17 +1712,30 @@ ciphertext and its keys with no tombstone to re-apply.
   gateway: tombstone sequence, scope (subject token, leaf id, leaf version, or
   leaf id and old class), erased identifier HMACs, erased edge versions, and
   the keystore row ids destroyed. No content.
-- It lives outside the snapshot timeline: written locally with fsync before
-  step 2 of 14.3 continues, and replicated to a second location (a separate
+- It lives outside the snapshot timeline: written locally with fsync at the
+  erasure boundary (14.3 step 3), and replicated to a second location (a separate
   host or bucket with object versioning, ASSUMPTION) that no snapshot restore
   touches. Only the newest journal is ever restored; there is no older copy to
   choose.
-- Every restore of Elasticsearch or of the keystore, of any age, applies the
-  newest journal before anything is served: every tombstone is re-recorded in
-  `ctl`, every keystore row it names is destroyed (a restored keystore backup
-  therefore loses every key erased after it was taken), projections are rebuilt
-  from source past the guard, and the gateway refuses to serve a tenant whose
-  `ctl` tombstone sequence is below the journal's newest.
+- Every restore of Elasticsearch or of the keystore, of any age, runs these
+  steps with the tenant disabled, and enables it only at the end (review 2,
+  F8):
+  1. every journal tombstone is re-recorded in `ctl`, and every keystore row
+     it names is destroyed (a restored keystore backup therefore loses every
+     key erased after it was taken);
+  2. the erasure closure of every journal tombstone (14.2) is replayed over
+     every restored index, including `lc-<t>-authz` (sessions and grants of an
+     erased principal), the tenant and class control indices and the source
+     log, and every match is deleted or stripped as in 14.3 steps 5 and 6;
+  3. projections are rebuilt from source past the guard;
+  4. the independent verifier (14.7) runs its residue checks for every journal
+     tombstone, with its own keys and by direct reads of every restored index,
+     authz included ("content was not served" is not enough);
+  5. only when it reports zero residue is the tenant enabled. The gateway also
+     refuses to serve a tenant whose `ctl` tombstone sequence is below the
+     journal's newest.
+  The replay and checks cost no model call; their time is part of the restore
+  and is reported.
 - If the journal is unavailable, the tenant is not served (fail closed) until
   it is restored. The journal is kept for the life of the tenant, which carries
   the same trade-off as erased identifier HMACs (open question O-5).
@@ -1681,7 +1887,7 @@ edges is converted to `contradicts` and flagged.
 | Insert-time edges and placement members written while a reorganiser candidate is open, then the candidate is rejected | bound by `src_seq`, not by a generation number, so they stay visible to every task pinned after P covers them (13.2) | stub loop |
 | Link typing for one leaf stalls (model slow) | P waits at most `D_WP`; then the job is cancelled and joined, its documents deleted, the failure counted, and P moves on; later leaves' members become visible again | unit |
 | Two candidates retire the same member; one is rejected | `gen_to` is a set; the rejected number is in no ancestry, so only the adopted retirement hides it | unit |
-| Failed model call (timeout, refusal, error) | typed failure; build keeps previous node version; holder falls back to embedding routing, flagged; counted in denominators | fault-injection test |
+| Failed model call (timeout, refusal, error) | typed failure; a failed build call for a node with pending members aborts that generation (no W is published that it does not represent; members stay pending and reachable by tree-only recall; 7.6); holder falls back to embedding routing, flagged; counted in denominators | fault-injection test; SEC-V7 |
 | Malformed model output | schema validation; treated as failure | fault-injection test |
 | Model names a child it was not shown | dropped, counted | fault-injection test |
 | Prompt injection in leaf text | holder output limited to presented ids; no tools in holder calls | injection test |
@@ -1699,13 +1905,13 @@ edges is converted to `contradicts` and flagged.
 | Double-submitted erasure | erasure id idempotent; second call returns the first receipt | erasure probe |
 | Elasticsearch unavailable | reads fail closed with a typed error; writes refused as retryable; no local plaintext queue | fault-injection test |
 | Partial bulk failure | per-item status; orphans repaired (7.4) | fault-injection test |
-| Near-real-time window (1 s) | heads and tombstones read by realtime GET, epochs from the gateway's table; search results post-checked against tombstones | erasure probe |
+| Near-real-time window (1 s) | heads by realtime GET; tombstones and epochs from the gateway's in-memory tables; P, heads and the erasure boundary published only after an explicit refresh (5.6, 14.3); search results post-checked against published tombstones | erasure probe; SEC-V2 |
 | Shard limit | provisioning refuses at 80% | provisioning test |
 | Time zones | UTC stored plus original offset; day buckets in the tenant's declared zone | unit |
 | Clock skew | order by source sequence, not wall clock | unit |
 | Legal hold during erasure | hold wins; queued; delay in receipt | erasure probe (g) |
 | Erasure during rebuild or reflection | tombstone fence aborts the job's commit | erasure probe (g) |
-| Restore from snapshot after erasure | tombstones re-applied before serving | version probe (e) |
+| Restore from snapshot after erasure | tombstones re-applied, erasure closure replayed over every restored index (authz included), verifier residue checks pass, then the tenant is enabled (14.6) | E3, V5 |
 | Erased subject mentioned again in new content | erased identifier HMACs refuse it | erasure probe (a) |
 | Erased identifier under a variant spelling (case, width, accents, homoglyphs) | NFKC, case folding and the confusables skeleton before the HMAC (5) | unit with a variant table; E3 |
 | Two people with the same name, one erased | identifiers are declared with context; a bare-name match is held for review, and the writer's outcome does not reveal an erasure (7.3) | unit |
@@ -1714,8 +1920,11 @@ edges is converted to `contradicts` and flagged.
 | Re-created edge after erasure | version counter starts above the erased versions (5.5) | unit |
 | Restore of a snapshot older than an erasure | newest tombstone journal applied first; keystore rows it names destroyed (14.6) | E3, V5 |
 | Authz index unwritable (disk at flood stage, read-only block) | revoke works from the gateway's own epoch table and journal (4.4) | R3, P14 |
+| Epoch journal write fails (no space, stalled fsync) or a restart finds it incomplete | `revoke` has already denied in memory; that tenant is closed (all its principals denied) until its administrators re-establish grants; other tenants unaffected (4.4) | R7 |
+| Retention expiry of a generation named by an adopted edge's `gen_from` or a retired edge's `gen_to` | ancestry ids are kept for the life of the class, so the adopted edge stays visible and the retired one stays hidden (5.6) | SEC-V2, V4 |
+| Very short leaf (a few words) | its title may reveal it; no gist or fact is returned (INV-7); limit (20) | SEC-A8 |
 | Edge between incomparable classes | not created unless a dominating class is declared | access probe |
-| Class relabel of a leaf, upward | erasure of the old-class copy at once; old pointers `unavailable`; new version in the new class (14.1) | A6 |
+| Class relabel of a leaf, upward | erasure of the old-class copy, returning at its erasure boundary; old pointers `unavailable`; new version in the new class (14.1) | A6 |
 | Class relabel of a leaf, downward | ordinary new write in the lower class by a principal holding both | access probe |
 
 ## 18. Model-call interface and the deterministic stub
@@ -1738,9 +1947,10 @@ class ModelPort(Protocol):
   model id. The budget handle increments a persistent per-stage counter before
   the call (a failed call still counts) and refuses at the cap (LAB pattern).
 - Cache: key, class and scope as in 5.8; the cache is an Elasticsearch index
-  of the class, so erasure reaches it. The evaluation harness may add its own
-  EVAL-CACHE outside the product path (EXPERIMENT 10.1); the product never
-  shares prompt-bearing outputs across principals.
+  of the class, so erasure reaches it. It is the only model-output cache:
+  the evaluation adds none (an evaluation cache outside the product's erasure
+  closure was withdrawn, review 2, F10). Prompt-bearing outputs are never
+  shared across principals.
 - Calls pass through the per-tenant fair queue of 15 before the global
   concurrency limit.
 - No retries during evaluation runs (failures count); a provider throttle
@@ -1756,10 +1966,14 @@ gate:
 - `route`: scores each presented child by BM25 of the prompt over the child's
   title, gist and entities plus cosine of hashed bag-of-words vectors; returns
   children over a threshold, at most `B_FANOUT`.
-- `build_l1`, `build_upper`: extractive. Title = top tf-idf terms; gist = the
+- `build_l1`, `build_upper`: extractive. Title = top 4 tf-idf terms; gist = the
   highest-scoring sentence; facts = top 3 sentences; summary = concatenated
-  child titles and top terms.
-- `organise`: groups pointers by holder path and sorts by score.
+  child titles and top terms. Gists and facts go into child entries for
+  holders only; a holder's returned pointer never carries them (INV-7), so a
+  one-sentence leaf, whose gist is the whole leaf, is not returned without a
+  lookup.
+- `organise`: groups pointers by holder path and sorts by score; outline
+  labels are holder paths and pass the 5-gram check (8.3).
 - `type_edges`: rules (shared entity: same_entity; negation or number change
   over the same entity and attribute: contradicts; later date and same entity:
   supersedes candidate).
@@ -1767,11 +1981,14 @@ gate:
   with a separate tokenizer), so judge and router are not the same function.
 - `query_variants`, `synthetic_queries`: template rewrites over top terms.
 - `ask`, `reader_answer`: extractive answer from the best sentence. As the
-  stream reader (EXPERIMENT 3.8), the stub looks up the pointers whose title
-  and gist score in its own top 3 under a scorer separate from `route` and
-  from `judge_relevance`; it never sees gold or the planting list.
+  stream reader (EXPERIMENT 3.8), the stub sees only the digest and looks up
+  the pointers whose title scores in its own top 3 under a scorer separate
+  from `route` and from `judge_relevance`; it never sees gold or the planting
+  list.
 - Holder reasons: the stub writes reasons from its own matched terms, at most
-  12 words; a broken variant that quotes child facts exists for the A8 probe.
+  12 words; broken variants for the A8 probe quote child facts in reasons,
+  return the gist with the pointer, and copy a title from the leaf's first
+  sentence.
 
 All stub outputs are deterministic given inputs and a seed. A latency-injecting
 wrapper with one global concurrency limit is used for the availability probe
@@ -1797,7 +2014,7 @@ living_context/
   gateway/
     server.py            local socket server; the only ES client
     admission.py         byte, structure, concurrency, idle, per-tenant caps and byte caps; revoke lane
-    sessions.py          session resolution, authority-epoch table, epoch journal, send fence
+    sessions.py          session resolution, authority-epoch table, bounded epoch journal with compaction and fail-closed start, send fence
     journal.py           per-tenant tombstone journal (hash chain, replication, restore apply)
     validator.py         refuses documents without tenant, class, lineage (fail closed)
     indices.py           naming, aliases, provisioning checks, shard budget
@@ -1814,7 +2031,7 @@ living_context/
   feedback/              protocol log, reflection, judge, reverse audit, reorganiser, gate
   erasure/               closure, executor, purge, receipts
   verifier/              separate entry point and keys; canaries; isolation and erasure checks
-  evalkit/               dataset adapter (field whitelist), splits, metrics, bootstrap, score intervals, replay with lag, planting, reader driver, controls, eval cache, budget.py, gate_power.py
+  evalkit/               dataset adapter (field whitelist), splits, metrics, bootstrap, score intervals, replay with lag, planting, reader driver, controls, budget.py, gate_power.py
 tools/                   provision_tenant.py (operator), probes/ (P1 to P16)
 tests/                   unit/, stubloop/, security/, faults/
 ```
@@ -1842,6 +2059,11 @@ credentials.
 | Filesystem and SSD remanence of destroyed keys | The keystore overwrites and checkpoints, but freed blocks and flash wear levelling are below the file layer; removing this needs a KMS or HSM, out of scope for the first build |
 | Tokens left in log files and the tombstone journal | Logs hold no content but may hold subject or principal tokens until `R_LOGS`; the journal keeps erased tokens and identifier HMACs for the tenant's life (O-5) |
 | Tombstone journal replica | Its second location is an operator choice; if it is lost together with the primary, the tenant is not served until restored (fail closed) |
+| Unclean gateway restart closes tenants | `revoke` returns before its journal write is durable (4.4), so a crash cannot be told apart from a lost revoke; every tenant whose journal lacks a clean shutdown record is closed until its administrators re-establish grants. Copy-on-write filesystems can still report no space inside a preallocated file; that also closes the tenant |
+| A node whose build keeps failing holds W back | Publishing a W the tree does not represent would hide pending leaves (review 2, F6); the members stay pending and reachable, but titles and gists for that class stop advancing until the call succeeds; failures are counted |
+| The gate's test assumes symmetric cluster means | The exact sign-flip test (13.3) is valid when cluster means are symmetric about 0 under no change; a candidate with frequent small gains and rare large losses can be adopted (simulated 0.17 at K = 8, about 0.07 at K = 60, EXPERIMENT 7.3). A test valid without the symmetry assumption (a Hoeffding bound) would need a mean of at least 0.87 at K = 8 and would almost never adopt; the general replay guard and the RANDOM-FEEDBACK control bound the effect |
+| A very short leaf can be guessed from its title | Titles are at most 12 words and share no 5-gram with the leaf, but a leaf of a few words is nearly its own title; content of longer leaves is reached only by a logged lookup (INV-7) |
+| Erasure delays the tenant's own writes | The write gate of the erasure boundary delays that tenant's commits for at most `B_ERASE` (14.3, INV-9); other tenants are not affected |
 
 ## 21. Lessons from the earlier lab (LAB-R1 to LAB-R12)
 
@@ -1900,15 +2122,20 @@ DEVIATIONS from the owner's description (numbered in order; review M4):
 
 ASSUMPTIONS that change cost or results: `LEAF_CAP` 1,536; fan-out 16/24/4;
 `M_MAX` 2; `B_HOLDERS` = top-level holders + 36, `B_FANOUT` 6, at most 12
-organise calls; organise threshold; L1 summary
-refresh trigger (4 new children or 25%); top-3 typed edges per leaf; 2-hop,
-10-neighbour, 50-leaf expansion caps; edge weights and 30-day half-life;
-exploration share 1 in 10; IPS clip 0.05; gate: betting confidence sequence,
-alpha 0.05, 20 to 60 targeted searches, general-replay count guard; reverse
-audit `N_AUDIT` 100 leaves and `K_CAND` 5 searches per cycle; reasons at most
-12 words with the 5-gram rule; retention 5 generations or 14 days; `P_PURGE`
-1 hour; `R_KEYS` 35 days; `R_LOGS` 7 days; write-path deadline `D_WP` 10
-minutes (5.6); send buffer 64 KiB; final-list
-fusion by RRF of the tree, direct and linked lists (k = 60, cut 50); reading
-of "never offered" as `tree_missed` (10); reverse-audit synthetic queries off
-by default (12).
+organise calls; organise threshold; L1 summary refresh trigger (4 new
+children or 25%); top-3 typed edges per leaf; 2-hop, 10-neighbour, 50-leaf
+expansion caps; edge weights and 30-day half-life; exploration share 1 in 10;
+IPS clip 0.05; gate: exact cluster sign-flip test, alpha 0.05, at least 8
+clusters, at most 60 targeted queries in clusters of at most 6, per-query
+sign scoring, one evaluation per candidate, general-replay count guard
+(13.3); reverse audit `N_AUDIT` 100 leaves and `K_CAND` 5 searches per cycle,
+re-filing support `S_MIN` 2 missed relevant searches and miss rate at least
+0.5 (12); titles and reasons at most 12 words with the 5-gram rule, failing
+titles replaced by 4 code-built terms (8.2); retention 5 generations or 14
+days, ancestry ids kept for the class's life (5.6); `P_PURGE` 1 hour;
+`R_KEYS` 35 days; `R_LOGS` 7 days; erasure boundary `B_ERASE` 60 s (14.3);
+write-path deadline `D_WP` 10 minutes (5.6); send buffer 64 KiB; epoch
+journal `J_SIZE` 4 MiB per tenant, `N_PRINCIPALS` 10,000, `D_FSYNC` 2 s
+(4.4); final-list fusion by RRF of the tree, direct and linked lists
+(k = 60, cut 50); reading of "never offered" as `tree_missed` (10);
+reverse-audit synthetic queries off by default (12).

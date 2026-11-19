@@ -5,8 +5,20 @@ its failing-first test: a test written before the code, shown to fail against
 the previous commit or a named broken variant, then shown to pass. A test that
 cannot fail for the stated reason does not count (LAB-R8). Security probes
 start at step 5 (the first step with a gateway) and run in every later step
-(EXPERIMENT.md section 9); steps 1 to 4 have their own policy and keystore
-tests.
+(EXPERIMENT.md section 9; the T5 floods in the short form of section 0);
+steps 1 to 4 have their own policy and keystore tests.
+
+Order (revised after review 2): the gateway, policy, lineage validation,
+source and keystore lifecycle, publication and versioning rules, revocation,
+erasure, restore and the independent verifier are built from the first
+steps. Edges, reflection, the reverse audit and the reorganiser with its gate
+are built early as minimal real producers driven by the stub model (Steps 12,
+17, 18, 19), so the security track exercises every artefact kind they write
+(edges, notes, judge labels, query-shaped members and summaries). Their
+refinements (sophisticated audit ranking, IPS-weighted feedback, hub policy,
+co-confirmation splits), the comparison arms and the proxy world come after
+H1, behind the same interfaces (section 3A); nothing that H1 needs waits for
+them.
 
 Labels as in [DESIGN.md](DESIGN.md) section 0.
 
@@ -19,10 +31,13 @@ Labels as in [DESIGN.md](DESIGN.md) section 0.
   placeholders. Secrets are read from 0600 files by path, never from argv or
   environment values, never logged (LAB-R7).
 - Every step ends with `python -m unittest discover -s tests` green, the
-  security probes green for everything built so far, and every broken control
-  red.
+  security probes of S0-core green for everything built so far, and every
+  broken control red. The T5 floods are not re-run in full at every step:
+  their full measurement is the S0-load checkpoint (Step 22); a step that
+  touches admission, quotas, the model or embedding port, or byte caps runs
+  them in the short form of Step 5.
 - No model calls until stage S1 is approved (EXPERIMENT.md section 10). Steps
-  1 to 21 use the deterministic stub only.
+  1 to 22 use the deterministic stub only.
 - Heavy jobs (whole-pool embedding, whole-pool builds) run on a remote host,
   not the owner's laptop.
 
@@ -87,7 +102,7 @@ design already names.
 | P2 | API key with role descriptor on `lc-ta-*` only and no cluster privilege, security on: search, get, mget, msearch, count, kNN, percolate, terms lookup, `_cat/indices`, `_field_caps`, `_mapping`, wildcard and comma lists, alias names against `lc-tb-*` (including `lc-tb-authz`) and the look-alike `lc-tbx-*`; plus the cluster APIs `_cluster/state`, `_cat/shards`, `_cat/aliases`, `_tasks?detailed`, `_resolve/index`, `_search_shards`, `_nodes/stats`, `_cluster/stats`. Control: the same with a key holding `cluster: monitor` must leak through at least one cluster API (so the probe can fail) | all refused or empty, no names or query descriptions leaked | this is the hard boundary: if it fails, dedicated tenants move to separate clusters and the gap is reported before any other step |
 | P3 | `ELASTIC_PASSWORD_FILE` honoured; the password appears in no container log | yes | operator runs the reset tool with output redirected to a 0600 file |
 | P4 | Percolate a stored `knn` query | fails or unsupported | already designed lexical-only; record |
-| P5 | Realtime GET by id returns a document version immediately after the index call returns, without refresh (used for sessions, heads and tombstones; epochs are already in the gateway's own table, DESIGN 4.4) | yes | gateway keeps the tombstone table in memory too, updated synchronously by the calls it serves, reloaded on start from the journal |
+| P5 | Realtime GET by id returns a document version immediately after the index call returns, without refresh (used for sessions and heads; tombstones and epochs are in the gateway's own memory, DESIGN 4.4, 5.9); and an explicit `_refresh` that has returned makes every write acknowledged before it searchable (the searchable-publication barrier, DESIGN 5.6; review 2, F4) | yes | for heads: the gateway keeps heads in memory too, reloaded on start; for refresh: none, P and heads are not published, and the gap blocks Step 13 |
 | P6 | API key invalidation latency on our node | under 1 s | gateway drops its client for a revoked tenant at once (it is the only client); report the measured latency as a limit |
 | P7 | kNN `filter` with a restrictive filter returns k hits (filter applied during search) | yes | over-fetch with `num_candidates` up to 10,000 and report recall loss; per-class indices already make the filter mostly unnecessary |
 | P8 | One `_aliases` request with add and remove actions is atomic under concurrent search | yes | gateway write gate held across the swap; readers retry once on a missing alias |
@@ -161,7 +176,8 @@ Each step: what, failing-first test, done when.
   slots and queues, per-tenant stored-byte caps, a separate revoke lane),
   sessions minted only by an identity adapter from a proof, session tokens
   carrying the tenant prefix, per-tenant `lc-<t>-authz` with HMAC principal
-  tokens, the in-memory epoch table with its local journal, `es.py` reading key
+  tokens, the in-memory epoch table with its bounded per-tenant journal
+  (DESIGN 4.4), `es.py` reading key
   files by path, `indices.py` naming (including the per-class control index)
   and shard-budget check (DESIGN 6.4 formula), `validator.py` refusing
   documents without tenant, class or lineage; slow logs disabled on every
@@ -171,7 +187,10 @@ Each step: what, failing-first test, done when.
   cluster privilege (DESIGN 6.3).
 - Failing-first tests (security track begins): SEC-T1 (with the cluster
   APIs), T2, T3 (normalised bodies) on the fixture tenants; T5 flood probes
-  including the disk-fill flood against the byte cap; T6 key-space collision;
+  including the disk-fill flood against the byte cap, in a short form (one
+  1-minute run per flood kind with its unloaded baseline, ASSUMPTION: a smoke check that
+  each broken control turns it red, never reported as a T5 pass; the full T5
+  is S0-load, Step 22); T6 key-space collision;
   the validator refuses a document without `lin_subjects`; an authz document
   of `ta` is unreachable with any `tb` key. Broken controls: `lc-*`
   descriptor; tenant from body; parse before admission; 32-bit lock key; key
@@ -181,7 +200,8 @@ Each step: what, failing-first test, done when.
 
 - `ingest/`: segmentation (session and gap cuts, embedding valleys, hard cap
   with recursive split), subjects (identifier declarations), tombstone guard,
-  source append, projection, leaf head compare-and-set, dirty queue.
+  source append, projection (with the code-built leaf title, DESIGN 5.2),
+  leaf head compare-and-set, dirty queue.
 - `embed/`: hashed stub.
 - Failing-first: the longest session in the dataset shape (a 78,000-character
   synthetic session) produces no leaf over the cap (broken variant: split only
@@ -233,15 +253,20 @@ Each step: what, failing-first test, done when.
 - `recall/fanout.py`, `holder.py`, `organise.py`, `digest.py`, `lookup.py`,
   `fusion.py`: all top holders asked in parallel, asynchronous expansion,
   budget, fallback on failure, organise step, digest with sizes and totals,
-  pointers only, the reason schema (at most 12 words) and 5-gram leak check,
+  pointers only (pointer, title, size, path, reason, confidence; no gist or
+  fact, DESIGN INV-7), the title and reason schema (at most 12 words) and the
+  5-gram leak check on reasons, titles and outline labels,
   chunked holder calls above `F_MAX` entries, pending members shown with a
   code-built title, `last_seen` never shown, the three-list RRF merge rule
   (EXPERIMENT 5.1), gateway-logged `opened`, typed resolution answers.
 - Failing-first: on the fixture, stub A1-tree-only recall@10 (no direct-search
   fusion) at least 0.80 and SHUFFLED-SUMMARIES at least 0.30 lower (the stub
-  gate in EXPERIMENT S0); a digest never contains leaf text (broken: include
-  the gist of an unopened leaf's text body); no reason shares a 5-gram with
-  its holder's input (broken: reasons quoting child facts, SEC-A8 red); a
+  gate in EXPERIMENT S0); a digest never contains a gist, a fact or leaf
+  text, including for a one-sentence leaf (broken: return the gist with the
+  pointer, which hands over the whole one-sentence leaf; SEC-A8 red); no
+  reason, title or outline label shares a 5-gram with the leaf text, facts or
+  gists it derives from (broken: reasons quoting child facts; a title copied
+  from the leaf's first sentence; SEC-A8 red); a
   holder prompt never contains `last_seen` (assertion on the captured
   prompt); a node with 3 x `F_MAX` entries is asked in 3 chunks; a holder
   failure produces a flagged fallback, not an empty branch; an id not
@@ -263,13 +288,16 @@ Each step: what, failing-first test, done when.
 
 ### Step 12: edges and bounded expansion
 
-- `graph/`: candidates (kNN 10, shared entities), stub typing, weights,
-  decay, specificity, degree cap and hub nodes, supersedes and contradicts
-  rules, edge versions bound by `src_seq` (insert-time) or `gen_from`
-  (rebuild hub edges, reorganiser) and a `gen_to` set, expansion with caps and
+- `graph/` as a minimal real producer (review 2): candidates (kNN 10, shared
+  entities), stub typing, initial weights, specificity, supersedes and
+  contradicts rules, edge versions bound by `src_seq` (insert-time) or
+  `gen_from` (rebuild, reorganiser) and a `gen_to` set, expansion with caps and
   the visibility filter of the task's pin (DESIGN 13.2: the pinned write-path
   watermark P for write-path versions, the pinned generation's ancestry for
   the others), version counters of re-created edges above erased versions.
+  Decay, the degree cap and hub nodes (DESIGN 16.4) come after H1 behind the
+  same interface (3A); until then the degree cap only refuses edges past it,
+  counted.
 - Failing-first: on fixture questions whose evidence spans two leaves linked
   only by an entity, A2 finds both and A1 does not; RANDOM-EDGES removes the
   gain; an edge between a `base` and a `restricted` leaf lives only in the
@@ -293,48 +321,85 @@ Each step: what, failing-first test, done when.
   (old members retired by a `gen_to` entry, new ones written with `gen_from`),
   forwarding records, rebase on a lost head compare-and-set, retention and
   retirement of generations.
-- Manifests with ancestry and source watermark W (monotone along ancestry);
-  the visibility rule for members and edges (DESIGN 13.2: pinned P for
-  write-path versions, ancestry for rebuild and reorganiser versions, `gen_to`
-  sets for retirement);
-  deletion of a rejected or rebased candidate's unshared nodes, members and
-  edges; an evaluation-only pinning hook that keeps planted entries out of
-  normal rebuilds (used by `evalkit` only, EXPERIMENT 3.6).
-- Failing-first: SEC-V1, V2 (tree and edges), V4 (with edges and rollback), V6
-  with broken controls (node id reuse, re-read head per wave, flip without
+- Manifests with the full ancestry (kept for the life of the class; retention
+  removes content, never ancestry ids; DESIGN 5.6) and source watermark W
+  (monotone along ancestry); the visibility rule for members and edges (DESIGN
+  13.2: pinned P for write-path versions, ancestry for rebuild and reorganiser
+  versions, `gen_to` sets for retirement); the searchable-publication barrier
+  (P and every head flip only after an explicit refresh of the touched member,
+  edge and node indices has returned; DESIGN 5.6); a rebuild that aborts the
+  whole generation when a build call fails for a node with pending members
+  (DESIGN 7.6); deletion of a rejected or rebased candidate's unshared nodes,
+  members and edges; an evaluation-only pinning hook that keeps planted
+  entries out of normal rebuilds (used by `evalkit` only, EXPERIMENT 3.6).
+- Failing-first: SEC-V1, V2 (tree and edges), V4 (with edges and rollback), V6,
+  V7 with broken controls (node id reuse, re-read head per wave, flip without
   compare-and-set, expansion reading the latest edges, candidate edges visible
-  at write, rollback leaving the candidate's edges visible); a leaf written
-  during a rebuild is found by direct search immediately, by the tree as a
-  pending member once P covers it, and with a title and gist after the next
-  batch.
+  at write, rollback leaving the candidate's edges visible); V2 with index
+  refresh paused by a test hook independently of write acknowledgement, tasks
+  started without waiting for refresh (broken: publish P or a head on
+  acknowledgement; an edge appears mid-task); V2 and V4 across a real
+  retention expiry with `R_GEN` shortened, including a retired edge (broken:
+  ancestry truncated to retention; the adopted edge vanishes and the retired
+  one returns); V7 with one failing build call in a rebuild (broken: publish
+  the advanced W with the failed node at its old version; the pending leaf
+  drops out of tree-only recall); a leaf written during a rebuild is found by
+  direct search immediately, by the tree as a pending member once P covers it,
+  and with a title (and, for holders, a gist) after the next batch.
 
 ### Step 14: erasure
 
-- `erasure/`: tombstones written first to the per-tenant tombstone journal
-  (`gateway/journal.py`: hash chain, fsync, replication to the second
-  location), fence, key destruction, lineage closure including authz records
-  and query-shaped artefacts (DESIGN 14.2), deletes, the log-row strip,
-  rewrites and member and edge removal in every retained generation, purge
-  (default and copy-and-swap), receipts with a requester copy over its read set;
-  relabel as erasure of the old-class copy; restore that applies the newest
-  journal to Elasticsearch and to the keystore before serving; `verifier/` as a
-  separate entry point with its own keys, canaries (including query-only,
-  authz and query-shaped canaries) and the plaintext log grep with its control
-  marker.
+- `erasure/`, following DESIGN 14.3 (review 2, F7): the request; the
+  per-tenant write gate in the gateway (commits take the shared side, the
+  executor the exclusive side); under the gate a refresh and the full lineage
+  closure, including ancestors through transitive `lin_nodes` lineage, authz
+  records and query-shaped artefacts (DESIGN 14.2), written as a redact set
+  tagged with the new sequence; the boundary: tombstone appended to the
+  per-tenant tombstone journal (`gateway/journal.py`: hash chain, fsync,
+  replication to the second location), recorded in `ctl`, refreshed, and made
+  effective with its redact set in one in-memory step; the send hand-off's
+  tombstone re-check that aborts a response read before the boundary (DESIGN
+  4.4; the per-principal fence around the hand-off comes in Step 15); then
+  key destruction,
+  deletes, the log-row strip, rewrites and member and edge removal in every
+  retained generation, purge (default and copy-and-swap), receipts with a
+  requester copy over its read set; relabel as erasure of the old-class copy,
+  returning at the boundary; restore (DESIGN 14.6, review 2, F8) that applies
+  the newest journal to Elasticsearch and to the keystore, replays the closure
+  over every restored index (authz and control included), rebuilds
+  projections and enables the tenant only after the verifier's residue checks
+  pass; `verifier/` as a separate entry point with its own keys, canaries
+  (including query-only, authz and query-shaped canaries) and the plaintext
+  log grep with its control marker.
 - Failing-first: SEC-E0 to E6, E8 and E9 with their broken controls (redact
-  set not consulted; current generation only; key-only; raw-file grep of
-  segments as verifier; string-search closure; closure without authz;
-  reseal-before-quarantine; no erased-identifier HMACs; restore before
-  tombstones; tombstones only inside the snapshot, which must resurrect content
-  when an older snapshot and an older keystore backup are restored; keystore
-  restore that keeps keys named by newer tombstones; fence removed; hold
-  ignored; receipt without recount; requester receipt with per-class counts;
-  subject detection on leaves only).
+  set not consulted; tombstone published before the closure completes, shown
+  by pausing the closure walk before an upper node reached only through
+  transitive lineage; commits not held at the gate during the closure; a send
+  hand-off without the tombstone re-check (a lookup read before the boundary
+  sent in full after it); a model-port wrapper keeping outputs in a file
+  outside the indices (E1's data-root grep must find it); current
+  generation only; key-only; raw-file grep of segments as verifier;
+  string-search closure; closure without authz; reseal-before-quarantine; no
+  erased-identifier HMACs; restore before tombstones; restore that re-applies
+  tombstones but does not replay the closure over restored authz records;
+  tombstones only inside the snapshot, which must resurrect content when an
+  older snapshot and an older keystore backup are restored; keystore restore
+  that keeps keys named by newer tombstones; job commit that does not check
+  the published tombstones; hold ignored; receipt without recount; requester
+  receipt with per-class counts; subject detection on leaves only); E7 records
+  request-to-boundary time against `B_ERASE`.
 
 ### Step 15: revocation
 
-- Revoke call on the gateway's in-memory epoch table with its local journal and
-  best-effort persistence (DESIGN 4.4); revoke lane; epoch checks at admission
+- Revoke call on the gateway's in-memory epoch table (DESIGN 4.4, review 2,
+  F9): denial in memory under the fence with no I/O inside it, return of
+  `denied`, then the append and fsync to the tenant's bounded, preallocated
+  journal with `durable_at` reported separately, compaction by snapshot and
+  atomic rename, start and shutdown records, the fail-closed rule (journal
+  fault, `D_FSYNC` exceeded, or an incomplete journal at start closes the
+  tenant until its administrators re-establish grants through the
+  break-glass-opened administration path), and best-effort persistence to
+  `lc-<t>-authz`; revoke lane; epoch checks at admission
   and at each fan-out wave; the per-principal send fence (non-blocking socket
   writes under the shared side, writer-preferring exclusive side for revoke,
   discard of unsent buffers); a test hook that injects a delay between the
@@ -342,12 +407,18 @@ Each step: what, failing-first test, done when.
   operator's break-glass revoke; class-grant removal as an epoch bump; tenant
   key owner rotation and invalidation (P15) and the gateway dropping its clients
   for a revoked tenant.
-- Failing-first: SEC-R1 to R6 and T7 with their broken controls, including: no
+- Failing-first: SEC-R1 to R7 and T7 with their broken controls, including: no
   send fence with the injected delay (must fail deterministically); a socket
   write inside the fence with a slow-reading client; revoke that requires the
-  Elasticsearch write (with `lc-ta-authz` blocked, P14); single-administrator
-  revoke of a revoker; self-grant; class removal without an epoch bump; rotation
-  that needs the bootstrap credential.
+  Elasticsearch write (with `lc-ta-authz` blocked, P14); revoke that waits for
+  the journal fsync (over the bound with the fsync delayed); a journal error
+  that does not close the tenant; a start that accepts a journal without a
+  shutdown record; compaction without the atomic rename; one journal shared by
+  all tenants; a shutdown record written before pending appends drain;
+  single-administrator revoke of a revoker; self-grant; class
+  removal without an epoch bump; rotation that needs the bootstrap credential.
+  R7 runs on a small scratch filesystem for the out-of-space case and stops the
+  gateway abruptly at each persistence boundary.
 
 ### Step 16: access-class non-interference suite
 
@@ -360,8 +431,8 @@ Each step: what, failing-first test, done when.
 
 ### Step 17: reflection and the separate judge (stub)
 
-- `feedback/reflection.py`, `judge.py`: three pools including the deeper,
-  looser pool (c); a switch that removes pool (c) for the NO-AUDIT arm; judge
+- Minimal real producer (review 2): `feedback/reflection.py`, `judge.py`:
+  three pools including the deeper, looser pool (c); a switch that removes pool (c) for the NO-AUDIT arm; judge
   blind to source; per-source misses (`tree_missed`, `any_missed`); notes with
   lineage (including query subject tokens) and join class; write-time
   background search.
@@ -372,14 +443,20 @@ Each step: what, failing-first test, done when.
 
 ### Step 18: reverse audit
 
-- `feedback/reverse_audit.py`: model-free candidate generation (batched
-  percolation of every leaf against the stored queries added since the last
-  cycle, and kNN of those queries' vectors over leaf vectors), the gold-blind
-  priority rule, the caps `N_AUDIT` and `K_CAND`, judge confirmation, log check
-  against `offered_by_tree`, Wilson miss rate, flagging rule, pruning and
-  archiving rules; synthetic queries behind a switch, off by default.
-- Failing-first: a planted mis-filed leaf whose past query was logged and not
-  offered by the tree gets a miss rate of 1 with its query listed (broken:
+- Minimal real producer (review 2): `feedback/reverse_audit.py`: model-free
+  candidate generation (batched percolation of every leaf against the stored
+  queries added since the last cycle, and kNN of those queries' vectors over
+  leaf vectors), candidate searches and judge labels accumulated per leaf
+  across cycles, the gold-blind priority rule of DESIGN 12 (a sort), the caps
+  `N_AUDIT` and `K_CAND`, judge confirmation, log check against
+  `offered_by_tree`, Wilson miss rate, the flagging rule (`S_MIN = 2` missed
+  relevant searches and miss rate at least 0.5; review 2, F3), pruning and
+  archiving rules; synthetic queries behind a switch, off by default. Any
+  ranking beyond that sort comes after H1 (3A).
+- Failing-first: a planted mis-filed leaf whose two past queries were logged
+  in different cycles and not offered by the tree gets a miss rate of 1 with
+  both queries listed and is flagged (broken: candidates from the current
+  cycle only, so support never reaches 2; broken: support threshold 5; broken:
   audit against synthetic queries only misses the real query); the audit's
   judge calls per cycle never exceed `N_AUDIT` (broken: uncapped, counted);
   with synthetic queries off, a leaf with no search history is never re-filed
@@ -388,16 +465,25 @@ Each step: what, failing-first test, done when.
 
 ### Step 19: reorganiser and the replay gate
 
-- `feedback/reorganise.py`, `gate.py`: signals with clipped IPS weights,
-  operations producing a candidate generation (members and edges carrying the
-  candidate's generation and `lin_queries`), targeted replay with gate-only
-  synthetic queries that are never stored, judging of unjudged items at
-  replay, the betting confidence sequence (DESIGN 13.3), the general-replay
-  count guard, adoption and rollback by head compare-and-set;
-  `evalkit/gate_power.py` (the simulation behind EXPERIMENT 7.3).
-- Failing-first: on the fixture, the oracle candidate is adopted and the
-  random-moves candidate rejected (the gate positive controls; broken: a gate
-  that rejects everything must fail the oracle check); on the fixture stream,
+- Minimal real producer (review 2): `feedback/reorganise.py`, `gate.py`:
+  signals (confirmed hits, judge misses, audit misses) without IPS weighting;
+  the operations add membership, move and re-summarise, producing a candidate
+  generation per learning cycle (members and edges carrying the candidate's
+  generation and `lin_queries`); targeted replay with gate-only synthetic
+  queries that are never stored, grouped into clusters by operation and
+  spread over as many clusters as possible; judging of unjudged items at
+  replay; the exact cluster sign-flip test (DESIGN 13.3, review 2, F12); the
+  general-replay count guard; adoption and rollback by head compare-and-set;
+  `evalkit/gate_power.py` (the simulation behind EXPERIMENT 7.3, already
+  written and run). IPS-weighted signals, co-confirmation splits and merges
+  and the hub operation come after H1 behind the same interface (3A).
+- Failing-first: the exact p-value matches brute-force enumeration over all
+  sign vectors for K up to 12; a candidate with fewer than 8 clusters is never
+  adopted (broken: per-query test, which adopts one fully correlated cluster
+  of 60 paraphrases); on the fixture (at least 16 plants), the oracle
+  candidate is adopted and the random-moves candidate rejected (the gate
+  positive controls; broken: a gate that rejects everything must fail the
+  oracle check); on the fixture stream,
   LOOP repairs planted items in strata 2 and 3 and NO-AUDIT does not
   (difference at least 0.25); decoys are repaired less than plants;
   RANDOM-FEEDBACK and SHUFFLED-LOG candidates are rejected; rollback restores
@@ -415,9 +501,13 @@ Each step: what, failing-first test, done when.
   RECENCY-ONLY, the stream reader driver (EXPERIMENT 3.8) with opened-share
   bounds, recurring workload and probe generation from question and answer
   only with the rank filter, the exposed flag, planting with donor-sibling
-  metadata and the pinning hook, decoys, strata quotas, QUERY-MEMO,
-  AGENTIC and AGENT-A0, the EVAL-CACHE wrapper, `budget.py` (recomputes
-  EXPERIMENT 10.3), result-file schema with the required fields. Reused modules
+  metadata and the pinning hook, decoys, strata from A0 ranks at each
+  scheduled search's corpus prefix and their quotas, the offer audit and the
+  eligibility report (EXPERIMENT 3.6), fused final-list and tree-only recall,
+  bootstrap over recalls for the reader's count measures (EXPERIMENT 3.8),
+  QUERY-MEMO, AGENTIC and AGENT-A0, `budget.py` (already written and run; it
+  prints EXPERIMENT 10.3), result-file schema with the required fields. No
+  evaluation cache (review 2, F10). Reused modules
   are vendored from the owner's earlier evaluation harness with the source
   commit recorded in each file's header, and checked by the hygiene test.
 - Data probes, written to `docs/DATA.md`: every record and turn key with
@@ -435,10 +525,35 @@ Each step: what, failing-first test, done when.
   eleven task kinds (broken: adapter copying `has_answer` into `source_ref`);
   RECENCY-ONLY on a replay built without lag exceeds its margin (so the control
   can fail) and passes with lag; a stub opener that opens every pointer
-  violates the opened-share bound; a result file missing a required field is
-  refused.
+  violates the opened-share bound; a plant ranked fourth at its source
+  question's prefix and beyond 20 in the end pool lands in stratum 1 (broken:
+  end-pool ranks put it in stratum 2); a plant offered only through an
+  exploration slot before its repair is reclassified by the offer audit
+  (broken: audit over scheduled searches only); a plant at direct rank 30 of
+  its source question that only feeds the fused ranking and is never opened
+  is not reclassified (broken: an audit over every logged pointer empties
+  stratum 2); a result file missing a
+  required field is refused; on the fixture, with a perfect memo list (the
+  gold session first) while the tree, direct and linked lists all miss the
+  gold and share no item with each other (so no item outranks the memo's
+  first under RRF k = 60), QUERY-MEMO's fused final-list recall@10 is 1 and FROZEN's is 0, and
+  the H3 "beyond memo" comparison reads fused final-list recall (broken: a
+  comparison scored on tree-only recall gives both 0 and must fail);
+  the interval code refuses a Wilson interval for a measure not declared
+  binary, and opens per recall on 100 recalls whose opens vary from 0 to 6
+  (seeded) gets the bootstrap interval of a reference computation that
+  resamples recalls with the same seed (broken: Wilson on the total opens
+  over 100 recalls must be refused); the run driver refuses a confirmatory stage
+  whose `L`, `c` or another registered value differs from its freeze commit
+  and a second stamped run of a confirmatory stage, and allows resuming the
+  same run on the same commit (EXPERIMENT 3.7; broken: a driver that reads
+  `L` from the working configuration).
 
-### Step 21: comparison arms
+### Step 21: comparison arms (not needed for H1)
+
+Not needed for H1, so it may follow S6-H1 (3A). C1 and C2 make no model
+calls, so their S2 and S3 rows can be computed later on the stored S2 and S3
+structures; the proxy world is needed only by S4a and S4b.
 
 - `recall/compare/es_routing.py` (C1) and `collapsed.py` (C2), labelled
   COMPARISON in code and outputs; the proxy-world runner that uses C1 routing
@@ -450,15 +565,40 @@ Each step: what, failing-first test, done when.
 
 ### Step 22: stub-only loop on the fixture (stage S0)
 
-- Run the whole pipeline end to end on the fixture with the stub; all gates
-  in EXPERIMENT S0.
-- Done when every S0 gate passes in one stamped run.
+- Run the whole pipeline end to end on the fixture (at least 16 plants) with
+  the stub; all gates in EXPERIMENT S0, in two named, resumable checkpoints
+  (review 2, F13), each a stamped run on the same commit:
+  - S0-core: every probe and gate except the T5 floods. Estimated wall time
+    5 to 8 hours (ASSUMPTION until the first run measures it), dominated by
+    about 190 erasures with purge (E1 to E4 and E9, 3 runs each, plus E8),
+    each waiting 22 to 30 s for retention leases (LAB), about 1.5 hours; the
+    E7 scale test (a 1,000,000-document tenant with stub embeddings), about 1
+    to 2 hours; R1 to R7 with their trials and restarts, about 1 hour; the rest
+    (T1 to T4, T6, T7, A1 to A8, V1 to V7, the stub loop gates) about 1 to 2
+    hours. Resumable per probe: a probe that has passed on this commit is not
+    re-run after an interruption.
+  - S0-load: the T5 floods only: 6 flood kinds x 3 runs x 10 minutes = 180
+    minutes of loaded measurement, plus one 10-minute unloaded baseline per
+    flood kind (60 minutes) and a reset between runs (about 5 minutes each,
+    90 minutes): estimated 5.5 hours of wall time (ASSUMPTION). Floods run one
+    at a time on the single node, because parallel floods would change each
+    flood's baseline. Resumable per flood kind (each about 55 minutes).
+- Done when both checkpoints pass on the same commit. A partial set is
+  reported as S0 INCOMPLETE with the list of probes not yet run, never as a
+  pass.
+- Failing-first: the S0 report, given S0-core results alone, both
+  checkpoints with one probe missing or skipped, or the two checkpoints on
+  different commits, reports S0 INCOMPLETE and names what is missing
+  (broken: a report that passes S0 on S0-core alone must fail).
+- After the deferred parts of 3A land, both checkpoints are run again on that
+  commit before S4b or S6-H2 starts.
 
 ### Step 23: capped model client (needs S1 approval)
 
 - `model/claude_cli.py`: headless CLI calls from a neutral working directory
   with no hooks, no tools, no session persistence; full pinned model id; the
-  budget counter; the prompt leak check before the cache lookup (LAB pattern).
+  budget counter; the prompt leak check before the product cache lookup
+  (DESIGN 5.8; LAB pattern).
 - Failing-first: with the counter at its cap the client refuses without
   spawning a process; a prompt containing a gold-style id or a whitelisted-out
   dataset field marker is refused before any call; a throttle response pauses
@@ -467,12 +607,36 @@ Each step: what, failing-first test, done when.
   token assumptions (EXPERIMENT 10.2) with measured figures, committed before
   S2.
 
+## 3A. Built after H1, behind the same interfaces
+
+Not needed for S0 to S6-H1; built before S4b or S6-H2 starts, followed by a
+fresh S0 run (Step 22):
+
+- Graph refinements: decay, the degree cap with hub summary nodes (DESIGN
+  16.4), the personalised PageRank ablation.
+- Feedback refinements: IPS-weighted signals with clipped propensities
+  (DESIGN 11.1); split, merge and collapse driven by co-confirmation clusters
+  and the hub operation (DESIGN 11.2); any audit ranking beyond the sort of
+  DESIGN 12.
+- Step 21 (comparison arms C1 and C2, and the proxy world).
+- Development ablations (EXPERIMENT 4), each under its own approval and call
+  cap; they cannot change anything already frozen (EXPERIMENT 3.7).
+
+A2 and RANDOM-EDGES rows from S2 and S3 are exploratory; if the graph
+refinements change expansion, those rows are recomputed on the stored S2 and
+S3 structures before the freeze that precedes S6-H2 (EXPERIMENT 3.7).
+
+Each refinement enters behind the interface its minimal producer already
+uses, with its own failing-first test; the security probes that cover the
+artefacts it writes are re-run.
+
 ## 4. What each later stage needs from the owner
 
 S1 to S7b each need the owner's approval of that stage and its call cap
 (EXPERIMENT section 10); S6, S7a and S7b also need the release of the fresh
-set. The order of the stages and the stop rule after S6 are the owner's
-decision (EXPERIMENT 12, X6).
+set. The default order is S0, S1, S2, S3, S6-H1, then S6-H2, S4b and S7b,
+S4a and S7a (EXPERIMENT 10.3); any reduction or the stop rule after S6-H1 is
+the owner's decision (EXPERIMENT 12, X4 and X6).
 No step in this plan needs a human to create an account or type a password:
 the bootstrap secret and each tenant key owner's credential are generated into
 0600 files the same way and never displayed.
