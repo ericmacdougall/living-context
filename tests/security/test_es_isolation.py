@@ -32,11 +32,11 @@ class Adapter:
 
 
 def reset(admin):
-    for t in TENANTS:
-        admin.request("DELETE", f"/lc-{t}-*")
-        st, aliases = admin.request("GET", f"/lc-{t}-*/_alias")
-        admin.request("DELETE", f"/lc-sys-registry/_doc/{t}")
-    admin.request("DELETE", "/lc-sys-registry")
+    """Delete every index of the fixture tenants by NAME (wildcard deletes are refused by default)."""
+    st, rows = admin.request("GET", "/_cat/indices/lc-*?format=json&h=index")
+    for row in rows if st == 200 and isinstance(rows, list) else []:
+        if any(row["index"].startswith(f"lc-{t}-") for t in TENANTS) or row["index"] == "lc-sys-registry":
+            admin.request("DELETE", "/" + row["index"])
 
 
 class Forwarding(Gateway):
@@ -48,10 +48,11 @@ class Forwarding(Gateway):
         return {"ok": True, "raw": body}
 
 
-@unittest.skipUnless(HAVE, "no scratch cluster configured")
 class IsolationOnElasticsearch(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        if not HAVE:  # fail, never skip: a security probe that did not run is not a pass (LAB-R8)
+            raise RuntimeError("LC_TEST_ES_URL, LC_TEST_CA and LC_TEST_PW must point at a scratch cluster")
         cls.tmp = tempfile.TemporaryDirectory()
         root = Path(cls.tmp.name)
         cls.admin = EsClient(URL, CA, PW, scheme="basic", user="elastic")
@@ -87,6 +88,8 @@ class IsolationOnElasticsearch(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        if not HAVE:
+            return
         reset(cls.admin)
         cls.tmp.cleanup()
 
