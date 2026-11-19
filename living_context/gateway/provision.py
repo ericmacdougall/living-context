@@ -31,6 +31,7 @@ COMMON = {"tenant": {"type": "keyword"}, "cls": {"type": "keyword"}, "kind": {"t
           "erasure_rewrite": {"type": "long"}, "created_at": {"type": "date"}, "schema_v": {"type": "short"},
           "src_seq": {"type": "long"}, "gen_from": {"type": "long"}, "gen_to": {"type": "long"}}
 EXTRA = {
+    "cache": {"value": {"type": "object", "enabled": False}},
     "leaf": {"text": {"type": "text", "analyzer": "english"}, "title": {"type": "text"}, "entities": {"type": "keyword"},
              "size_tokens": {"type": "integer"}, "content_hash": {"type": "keyword"},
              "embedding": {"type": "dense_vector", "dims": 384, "similarity": "cosine",

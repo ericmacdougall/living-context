@@ -24,6 +24,7 @@ from __future__ import annotations
 import base64
 import datetime
 import json
+import threading
 import time
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional
@@ -41,6 +42,16 @@ STORED, HELD, REFUSED, EMPTY, TOO_LARGE, KEY_REUSE = "stored", "held", "refused"
 EMBED_MODEL = "stub-hashed-bow-v1"
 SCHEMA_V = 1
 CAS_TRIES = 50
+
+
+_SRC_LOCKS: dict = {}
+_SRC_LOCKS_GUARD = threading.Lock()
+
+
+def _src_lock(tenant: str, leaf_id: str, lv: int) -> threading.Lock:
+    """One lock per leaf version: the source check, the key creation and the source append are one step."""
+    with _SRC_LOCKS_GUARD:
+        return _SRC_LOCKS.setdefault((tenant, leaf_id, lv), threading.Lock())
 
 
 class WriterError(Exception):
@@ -188,15 +199,32 @@ class Writer:
 
     # ---- idempotency ------------------------------------------------------------------------------
     def _claim_id(self, principal: str, cls: str, key: str) -> str:
-        """Scope (tenant, principal, class, key). DESIGN 7.1 names (tenant, principal, key); the claim lives in
-        the class's control index, so that a lower-class reader cannot see it (ASSUMPTION: the class is part of the scope)."""
-        return "idem:" + self._ks.digest("idem", f"{self.tenant}\x00{principal}\x00{cls}\x00{key}".encode())[:40]
+        """Scope (tenant, principal, key), as DESIGN 7.1 names it: the class is NOT part of the scope. The full claim
+        (leaf id, version, sequence) lives in the class's control index so that a lower-class reader cannot see it;
+        a scope marker holding only the keyed digest of the body (which includes the class) lives in the tenant
+        control index, so the same key with a different body in another class is refused."""
+        return "idem:" + self._ks.digest("idem", f"{self.tenant}\x00{principal}\x00{key}".encode())[:40]
+
+    def _scope_marker(self, principal: str, key: str, digest: str, cls: str) -> Optional[WriteResult]:
+        tidx, cid = tenant_index(self.tenant, "ctl"), self._claim_id(principal, cls, key)
+        for _ in range(CAS_TRIES):
+            cur = self._get(tidx, cid)
+            if cur is None:
+                st, _ = self._put(tidx, cid, self._base("idem_scope", TENANT_CLS, body_digest=digest), cls=None, create=True)
+                if st in (200, 201):
+                    return None
+                continue
+            return None if cur["_source"].get("body_digest") == digest else WriteResult(KEY_REUSE)
+        raise WriterError("claim contended")
 
     def _claim(self, principal: str, key: str, body: bytes, cls: str):
         """Return (leaf_id, lv, src_seq) of the claim, or a WriteResult when the key was used with another body
         or the leaf is already complete (the first result is returned)."""
         idx = class_index(self.tenant, cls, "ctl")
         cid, digest = self._claim_id(principal, cls, key), self._ks.digest("idem", body)
+        refused = self._scope_marker(principal, key, digest, cls)
+        if refused is not None:
+            return refused
         for _ in range(CAS_TRIES):
             cur = self._get(idx, cid)
             if cur is None:
@@ -226,16 +254,28 @@ class Writer:
 
     # ---- steps --------------------------------------------------------------------------------------
     def _append_source(self, cls, leaf_id, lv, seq, text, tokens, source_ref) -> None:
+        with _src_lock(self.tenant, leaf_id, lv):  # check, key and append are one step (retries race otherwise)
+            self._append_source_locked(cls, leaf_id, lv, seq, text, tokens, source_ref)
+
+    def _append_source_locked(self, cls, leaf_id, lv, seq, text, tokens, source_ref) -> None:
         idx, did = tenant_index(self.tenant, "src"), f"{leaf_id}:{lv}"
-        if self._get(idx, did) is not None:
+        have = self._get(idx, did)
+        self._pause("src_checked")
+        if have is not None:
             return  # resumed after the append
         if self._ks.has_key(leaf_id, lv):  # a key made before a crash that never reached the append
             self._ks.destroy(leaf_id=leaf_id)
         ct, nonce, key_ref = self._ks.encrypt(leaf_id, lv, text.encode(), tokens)
+        self._pause("key_made")
         doc = self._base("src", cls, lin_subjects=tokens, lin_leaf_ids=[leaf_id], leaf_id=leaf_id, lv=lv, src_seq=seq,
                          ct=base64.b64encode(ct).decode(), nonce=base64.b64encode(nonce).decode(), key_ref=key_ref,
                          valid_from=_now(), ingested_at=_now(), source_ref=source_ref or {})
         self._put(idx, did, doc, cls=cls, create=True)
+        stored = self._get(idx, did)  # whoever won the create, the stored ciphertext must open under a live key
+        try:
+            self._ks.decrypt(leaf_id, lv, base64.b64decode(stored["_source"]["ct"]), base64.b64decode(stored["_source"]["nonce"]))
+        except KeystoreError as e:
+            raise WriterError("stored source does not open under its key") from e
 
     def _project(self, cls, leaf_id, lv, seq, text, tokens) -> None:
         doc = self._base("leaf", cls, lin_subjects=tokens, lin_leaf_ids=[leaf_id], src_seq=seq, text=text,

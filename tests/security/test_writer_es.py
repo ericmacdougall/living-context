@@ -61,7 +61,7 @@ class WriterOnElasticsearch(unittest.TestCase):
         root = Path(cls.tmp.name)
         cls.admin = EsClient(URL, CA, PW, scheme="basic", user="elastic")
         reset(cls.admin)
-        r = provision_tenant(cls.admin, T, ["base"], key_dir=root / "keys", data_root=root / "data", journal_size=65536)
+        r = provision_tenant(cls.admin, T, ["base", "restricted"], key_dir=root / "keys", data_root=root / "data", journal_size=65536)
         cls.gate = EsGate(URL, CA, {T: r["keys"]})
         cls.ks = Keystore(root / "ks" / f"{T}.db", T)
         cls.guard = Guard(TokenSource(cls.ks))
@@ -144,6 +144,68 @@ class WriterOnElasticsearch(unittest.TestCase):
         msg = self.run_checked(self.check_key_behaviour, self.writer(Lax))
         self.assertIsNotNone(msg)
         self.assertIn("another body was not refused", msg)
+
+    def test_idempotency_scope_is_tenant_principal_key_across_classes(self):
+        w = self.writer()
+        k = "xk-" + uuid.uuid4().hex[:8]
+        a = w.remember("tok", "base", "scope body one", key=k)
+        self.assertTrue(a.ok)
+        b = w.remember("tok", "restricted", "scope body one", key=k)  # same key, another class: another body
+        self.assertEqual(b.status, wmod.KEY_REUSE)
+        self.assertEqual(w.remember("tok", "base", "scope body one", key=k).leaf_id, a.leaf_id)
+        self.assertTrue(w.remember("tok2", "restricted", "scope body one", key=k).ok)  # another principal
+
+    def test_broken_per_class_scope_is_red(self):
+        class PerClass(Writer):
+            def _scope_marker(self, *a, **kw):
+                return None  # the claim is found per class only: the same key in another class is a new claim
+
+        w = self.writer(PerClass)
+        k = "xk-" + uuid.uuid4().hex[:8]
+        self.assertTrue(w.remember("tok", "base", "scope body two", key=k).ok)
+        self.assertTrue(w.remember("tok", "restricted", "scope body two", key=k).ok)  # accepted: what DESIGN 7.1 forbids
+
+    def race(self, lock_factory):
+        """Retry A finishes between retry B's source check and B's key step; the stored ciphertext must still open."""
+        k = "race-" + uuid.uuid4().hex[:8]
+        text = "race body " + k
+        b_at, b_go = threading.Event(), threading.Event()
+
+        def pause_b(step):
+            if step == "src_checked" and not b_at.is_set():
+                b_at.set()
+                self.assertTrue(b_go.wait(20))
+
+        # one open claim: the first writer claimed and crashed before the source step
+        w0 = self.writer(pause=lambda s: (_ for _ in ()).throw(Crash()) if s == "allocated" else None)
+        with self.assertRaises(Crash):
+            w0.remember("tok", "base", text, key=k)
+        out = {}
+        with mock.patch.object(wmod, "_src_lock", lock_factory):
+            tb = threading.Thread(target=lambda: out.__setitem__("b", self.writer(pause=pause_b).remember("tok", "base", text, key=k)))
+            tb.start()
+            self.assertTrue(b_at.wait(20))
+            ta = threading.Thread(target=lambda: out.__setitem__("a", self.writer().remember("tok", "base", text, key=k)))
+            ta.start()
+            ta.join(1.5)  # fixed code: A waits for B's lock; broken code: A finishes here
+            b_go.set()
+            tb.join(30)
+            ta.join(30)
+        res = out["a"]
+        src = self.doc(f"lc-{T}-src", f"{res.leaf_id}:{res.lv}")
+        try:
+            plain = self.ks.decrypt(res.leaf_id, res.lv, base64.b64decode(src["ct"]), base64.b64decode(src["nonce"]))
+        except KeystoreError:
+            self.fail("stored ciphertext lost its key")
+        self.assertEqual(plain.decode(), text)
+
+    def test_concurrent_retries_of_an_open_claim_keep_the_stored_key(self):
+        self.race(wmod._src_lock)
+
+    def test_broken_unlocked_source_step_destroys_the_stored_key(self):
+        msg = self.run_checked(self.race, lambda *a: threading.Lock())
+        self.assertIsNotNone(msg)
+        self.assertIn("lost its key", msg)
 
     def test_crash_after_each_step_then_retry_with_the_same_key_completes_one_leaf(self):
         for step in ("allocated", "source", "projection", "head"):

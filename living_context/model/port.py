@@ -56,6 +56,10 @@ class CallContext:
     input_classes: tuple = ()     # classes of every input to the call
     model_id: str = STUB_ID
     task_id: str = ""
+    lin_leaf_ids: tuple = ()      # lineage of the call: what the output was derived from (erasure reaches it)
+    lin_nodes: tuple = ()
+    lin_subjects: tuple = ()
+    lin_queries: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -94,6 +98,10 @@ class ModelPort:
         with self._lock:
             self.port_calls += 1
         name = task.value
+        lineage = {"lin_leaf_ids": ctx.lin_leaf_ids, "lin_nodes": ctx.lin_nodes, "lin_queries": ctx.lin_queries,
+                   "lin_subjects": tuple(ctx.lin_subjects) + tuple(inputs.get("subjects", []) if name in cachemod.PROMPT_BEARING else [])}
+        if getattr(self._store, "requires_lineage", False) and not any(lineage.values()):
+            raise PortRefused("a call without lineage cannot be cached inside the erasure closure")
         cls, scope = self._place(name, ctx)
         key = cachemod.cache_key(ctx.tenant, cls if self._class_in_cache else "", name, PROMPT_VERSION[name],
                                  ctx.model_id, scope, inputs)
@@ -118,6 +126,5 @@ class ModelPort:
             return CallResult(False, error=err)
         if not schema_ok(name, out):
             return CallResult(False, error="schema")
-        subjects = inputs.get("subjects", []) if name in cachemod.PROMPT_BEARING else []
-        self._store.put(cls, key, out, subjects)
+        self._store.put(cls, key, out, lineage)
         return CallResult(True, out)
