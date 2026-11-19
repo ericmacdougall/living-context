@@ -103,6 +103,32 @@ class Cap(unittest.TestCase):
             self.assertEqual(Budget(Path(d) / "b", 25).count(), 1)     # the attempt counted
             self.assertNotIn("strict_ok", p.rows[-1])
 
+    def test_an_allowance_limit_refusal_is_a_hard_stop_not_a_throttle_and_not_a_scored_failure(self):
+        refusal = json.dumps({"type": "result", "is_error": True, "result": "You've hit your weekly limit \u00b7 resets Nov 24 at 8am"})
+        for out in (cc.RunOut(1, refusal, "", 0.2), cc.RunOut(1, "", "Claude usage limit reached", 0.2), cc.RunOut(0, refusal, "", 0.2)):
+            with tempfile.TemporaryDirectory() as d:
+                p = port(d, Fake(out))
+                with self.assertRaises(cc.StageLimited):
+                    p.call(Task.JUDGE_RELEVANCE, {"query": "q", "text": "t"}, ctx=CTX)
+                self.assertTrue(p.rows[-1]["limited"])
+                self.assertEqual(Budget(Path(d) / "b", 25).count(), 1)
+
+    def test_model_text_that_mentions_a_limit_is_not_a_refusal(self):
+        ok = envelope({"score": 1, "relevant": True}, result=json.dumps({"score": 1, "relevant": True, "note": "weekly limit"}))
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(port(d, Fake(ok)).call(Task.JUDGE_RELEVANCE, {"query": "q", "text": "t"}, ctx=CTX).ok)
+
+    def test_a_streak_of_cli_failures_stops_the_stage_and_a_success_resets_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            seq = [cc.RunOut(1, "", "boom", 0.1)] * (cc.MAX_CLI_FAILURE_STREAK - 1) + [cc.RunOut(0, JUDGE, "", 0.1)]
+            r = Fake(lambda _p: seq.pop(0) if seq else cc.RunOut(1, "", "boom", 0.1))
+            p = port(d, r)
+            for _ in range(cc.MAX_CLI_FAILURE_STREAK):
+                p.call(Task.JUDGE_RELEVANCE, {"query": "q", "text": "t"}, ctx=CTX)
+            with self.assertRaises(cc.StageLimited):
+                for _ in range(cc.MAX_CLI_FAILURE_STREAK):
+                    p.call(Task.JUDGE_RELEVANCE, {"query": "q", "text": "t"}, ctx=CTX)
+
 
 class Invocation(unittest.TestCase):
     def test_argv_is_frozen_has_no_prompt_and_no_bare(self):

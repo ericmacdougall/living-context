@@ -32,9 +32,9 @@ from living_context.model.budget import Budget, BudgetExceeded
 from living_context.model.port import CallContext, CallResult, Task
 
 from . import claude_cli
-from .claude_cli import StagePaused
+from .claude_cli import StageLimited, StagePaused
 
-__all__ = ["Journal", "ResilientPort", "StageStopped", "StagePaused", "BudgetExceeded"]
+__all__ = ["Journal", "ResilientPort", "StageStopped", "StagePaused", "StageLimited", "BudgetExceeded"]
 
 
 class StageStopped(Exception):
@@ -86,7 +86,7 @@ class ResilientPort:
         self._retry_failed, self._fail_retries = tuple(retry_failed), failure_retries
         self._occ: Dict[str, int] = {}
         self._lock = threading.Lock()
-        self.replayed = self.fresh = self.lost = self.throttled = 0
+        self.replayed = self.fresh = self.lost = self.throttled = self.limited = 0
         self.delays: List[float] = []
         # the one possibly-lost call: the journal ends with a pending row and the counter moved past what it recorded
         last = journal.last
@@ -131,6 +131,12 @@ class ResilientPort:
                                      "ts": self._clock()})
                 try:
                     res = self._inner.call(task, inputs, ctx=ctx)
+                except StageLimited:
+                    # an allowance refusal or a failing CLI: the refused call is not answered, so a resume asks it again (it is charged
+                    # again, honestly); nothing is retried here
+                    self.limited += 1
+                    self.journal.append({"t": "limited", "key": key, "task": name, "ts": self._clock()})
+                    raise
                 except StagePaused:
                     self.throttled += 1
                     self.journal.append({"t": "throttled", "key": key, "task": name, "attempt": attempt, "ts": self._clock()})

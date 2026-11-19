@@ -43,6 +43,16 @@ SYSTEM_PROMPT = ("You are one component of a memory-retrieval pipeline. Reply wi
 THROTTLE = re.compile(r"rate.?limit|usage limit|overloaded|too many requests|\b429\b|\b529\b", re.I)
 
 
+# An allowance refusal (weekly, session or usage limit) does not clear by waiting a few minutes: it is a hard stop, never retried.
+LIMIT = re.compile(r"hit your (?:\w+ )*limit|(?:weekly|daily|monthly|session|5.?hour|usage|plan|credit) limit"
+                   r"|resets? (?:at|in|on) |out of (?:extra )?usage|credit balance", re.I)
+MAX_CLI_FAILURE_STREAK = 5      # consecutive non-zero exits of the CLI (any text) stop the stage: something is wrong, do not burn the cap
+
+
+class StageLimited(Exception):
+    """The allowance is exhausted or the CLI keeps failing: the stage stops with its state file. Never retried, never scored."""
+
+
 class StagePaused(Exception):
     """A throttle response: the stage pauses, the event is recorded, and it is not a scored failure."""
 
@@ -224,6 +234,7 @@ class CappedPort:
         self._forbidden, self.model_id, self._argv = tuple(forbidden), model_id, list(argv_record)
         self._lock = threading.Lock()
         self.port_calls = 0
+        self._fail_streak = 0
         self.spawned = 0
         self.rows: List[dict] = []
         self._log.parent.mkdir(parents=True, exist_ok=True)
@@ -255,6 +266,18 @@ class CappedPort:
             row = {"n": n, "task": name, "prompt_chars": len(prompt), "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:16],
                    "latency_s": round(ro.latency_s, 3), "rc": ro.rc, "stdout_chars": len(ro.stdout), "argv": self._argv,
                    "prompt_version": PROMPT_VERSION}
+            env0 = self._envelope(ro.stdout)
+            res_text = env0.get("result") if isinstance(env0, dict) and isinstance(env0.get("result"), str) else ""
+            refused = ro.rc != 0 or (isinstance(env0, dict) and bool(env0.get("is_error")))
+            if refused and LIMIT.search("%s\n%s\n%s" % (ro.stderr or "", res_text, ro.stdout if ro.rc != 0 else "")):
+                row.update(limited=True, error="limit")
+                self._append(row)
+                raise StageLimited("allowance limit response at call %d" % n)
+            self._fail_streak = self._fail_streak + 1 if ro.rc != 0 else 0
+            if self._fail_streak >= MAX_CLI_FAILURE_STREAK:
+                row.update(error="cli_error")
+                self._append(row)
+                raise StageLimited("%d consecutive CLI failures, last at call %d" % (self._fail_streak, n))
             if THROTTLE.search(ro.stderr or "") or (ro.rc != 0 and THROTTLE.search(ro.stdout or "")):
                 row.update(throttled=True, error="throttled")
                 self._append(row)

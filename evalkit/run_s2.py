@@ -28,9 +28,9 @@ from living_context.model.budget import Budget, BudgetExceeded
 from living_context.model.port import PortRefused
 
 from . import arms, claude_cli, dataset as ds, s2_stage
-from .s2_ports import Journal, ResilientPort, StagePaused, StageStopped
+from .s2_ports import Journal, ResilientPort, StageLimited, StagePaused, StageStopped
 
-RC = {"COMPLETE": 0, "STOPPED": 3, "CAP_REACHED": 4, "BUILD_FAILED": 5, "PAUSED_THROTTLE": 75, "ERROR": 1}
+RC = {"COMPLETE": 0, "STOPPED": 3, "CAP_REACHED": 4, "BUILD_FAILED": 5, "PAUSED_THROTTLE": 75, "LIMIT_REACHED": 76, "ERROR": 1}
 
 
 def write_state(run_dir: Path, state: str, **extra) -> int:
@@ -114,6 +114,8 @@ def run(a, pick_questions, *, embedder=None, runner=None, loader=None) -> int:
         state = "CAP_REACHED"
     except StagePaused:
         state = "PAUSED_THROTTLE"
+    except StageLimited as e:                     # allowance exhausted or the CLI keeps failing: stop at once, no retry, no back-off
+        state, extra = "LIMIT_REACHED", {"error": str(e)}
     except (BuildFailed, PortRefused) as e:       # a refused prompt (a gold-style id or marker in it) stops the stage before any charge
         state, extra = "BUILD_FAILED", {"error": "%s: %s" % (type(e).__name__, e)}
     except Exception as e:                        # leave a state file for the operator, then show the traceback

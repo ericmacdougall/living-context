@@ -39,8 +39,9 @@ def block(prompt, marker):
 
 class Runner:
     """Answers by task from the prompt; optionally creates the stop file at call `stop_at`, throttles the calls in `throttle`."""
-    def __init__(self, stop_at=None, stop_file=None, throttle=()):
+    def __init__(self, stop_at=None, stop_file=None, throttle=(), limit_from=None, crash_from=None):
         self.n, self.stop_at, self.stop_file, self.throttle = 0, stop_at, stop_file, set(throttle)
+        self.limit_from, self.crash_from = limit_from, crash_from
         self.prompts = []
 
     def argv(self):
@@ -53,6 +54,10 @@ class Runner:
             Path(self.stop_file).write_text("")
         if self.n in self.throttle:
             return cc.RunOut(1, "", "rate limit exceeded", 0.01)
+        if self.limit_from and self.n >= self.limit_from:     # the CLI's allowance refusal as the headless JSON envelope
+            return cc.RunOut(1, json.dumps({"type": "result", "is_error": True, "result": "You've hit your weekly limit \u00b7 resets Nov 24 at 8am"}), "", 0.01)
+        if self.crash_from and self.n >= self.crash_from:
+            return cc.RunOut(1, "", "segfault", 0.01)
         if "TASK route" in prompt:
             kids = block(prompt, "Children (JSON):")
             lab = kids[0]["label"]
@@ -147,6 +152,30 @@ class S2Body(unittest.TestCase):
             r = Runner(throttle=range(1, 1000))
             self.assertEqual(self.go(d, r, max_retries=2), 75)
             self.assertEqual(self.state(d)["counter"], 3)
+
+    def test_a_weekly_limit_refusal_stops_at_once_with_a_state_file_and_is_never_retried(self):
+        with tempfile.TemporaryDirectory() as d:
+            r = Runner(limit_from=1)
+            self.assertEqual(self.go(d, r), 76)
+            st = self.state(d)
+            self.assertEqual((st["state"], st["counter"], r.n, st["throttled"]), ("LIMIT_REACHED", 1, 1, 0))   # one charged call, no loop
+
+    def test_a_limit_in_the_middle_of_the_run_stops_there_and_a_resume_asks_the_refused_call_again(self):
+        with tempfile.TemporaryDirectory() as d:
+            r = Runner(limit_from=4)
+            self.assertEqual(self.go(d, r), 76)
+            self.assertEqual((self.state(d)["counter"], r.n), (4, 4))
+            r2 = Runner()
+            self.assertEqual(self.go(d, r2, resume=True), 0)
+            self.assertEqual(self.state(d)["lost_in_flight"], 0)
+
+    def test_a_failing_cli_stops_after_a_short_streak_instead_of_burning_the_cap(self):
+        with tempfile.TemporaryDirectory() as d:
+            r = Runner(crash_from=1)
+            rc = self.go(d, r)       # the first build call fails 3 times (its retries) and ends the stage (5) before the streak breaker (76)
+            self.assertIn(rc, (5, 76))
+            self.assertLessEqual(self.state(d)["counter"], cc.MAX_CLI_FAILURE_STREAK)
+            self.assertEqual(self.state(d)["counter"], r.n)
 
 
 if __name__ == "__main__":
