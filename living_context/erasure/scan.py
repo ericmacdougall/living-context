@@ -27,6 +27,15 @@ class Hit(NamedTuple):
     lin_nodes: tuple = ()
 
 
+TENANT_WIDE = ("src", "ctl", "authz")
+
+
+def index_class(tenant: str, index: str) -> str:
+    """The access class an index of the tenant belongs to (`lc-<t>-<class>-<kind>[-<suffix>]`), or `tenantwide`."""
+    parts = index[len(f"lc-{tenant}-"):].split("-")
+    return "tenantwide" if parts[0] in TENANT_WIDE else parts[0]
+
+
 def find(es: EsClient, tenant: str, *, subjects: Iterable[str] = (), leaf_ids: Iterable[str] = (),
          nodes: Iterable[str] = ()) -> list[Hit]:
     """Return (physical-or-alias index, doc id) of every document whose lineage names any of the given values."""

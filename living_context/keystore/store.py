@@ -168,6 +168,26 @@ class Keystore:
             raise KeystoreError("ciphertext does not match this leaf version") from e
 
     # --- destroy ------------------------------------------------------------------
+    def destroy_versions(self, versions: Iterable[tuple]) -> list[str]:
+        """Destroy the data keys of the named (leaf id, highest version to destroy) pairs: every version of the leaf up to and
+        including that one. A relabel's replay uses it so the keys of the new-class version, which has a higher number, stay."""
+        db = self._db
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            rows = []
+            for lid, max_lv in sorted(set(versions)):
+                rows += db.execute("SELECT leaf_id, lv, key_ref FROM leaf_keys WHERE leaf_id=? AND lv<=?", (lid, int(max_lv))).fetchall()
+            for lid, lv, _ in rows:
+                db.execute("DELETE FROM leaf_keys WHERE leaf_id=? AND lv=?", (lid, lv))
+                db.execute("DELETE FROM leaf_subjects WHERE leaf_id=? AND lv=?", (lid, lv))
+            db.execute("COMMIT")
+        except Exception:
+            db.execute("ROLLBACK")
+            raise
+        if rows:
+            self._after_destroy(db)
+        return [r[2] for r in rows]
+
     def destroy(self, *, subject_token: str | None = None, leaf_id: str | None = None,
                 leaf_ids: Iterable[str] | None = None) -> list[str]:
         """Destroy every data key named by a subject token, by a leaf, or by a set of leaves (one VACUUM for the whole call,
@@ -213,7 +233,7 @@ def _locked(fn):
 
 
 for _name in ("subject_token", "digest", "has_key", "principal_token", "register_identifier", "encrypt",
-              "decrypt", "destroy", "count_keys"):
+              "decrypt", "destroy", "destroy_versions", "count_keys"):
     setattr(Keystore, _name, _locked(getattr(Keystore, _name)))
 
 

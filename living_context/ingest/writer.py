@@ -164,16 +164,21 @@ class Writer:
     # ---- the write ---------------------------------------------------------------------------------
     def remember(self, principal: str, cls: str, text: str, *, subjects_declared: Iterable[str] = (),
                  key: Optional[str] = None, source_ref: Optional[dict] = None, refresh: bool = True,
-                 _admitted: bool = False) -> WriteResult:
+                 _admitted: bool = False, _version: Optional[tuple] = None) -> WriteResult:
         """A commit: takes the shared side of the tenant's write gate (an erasure's closure-to-boundary holds it
         exclusively), and the guard check runs inside it so a tombstone published meanwhile is seen."""
         with self._gate.shared():
             return self._remember(principal, cls, text, subjects_declared=subjects_declared, key=key,
-                                  source_ref=source_ref, refresh=refresh, _admitted=_admitted)
+                                  source_ref=source_ref, refresh=refresh, _admitted=_admitted, _version=_version)
+
+    def relabel_write(self, principal: str, leaf_id: str, lv: int, new_cls: str, text: str, **kw) -> WriteResult:
+        """The new-class copy of a relabelled leaf (DESIGN 14.1): the same leaf id with a new `lv`, written after the old-class
+        copy was erased at its boundary (`Executor.relabel_erase`). `lv` must be above every version that existed."""
+        return self.remember(principal, new_cls, text, _version=(leaf_id, int(lv)), **kw)
 
     def _remember(self, principal: str, cls: str, text: str, *, subjects_declared: Iterable[str] = (),
                   key: Optional[str] = None, source_ref: Optional[dict] = None, refresh: bool = True,
-                  _admitted: bool = False) -> WriteResult:
+                  _admitted: bool = False, _version: Optional[tuple] = None) -> WriteResult:
         if cls == TENANT_CLS:
             return WriteResult(REFUSED)
         if not isinstance(text, str) or not text.strip():
@@ -195,7 +200,7 @@ class Writer:
                 return claim
             leaf_id, lv, seq = claim
         else:
-            leaf_id, lv, seq = new_leaf_id(), 1, self.next_seq()
+            leaf_id, lv, seq = (_version[0], _version[1], self.next_seq()) if _version else (new_leaf_id(), 1, self.next_seq())
         job = self._wp.begin(seq) if self._wp is not None else None
         try:
             self._pause("allocated")

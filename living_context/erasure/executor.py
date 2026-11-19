@@ -52,6 +52,7 @@ class Receipt:
     seq: int = 0
     boundary_s: float = 0.0
     closure: dict = field(default_factory=dict)
+    by_class: dict = field(default_factory=dict)    # (kind, class) -> documents in the closure
     keys_destroyed: int = 0
     deleted: int = 0
     rewritten: int = 0
@@ -67,7 +68,8 @@ class Executor:
                  journal: TombstoneJournal, gate: WriteGate, fence: SendFence, state: State, *,
                  pause: Optional[Callable[[str], None]] = None, transitive: bool = True, destroy_only_keys: bool = False,
                  purge_deadline_s: float = purge.DEFAULT_DEADLINE_S, purge_interval_s: float = 3.0,
-                 broken_delete_foreign_log_rows: bool = False, es_log: Optional[Callable[[], EsClient]] = None):
+                 broken_delete_foreign_log_rows: bool = False, es_log: Optional[Callable[[], EsClient]] = None,
+                 broken_skip_authz: bool = False, broken_relabel_keeps_old_copy: bool = False, broken_relabel_all_classes: bool = False):
         self._er, self._st, self.tenant, self._ks = es_erase, es_struct, tenant, keystore
         self._j, self._gate, self._fence, self.state = journal, gate, fence, state
         self._pause = pause or (lambda s: None)
@@ -75,6 +77,9 @@ class Executor:
         self._pd, self._pi = purge_deadline_s, purge_interval_s
         self._lg = es_log or es_struct   # the rewrite of a log row needs write on the log indices (the erase key has delete only)
         self._del_foreign = broken_delete_foreign_log_rows  # BROKEN variant: another actor's history is deleted too
+        self._skip_authz = broken_skip_authz   # BROKEN variant: the closure replay does not cover the authz index
+        self._relabel_keeps = broken_relabel_keeps_old_copy   # BROKEN variant: the relabel publishes the tombstone and erases nothing
+        self._relabel_all = broken_relabel_all_classes       # BROKEN variant: the relabel closure ignores the class
 
     # ---- closure ---------------------------------------------------------------------------------------------
     def closure(self, subject: str) -> tuple[dict, set]:
@@ -95,6 +100,8 @@ class Executor:
                         if h.kind == "node":
                             nxt.add(h.id)
                 frontier = nxt
+        if self._skip_authz:
+            hits = {k: h for k, h in hits.items() if not h.index.startswith(f"lc-{self.tenant}-authz")}
         return hits, leaves
 
     # ---- the request ------------------------------------------------------------------------------------------
@@ -118,14 +125,124 @@ class Executor:
                 apply_guard()
             rc.seq, rc.boundary_s = seq, time.monotonic() - t0
         self._pause("boundary")
-        # ---- after the boundary: keys, deletes, rewrites, purge ------------------------------------------------
+        return self._physical(hits, leaves, subject, seq, rc)
+
+    def replay(self, subject: str, leaf_ids: Iterable[str], seq: int, *, apply_guard: Callable[[], None] = lambda: None,
+               run_purge: bool = True) -> Receipt:
+        """A restore (DESIGN 14.6 steps 1 and 2): the journal tombstone `seq` is re-recorded in `ctl`, made effective in memory, and
+        its closure is replayed over EVERY index of the tenant (authz and control included) with the same deletes, strips and
+        rewrites as the original erasure. Runs with the tenant disabled; takes no journal append."""
+        t0 = time.monotonic()
+        er, rc = self._er(), Receipt()
+        leaves = set(leaf_ids)
+        with self._gate.exclusive():
+            er.request("POST", f"/lc-{self.tenant}-*/_refresh")
+            hits, found = self.closure(subject)
+            leaves |= found
+            if leaves:
+                for h in scan.find(er, self.tenant, leaf_ids=leaves):
+                    hits[(h.index, h.id)] = h
+            redact = sorted({h.id for h in hits.values()} | leaves)
+            tomb = {"tenant": self.tenant, "cls": "tenantwide", "kind": "tomb", "lin_leaves": [], "lin_leaf_ids": [],
+                    "lin_nodes": [], "lin_subjects": [], "lin_queries": [], "derivation": "erase", "erasure_rewrite": 0,
+                    "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "schema_v": 1, "seq": seq}
+            self._st().request("PUT", f"/{tenant_index(self.tenant, 'ctl')}/_doc/tb:{seq}", tomb)
+            er.request("POST", f"/{tenant_index(self.tenant, 'ctl')}/_refresh")
+            with self._fence.exclusive():
+                self.state.apply(seq, redact, leaves)
+                apply_guard()
+            rc.seq, rc.boundary_s = seq, time.monotonic() - t0
+        return self._physical(hits, leaves, subject, seq, rc, run_purge=run_purge)
+
+    # ---- class relabel (DESIGN 14.1, review F19c) -----------------------------------------------------------------------
+    def class_closure(self, leaf_ids: Iterable[str], cls: str) -> tuple[dict, dict]:
+        """The old-class copy of the leaves: documents that name a leaf id and live in an index of class `cls` (or are the
+        tenant-wide source records of its versions), then upward through `lin_nodes` inside the class. Returns the hits and
+        {leaf id: highest version that existed}. Documents of other classes are never in it."""
+        er, leaf_ids = self._er(), set(leaf_ids)
+        hits, lv_max = {}, {}
+        for h in scan.find(er, self.tenant, leaf_ids=leaf_ids):
+            icls = scan.index_class(self.tenant, h.index)
+            if icls == cls or (icls == "tenantwide" and h.kind == "src") or self._relabel_all:
+                hits[(h.index, h.id)] = h
+                if h.kind in ("src", "leaf") and ":" in h.id:
+                    lid, _, lv = h.id.rpartition(":")
+                    if lid in leaf_ids and lv.isdigit():
+                        lv_max[lid] = max(lv_max.get(lid, 0), int(lv))
+        frontier = {h.id for h in hits.values() if h.kind == "node"}
+        while frontier:
+            nxt = set()
+            for h in scan.find(er, self.tenant, nodes=frontier):
+                if (scan.index_class(self.tenant, h.index) == cls or self._relabel_all) and (h.index, h.id) not in hits:
+                    hits[(h.index, h.id)] = h
+                    if h.kind == "node":
+                        nxt.add(h.id)
+            frontier = nxt
+        return hits, lv_max
+
+    @staticmethod
+    def _within(h, lv_max: dict) -> bool:
+        """Source and leaf documents of a version above the relabelled one (the new-class copy) are not part of the old copy."""
+        if h.kind in ("src", "leaf") and ":" in h.id:
+            lid, _, lv = h.id.rpartition(":")
+            return not (lid in lv_max and lv.isdigit() and int(lv) > int(lv_max[lid]))
+        return True
+
+    def relabel_erase(self, leaf_ids: Iterable[str], old_cls: str, *, apply_guard: Callable[[], None] = lambda: None) -> Receipt:
+        """An upward relabel is an erasure of the old-class copy: a tombstone with scope (leaf ids, old class) and its redact set is
+        published at the boundary, then the usual keys, deletes, rewrites and purge of every old-class artefact derived from it.
+        The caller writes the new version (a higher `lv`) in the new class afterwards."""
+        t0, er, rc = time.monotonic(), self._er(), Receipt()
+        leaf_ids = sorted(set(leaf_ids))
+        with self._gate.exclusive():
+            er.request("POST", f"/lc-{self.tenant}-*/_refresh")
+            hits, lv_max = self.class_closure(leaf_ids, old_cls)
+            redact = sorted({h.id for h in hits.values()})
+            seq = self._j.append({"subject": "", "leaf_ids": leaf_ids, "cls": old_cls, "lv_max": lv_max, "redact": redact})
+            self._record_and_publish(seq, redact, set(), rc, t0, apply_guard)
+        self._pause("boundary")
+        if self._relabel_keeps:
+            return rc
+        return self._physical(hits, set(leaf_ids), "", seq, rc, cls=old_cls, lv_max=lv_max)
+
+    def replay_relabel(self, leaf_ids: Iterable[str], old_cls: str, seq: int, lv_max: dict, *, run_purge: bool = True) -> Receipt:
+        """The restore's replay of a relabel tombstone: the old-class closure only; the new-class version (a higher `lv`) stays."""
+        t0, er, rc = time.monotonic(), self._er(), Receipt()
+        with self._gate.exclusive():
+            er.request("POST", f"/lc-{self.tenant}-*/_refresh")
+            hits, _ = self.class_closure(leaf_ids, old_cls)
+            hits = {k: h for k, h in hits.items() if self._relabel_all or self._within(h, lv_max)}
+            redact = sorted({h.id for h in hits.values()})
+            self._record_and_publish(seq, redact, set(), rc, t0, lambda: None)
+        return self._physical(hits, set(leaf_ids), "", seq, rc, run_purge=run_purge, cls=old_cls, lv_max=lv_max)
+
+    def _record_and_publish(self, seq: int, redact: list, leaves: set, rc: Receipt, t0: float, apply_guard) -> None:
+        er = self._er()
+        tomb = {"tenant": self.tenant, "cls": "tenantwide", "kind": "tomb", "lin_leaves": [], "lin_leaf_ids": [],
+                "lin_nodes": [], "lin_subjects": [], "lin_queries": [], "derivation": "erase", "erasure_rewrite": 0,
+                "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "schema_v": 1, "seq": seq}
+        self._st().request("PUT", f"/{tenant_index(self.tenant, 'ctl')}/_doc/tb:{seq}", tomb)
+        er.request("POST", f"/{tenant_index(self.tenant, 'ctl')}/_refresh")
+        with self._fence.exclusive():
+            self.state.apply(seq, redact, leaves)
+            apply_guard()
+        rc.seq, rc.boundary_s = seq, time.monotonic() - t0
+
+    def _physical(self, hits: dict, leaves: set, subject: str, seq: int, rc: Receipt, *, run_purge: bool = True,
+                  cls: Optional[str] = None, lv_max: Optional[dict] = None) -> Receipt:
+        er = self._er()
         rc.closure = {}
         for h in hits.values():
             rc.closure[h.kind] = rc.closure.get(h.kind, 0) + 1
-        rc.keys_destroyed = len(self._ks.destroy(subject_token=subject))
-        rc.keys_destroyed += len(self._ks.destroy(leaf_ids=leaves))
+            key = (h.kind, scan.index_class(self.tenant, h.index))
+            rc.by_class[key] = rc.by_class.get(key, 0) + 1
+        if cls is not None:   # a relabel destroys the keys of the old versions only
+            rc.keys_destroyed = len(self._ks.destroy_versions((lid, (lv_max or {}).get(lid, 0)) for lid in leaves))
+        else:
+            rc.keys_destroyed = len(self._ks.destroy(subject_token=subject))
+            rc.keys_destroyed += len(self._ks.destroy(leaf_ids=leaves))
         if self._keys_only:  # BROKEN variant: the keys are gone, the plaintext projections stay
-            rc.recount = len(scan.find(er, self.tenant, subjects=[subject]))
+            rc.recount = len(scan.find(er, self.tenant, subjects=[subject] if subject else [], leaf_ids=leaves if cls else ()))
             return rc
         touched: set[str] = set()
         for h in list(hits.values()):
@@ -143,12 +260,16 @@ class Executor:
             return ix, purge.purge_index(er, ix, deadline_s=self._pd, interval_s=self._pi)
 
         with ThreadPoolExecutor(max(1, min(8, len(touched)))) as ex:  # the tombstone clocks run side by side
-            for ix, res in ex.map(one, sorted(touched)):
+            for ix, res in ex.map(one, sorted(touched) if run_purge else []):
                 rc.purge_s[ix] = round(res.seconds, 1)
                 rc.purge_left[ix] = res.deleted_left
                 rc.purge_ok &= res.ok
         er.request("POST", f"/lc-{self.tenant}-*/_refresh")
-        remaining = [h for h in scan.find(er, self.tenant, subjects=[subject], leaf_ids=leaves) if h.kind not in KEEP_KINDS | REWRITE_KINDS]
+        remaining = [h for h in scan.find(er, self.tenant, subjects=[subject] if subject else [], leaf_ids=leaves)
+                     if h.kind not in KEEP_KINDS | REWRITE_KINDS]
+        if cls is not None:   # the new-class copy names the same leaf ids: only the old class's documents are residue
+            remaining = [h for h in remaining if self._within(h, lv_max or {}) and
+                         (scan.index_class(self.tenant, h.index) == cls or h.kind == "src")]
         rc.recount = len(remaining)
         return rc
 
