@@ -33,9 +33,10 @@ class Hit:
 class DirectSearch:
     def __init__(self, client_for: Callable[[str], EsClient], tenant: str, *,
                  embed: Callable[[str], list] = embed_stub.embed, window: int = WINDOW, k: int = K_RRF,
-                 mode: str = HYBRID):
+                 mode: str = HYBRID, redacted: Callable[[str], bool] = lambda doc_id: False):
         self._client_for, self.tenant, self._embed = client_for, tenant, embed
         self._window, self._k, self._mode = window, k, mode
+        self._redacted = redacted  # the published redact set (DESIGN 14.3): consulted from the boundary until the purge ends
         self.plan: list[str] = []
 
     def classes_for(self, p: Principal, lattice: ClassLattice, wanted: Optional[Sequence[str]] = None) -> list[str]:
@@ -70,6 +71,8 @@ class DirectSearch:
                         srcs[h["_id"]] = h.get("_source") or {}
                 lists.append(ids)
             for doc_id, score in rrf(lists, self._k, self._window):
+                if self._redacted(doc_id) or self._redacted(doc_id.split(":")[0]):
+                    continue
                 merged.append((score, cls, doc_id, srcs.get(doc_id, {})))
         merged.sort(key=lambda t: (-t[0], t[1], t[2]))
         return [Hit(cls, doc_id, src.get("title", ""), int(src.get("size_tokens", 0)), score)
