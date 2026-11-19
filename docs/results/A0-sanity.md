@@ -16,7 +16,16 @@ the pinned real embedder (multilingual-e5-small, pinned revision, CPU), then fla
 | Search time for 94 questions | 4.2 s (strong), 3.2 s (text only); no failed search |
 
 Reading. The data path, the real embedder, the writer and the flat arm work at real scale on one pooled tenant of the pilot
-haystacks. The two A0 field variants return identical recall here: likely because on a tenant built without model calls the entity
-field is empty (not checked), so the "stronger baseline" choice (EXPERIMENT A0 definition, `--a0-fields`) only differs once a
-tree build has filled entity fields. Per-leaf figures on one pooled tenant are not those of the S2 pool (30 questions, each
-haystack on its own, 1,412 sessions).
+haystacks. The two A0 field variants return the same recall@10, and this is a real tie, not a parameter that did not take effect:
+checked on the same index, title is filled for all 19,605 leaves and entities for 18,909 (code-built, no model call), the BM25 field
+list reaches the query, and on 40 of the pilot questions the BM25 lists of the two variants differ in the top-10 order for 7 and in the
+top-50 order for 13 (scores differ in 8 top-10 lists). The difference is absorbed by the fusion with the vector list and by cutting to
+distinct sessions, so the mean recall@10 is identical to 16 digits at this size. Both variants stay registered as one parameter.
+
+Stated limit (embedding). The tokenizer warning "560 > 512" printed during ingest comes from tokenizing a whole leaf before it is cut
+into windows. Leaves are not truncated: a leaf longer than 480 tokens is embedded in 480-token windows and its vector is the normalised
+mean of the window vectors (34,271 windows for 19,605 leaves). Queries are cut at 480 tokens, which no question reaches. A0 and A1 read
+the same leaf vectors and the same query vector function, so both see the same windowing; the mean-of-windows vector is a design
+assumption (DESIGN 18.3) that lowers the sharpness of long-leaf vectors for both arms alike.
+
+Per-leaf figures on one pooled tenant are not those of the S2 pool (30 questions, 1,412 sessions, 5,988 leaves).
