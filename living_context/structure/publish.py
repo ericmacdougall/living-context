@@ -94,16 +94,18 @@ class Publisher:
             self._put("node", n.ref, self._node_doc(n), create=True)
             written.append(("node", n.ref))
         for parent, leaf_id, lv, score in tree.members:
-            mid = f"{parent}>{leaf_id}:{lv}"
-            doc = self._base("member", lin_leaf_ids=[leaf_id], lin_nodes=[parent], parent_id=parent, child_id=f"{leaf_id}:{lv}",
+            node_id = parent.split(":")[0]   # a member names its parent by the stable node id, never by a version
+            mid = f"{node_id}>{leaf_id}:{lv}"
+            doc = self._base("member", lin_leaf_ids=[leaf_id], lin_nodes=[node_id], parent_id=node_id, child_id=f"{leaf_id}:{lv}",
                              score=score, shaped_by="build", gen_from=gen, gen_to=[])
             self._put("member", mid, doc, create=True)
             written.append(("member", mid))
+        created_nodes = list(tree.nodes)
         self._pause("written")
         ancestry = list(expect_head["ancestry"]) + [gen] if expect_head else [gen]
         mf = self._base("manifest", lin_nodes=list(tree.top) or ["none"], family=self.family, gen=gen, top=list(tree.top),
                         W=watermark, parent_gen=(expect_head or {}).get("gen"), ancestry=ancestry, status="candidate",
-                        levels=tree.levels, tombstone_seq=0)
+                        levels=tree.levels, tombstone_seq=0, created_nodes=created_nodes)
         self._put("ctl", f"mf:{self.family}:{gen}", mf, create=True)
         written.append(("ctl", f"mf:{self.family}:{gen}"))
         if self._refresh:  # searchable publication: nothing flips before every index written has been refreshed

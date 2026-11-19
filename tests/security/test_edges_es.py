@@ -87,6 +87,7 @@ class EdgesOnElasticsearch(unittest.TestCase):
         self.admin.request("POST", f"/lc-{T}-*/_refresh")
 
     def clear_edges(self):
+        self.refresh()   # a delete-by-query sees only refreshed documents
         for c in CLASSES:
             self.admin.request("POST", f"/lc-{T}-{c}-edge/_delete_by_query?refresh=true&conflicts=proceed", {"query": {"match_all": {}}})
         self.admin.request("POST", f"/lc-{T}-ctl/_delete_by_query?refresh=true&conflicts=proceed", {"query": {"terms": {"_id": ["wp"]}}})

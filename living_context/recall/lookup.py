@@ -54,6 +54,12 @@ class Resolver:
         return {"status": "ok", "text": doc["text"]}
 
     def _node(self, p: Pointer) -> dict:
+        answer = getattr(self._s, "node_answer", None)
+        if answer is not None:   # a store that knows the node's class (the Elasticsearch store): one answer, class-checked
+            got = answer(p)
+            if got is None or (self._check_class and got[0] not in self._classes):
+                return dict(UNAVAILABLE)
+            return got[1]
         st = self._s.gen_status(p.gen)
         if st == "live":
             return {"status": "ok"}
@@ -70,8 +76,9 @@ class EsLeafStore:
     `ingest` key); the class check is the Resolver's, never this store's. Node generations are not served from here
     (`gen_status` answers None, so a node pointer is `unavailable` until Step 13 adds the retention records)."""
 
-    def __init__(self, es, tenant: str):
+    def __init__(self, es, tenant: str, node_es=None):
         self._es, self._t = es, tenant
+        self._nes = node_es or es   # node and control indices are read with the structure key, leaves with the ingest key
 
     def _search(self, pattern: str, ids: list, source: list):
         st, r = self._es.request("POST", f"/{pattern}/_search?ignore_unavailable=true", {
@@ -91,3 +98,33 @@ class EsLeafStore:
 
     def forwarding(self, gen: int, node_id: str) -> Optional[list]:
         return None
+
+    def node_answer(self, p, family: str = "topic"):
+        """(class, answer) for a node pointer, or None (unavailable). A node document that still exists answers `ok` while
+        its generation is retained or still shared with a retained one (documents are immutable, so the content is never another
+        node's); once retention expiry removed it, the `xp:` record names its class and the answer is `moved` with the forwarding
+        ids of the first later generation that replaced the node, else `expired`."""
+        ref = f"{p.id}:{p.version}"
+        es, self._es = self._es, self._nes
+        try:
+            return self._node_answer(p, ref, family)
+        finally:
+            self._es = es
+
+    def _node_answer(self, p, ref: str, family: str):
+        src = self._search(f"lc-{self._t}-*-node", [ref], ["cls"])
+        if src is not None:
+            mf = self._search(f"lc-{self._t}-{src['cls']}-ctl", [f"mf:{family}:{p.gen}"], ["status"])
+            if mf is None or mf.get("status") == "rejected":
+                return None
+            return src["cls"], {"status": "ok"}
+        xp = self._search(f"lc-{self._t}-*-ctl", [f"xp:{ref}"], ["cls"])
+        if xp is None:
+            return None
+        st, r = self._es.request("POST", f"/lc-{self._t}-{xp['cls']}-ctl/_search", {
+            "size": 1, "_source": ["new_ids"], "sort": [{"gen": "asc"}], "query": {"bool": {"filter": [
+                {"term": {"old_id": p.id}}, {"term": {"forward": True}}, {"range": {"gen": {"gt": p.gen}}}]}}})
+        hits = r["hits"]["hits"] if st == 200 else []
+        if hits:
+            return xp["cls"], {"status": "moved", "forward": list(hits[0]["_source"]["new_ids"])}
+        return xp["cls"], {"status": "expired"}

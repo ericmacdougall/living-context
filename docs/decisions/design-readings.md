@@ -48,3 +48,17 @@ Each entry names the passages, the reading the build follows and the test that k
   process holds the writer); a second writer process would need a realtime source for both.
 - 16.3 "set valid_to on the older leaf's head" is not built in Step 12; a `supersedes` edge is written and the expander returns the
   superseding partner with a superseded leaf.
+
+## Versioning and rebuild (DESIGN 5.3, 5.6, 7.5, 7.6, 13.2; main-accepted reading ASSUMPTION, listed by the Step 13 owner)
+
+- Members name their parent by the stable node id, not by a node version: a member placed while node `X:2` was live must still
+  find its parent after `X:3` is published. The view queries both spellings.
+- A builder that finds a node version id it meant to create already present treats the attempt as lost (the other builder owns
+  that version), never overwrites it and never deletes it on discard; a node version is created with create-only semantics.
+- Placement thresholds by depth (0.0, 0.05, 0.10, 0.20) and the summary refresh rule (4 new children or 25% size change) follow 7.5
+  and 7.6; a node that does not refresh keeps its summary and is marked `stale`.
+- Not built in Step 13: merge of an under-full node into its sibling, collapse of single-child chains, a pending-new node in a tree
+  taller than one level (the rebuild refuses it), the tombstone check before the flip beyond the `abort_if` hook, and the
+  evaluation-only pinning hook. Step 13 is therefore PARTIAL on those items.
+- Node pointers: a retained node document answers `ok`; once retention removed it an `xp:` record (ids only, class) gives `moved`
+  with the forwarding ids of the first later generation that replaced it, else `expired`.
