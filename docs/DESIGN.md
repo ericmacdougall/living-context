@@ -507,10 +507,19 @@ atomic with the send.
   the kernel; only bytes handed to the kernel before it may still reach the
   peer. Those the kernel still holds for the connection at the flip or
   boundary (its output queue, which the gateway reads) are at most the
-  connection's send buffer, which the gateway sets on every accepted
-  connection (`SO_SNDBUF`) so that the effective size the kernel reports is
-  at most 64 KiB, and checks at accept (ASSUMPTION), so at most the tenant's
-  open-connection cap (15) times 64 KiB in aggregate. On a TCP connection,
+  at most 64 KiB per connection, enforced by the hand-off itself (main's
+  decision after probe LC-PB, ASSUMPTION): under the shared side of the fence
+  the hand-off reads the connection's queued byte count (`SIOCOUTQ`) and makes
+  one non-blocking write of at most 64 KiB minus that count, and none when the
+  count is 64 KiB or more. The send buffer size alone does not bound it:
+  Linux doubles the value given to `SO_SNDBUF`, and with an effective 64 KiB
+  the kernel queue was measured above 64 KiB (106,112 bytes on TCP loopback,
+  68,096 on a unix stream socket; docs/PROBES.md). The gateway still requests a
+  32 KiB send buffer on every accepted connection (an effective 64 KiB on
+  Linux), so at most the tenant's
+  open-connection cap (15) times 64 KiB in aggregate. The bound is measured on
+  loopback (TCP and unix) only and is not established for remote peers, TLS or
+  peer-side autotuning (20). On a TCP connection,
   bytes already moved into the peer's receive buffer before the flip or
   boundary are outside this bound and the peer may read them later, so the
   bound is measured at the gateway (its hand-off trace and each connection's
@@ -874,7 +883,12 @@ manifests, forwarding records, redact sets and dirty queues of that class
 class ids are lowercase `[a-z0-9]{4,16}` with no hyphen, so no name can be a
 prefix of another tenant's pattern (ASSUMPTION; probe P2 includes a
 look-alike tenant name). Each name is an alias to a physical index
-`...-p<n>` so the copy-and-swap purge (14.5) can replace it.
+`...-p<8 random hex>` so the copy-and-swap purge (14.5) can replace it. The suffix
+is random and never a counter: probe P2 found that `_mget` on an alias name
+returns the concrete index behind it to a key that may not read it, and a
+sequential suffix would then disclose how often an index was swapped (main's
+mitigation under the P2 "accept with mitigations" ASSUMPTION; the gateway also
+never forwards an Elasticsearch error body, sub-response or index name, 8.7).
 
 ### 6.3 Keys and roles
 
@@ -1282,7 +1296,7 @@ the `linked` section, tagged `edge`.
 | Scoring statistics | per class and per tenant indices, so BM25 statistics never include hidden documents (the vendor's DLS warning does not apply because no hidden document shares an index) |
 | Fan-out shape and timing | the holders asked and the number of waves depend only on the reader's pinned trees; hidden trees are never touched |
 | Load on shared nodes | NOT closed: another tenant's or class's load can slow this reader on a shared node. Gateway quotas bound it; a separate cluster removes it (limit, section 20) |
-| Errors | one typed `unavailable` for forbidden, erased, relabelled away and missing |
+| Errors | one typed `unavailable` for forbidden, erased, relabelled away and missing; no Elasticsearch error body, sub-response (for example an `_mget` per-document error) or index name is ever forwarded (probe P2, T3) |
 | Logs and notes | log rows and notes take the join class (INV-3), so a low-class reorganiser never sees a high-class query |
 | Model cache | entry class = join of prompt and inputs; prompt-bearing entries scoped per principal, so neither content nor cache-hit timing crosses classes or principals (5.8) |
 | Holder reasons, titles, outline labels | field contract (INV-7): no body, gist or fact field is returned; titles are code-built (4 tf-idf terms, no token containing a digit); reasons and labels at most 12 words and sharing no 5-gram with the call's input (8.2, 8.3); these are descriptors of the reader's own classes and can still convey an answer about them (20) |
@@ -1808,7 +1822,8 @@ Erasable indices stay live, so:
   write are atomic with the boundary under the tenant's send fence, so only
   bytes handed to the kernel before the boundary may still reach the peer;
   those the kernel still holds for a connection at the boundary are at most
-  64 KiB per connection, and the tenant's open-connection cap
+  64 KiB per connection (the hand-off writes at most 64 KiB minus the queued
+  byte count, 4.4), and the tenant's open-connection cap
   times 64 KiB in aggregate, measured at the gateway (4.4); physical purge
   within `P_PURGE = 1 hour` of the boundary (ASSUMPTION); keystore backup copies of destroyed keys age out
   within `R_KEYS = 35 days` (ASSUMPTION), stated in every receipt.
@@ -2035,6 +2050,7 @@ edges is converted to `contradicts` and flagged.
 | Clock skew | order by source sequence, not wall clock | unit |
 | Legal hold during erasure | hold wins; queued; delay in receipt | erasure probe (g) |
 | Erasure during rebuild or reflection | the job's commit waits at the tenant's write gate and, checked against the published tombstones when it commits (the commit-time tombstone check of the shared guard), aborts (7.6 step 6, 14.3) | E4 |
+| Hand-off with the kernel queue already near 64 KiB | the hand-off reads `SIOCOUTQ` under the shared fence and writes at most 64 KiB minus the queued count, none when full; the rest stays in the gateway's buffer (4.4) | E8 (d), R1 |
 | Erasure boundary while several senders of the tenant are between their final check and their socket write | the publication step waits on the tenant's send fence until they have written; every later hand-off of a covered response is aborted; only bytes handed to the kernel before the boundary can still reach the peer, and those the kernel still holds at the boundary are at most 64 KiB per connection, measured at the gateway (4.4, 14.3) | E8 (d) |
 | Restore from snapshot after erasure | tombstones re-applied, erasure closure replayed over every restored index (authz included), verifier residue checks pass, then the tenant is enabled (14.6) | E3, V5 |
 | Erased subject mentioned again in new content | erased identifier HMACs refuse it | erasure probe (a) |
@@ -2176,6 +2192,9 @@ credentials.
 |---|---|
 | Model provider sees leaf text | Holder, build, judge and reader calls need content. Removing it needs a local model of adequate quality; out of scope for the first build |
 | Noisy-neighbour latency across tenants and classes on a shared cluster | Elasticsearch thread pools and nodes are shared; gateway quotas bound it, only a separate cluster removes it |
+| The 64 KiB kernel-held bound is measured on loopback only | Probe LC-PB measured TCP and unix sockets on loopback with a peer that does not read. Remote peers, TLS records and peer-side receive-buffer autotuning are not measured; the bound there is a target, not a result |
+| Tenant boundary: one names-only channel | Probe P2 failed as worded: `_mget` on another tenant's alias name returns the concrete index name to a tenant key. Tenant keys never leave the gateway, no Elasticsearch response is forwarded, and physical suffixes are random; whether that suffices or tenants move to separate clusters is the owner's decision (ASSUMPTION until then). The cluster boundary sits behind the provisioning interface so one cluster per tenant is a configuration choice |
+| Canonicalisation over-matches by design | The confusables skeleton can map two different people (`clark` and `dark`) to one token. Registration of an identifier whose token equals an existing identity's is refused (fail closed); two existing identities are never merged and an erasure of one token reaches only the identifiers declared under it. Held matches go to the review queue (7.3) |
 | Mentions under undeclared spellings or paraphrase in source leaves | Detection cannot find what it was not told about; lineage closure covers derived artefacts, not new leaves that mention the person in a new way |
 | Legal sufficiency of crypto-shredding and the backup bound | No primary regulator text was found; needs counsel |
 | Embedding inversion | Vectors are treated as content and erased with it; a model that inverts vectors held by an attacker before erasure is out of scope |
@@ -2265,8 +2284,9 @@ titles code-built from 4 tf-idf terms with no token containing a digit
 (review 3, F11); retention 5 generations or 14
 days, ancestry ids kept for the class's life (5.6); `P_PURGE` 1 hour;
 `R_KEYS` 35 days; `R_LOGS` 7 days; erasure boundary `B_ERASE` 60 s (14.3);
-write-path deadline `D_WP` 10 minutes (5.6); send buffer set to an
-effective 64 KiB per connection and an open-connection cap per tenant, under
+write-path deadline `D_WP` 10 minutes (5.6); send buffer requested at
+32 KiB and each hand-off capped at 64 KiB minus the queued byte count, per
+connection, and an open-connection cap per tenant, under
 one per-tenant send fence (4.4, 15); epoch journal `J_SIZE` 4 MiB per file,
 two files per tenant (journal and spare), compaction by `RENAME_EXCHANGE`, `N_PRINCIPALS` 10,000, `D_FSYNC` 2 s
 (4.4); final-list fusion by RRF of the tree, direct and linked lists

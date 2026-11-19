@@ -380,7 +380,9 @@ Each step: what, failing-first test, done when.
   fence (DESIGN 4.4; review 3, F7), built here because erasure needs it first:
   every final send check (tombstone sequence and epoch) and its non-blocking
   socket write under the shared side, each accepted connection's send buffer
-  set and its effective size checked at accept (64 KiB, ASSUMPTION), the publication step under the
+  requested at 32 KiB and every hand-off capped at 64 KiB minus the
+  connection's queued byte count (`SIOCOUTQ`, read under the shared side;
+  measured on loopback only, ASSUMPTION after probe LC-PB), the publication step under the
   exclusive side, no journal, disk or Elasticsearch I/O under either side,
   the fence as the innermost lock (taken under the write gate, never the
   reverse), the in-memory scopes and redact-set ids that the check compares
@@ -405,7 +407,9 @@ Each step: what, failing-first test, done when.
   hand-off without the tombstone re-check (a lookup read before the boundary
   sent in full after it); a send hand-off that does not hold the send fence,
   with 8 concurrent senders paused after their final check (E8 (d): a paused
-  sender writes covered bytes after the boundary); a model-port wrapper keeping outputs in a file
+  sender writes covered bytes after the boundary); a hand-off that writes
+  without the queue-capped count (E8 (d) measures each paused sender's queue
+  and it exceeds 64 KiB); a model-port wrapper keeping outputs in a file
   outside the indices (E1's data-root grep must find it); current
   generation only; key-only; raw-file grep of segments as verifier;
   string-search closure; closure without authz; reseal-before-quarantine; no
