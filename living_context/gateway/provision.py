@@ -31,6 +31,12 @@ COMMON = {"tenant": {"type": "keyword"}, "cls": {"type": "keyword"}, "kind": {"t
           "erasure_rewrite": {"type": "long"}, "created_at": {"type": "date"}, "schema_v": {"type": "short"},
           "src_seq": {"type": "long"}, "gen_from": {"type": "long"}, "gen_to": {"type": "long"}}
 EXTRA = {
+    "node": {"family": {"type": "keyword"}, "level": {"type": "integer"}, "summary": {"type": "text"},
+             "title": {"type": "text"}, "children": {"type": "object", "enabled": False},
+             "facts": {"type": "object", "enabled": False}, "summary_embedding": {"type": "object", "enabled": False},
+             "child_count": {"type": "integer"}, "total_tokens": {"type": "long"}, "summary_status": {"type": "keyword"}},
+    "member": {"parent_id": {"type": "keyword"}, "child_id": {"type": "keyword"}, "score": {"type": "float"},
+               "shaped_by": {"type": "keyword"}},
     "cache": {"value": {"type": "object", "enabled": False}},
     "leaf": {"text": {"type": "text", "analyzer": "english"}, "title": {"type": "text"}, "entities": {"type": "keyword"},
              "size_tokens": {"type": "integer"}, "content_hash": {"type": "keyword"},
