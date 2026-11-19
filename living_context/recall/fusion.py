@@ -19,3 +19,11 @@ def rrf(rankings: Sequence[Sequence[Hashable]], k: int = K_RRF, window: int = WI
             seen.add(ident)
             score[ident] = score.get(ident, 0.0) + 1.0 / (k + rank)
     return sorted(score.items(), key=lambda kv: (-kv[1], str(kv[0])))
+
+
+def rrf_salted(rankings: Sequence[Sequence[Hashable]], salt: str, k: int = K_RRF, window: int = WINDOW) -> list[tuple[Hashable, float]]:
+    """The three-list merge of EXPERIMENT 5.1: each list cut at `window`, fused with RRF, ties broken by a salted hash of
+    the id (ASSUMPTION), so no list wins a tie by position or by id order."""
+    import hashlib
+    out = rrf(rankings, k, window)
+    return sorted(out, key=lambda kv: (-round(kv[1], 12), hashlib.sha256((salt + str(kv[0])).encode()).hexdigest()))

@@ -27,7 +27,7 @@ def fixture(n=2000, topics=100, seed=7):
     for i in range(n):
         words = rng.sample(vocab[i % topics], 6) + ["shared", "common", "noise"]
         text = " ".join(words) + "."
-        out.append(build.LeafRec(f"leaf{i:05d}", 1, text, title.build_title(text), stub.embed(text), 20 + (i % 7)))
+        out.append(build.LeafRec(f"{i + 1:032x}", 1, text, title.build_title(text), stub.embed(text), 20 + (i % 7)))
     return out
 
 

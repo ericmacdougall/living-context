@@ -74,7 +74,8 @@ class StubBackend:
         keep = [t for t in sorted(scored, key=lambda t: (-t[0], t[2])) if t[1] > 0 and t[0] >= i.get("threshold", 0.2)]
         keep = keep[: i.get("b_fanout", 6)]
         reasons = {lab: "matched " + " ".join(sorted(set(qt) & set(d))[:10]) for _, _, lab, d in keep}
-        return {"selected": [lab for _, _, lab, _ in keep], "reasons": reasons}
+        conf = {lab: 3 if sc >= 0.7 else 2 if sc >= 0.45 else 1 for sc, _, lab, _ in keep}  # 0 to 3, by score
+        return {"selected": [lab for _, _, lab, _ in keep], "reasons": reasons, "confidence": conf}
 
     # extractive builds: no title; gist = best sentence; facts = top 3 sentences
     def _build_l1(self, i):

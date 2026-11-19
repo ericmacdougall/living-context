@@ -37,7 +37,7 @@ class Task(str, Enum):
 PROMPT_VERSION = {t.value: "v1" for t in Task}
 SCHEMA: Mapping[str, Mapping[str, type]] = {
     "build_l1": {"entries": list, "summary": str}, "build_upper": {"summary": str},
-    "route": {"selected": list, "reasons": dict}, "organise": {"outline": list},
+    "route": {"selected": list, "reasons": dict, "confidence": dict}, "organise": {"outline": list},
     "type_edges": {"edges": list}, "judge_relevance": {"score": float, "relevant": bool},
     "query_variants": {"variants": list}, "synthetic_queries": {"queries": list},
     "ask": {"answer": str}, "reader_answer": {"answer": str}, "answer_judge": {"correct": bool},
