@@ -63,3 +63,31 @@ class Resolver:
         if st == "expired":
             return {"status": "expired"}
         return dict(UNAVAILABLE)
+
+
+class EsLeafStore:
+    """The gateway-side store behind `Resolver`: one key that reads the leaf indices of every class of the tenant (the
+    `ingest` key); the class check is the Resolver's, never this store's. Node generations are not served from here
+    (`gen_status` answers None, so a node pointer is `unavailable` until Step 13 adds the retention records)."""
+
+    def __init__(self, es, tenant: str):
+        self._es, self._t = es, tenant
+
+    def _search(self, pattern: str, ids: list, source: list):
+        st, r = self._es.request("POST", f"/{pattern}/_search?ignore_unavailable=true", {
+            "size": 1, "_source": source, "query": {"ids": {"values": ids}}})
+        return r["hits"]["hits"][0]["_source"] if st == 200 and r["hits"]["hits"] else None
+
+    def leaf(self, leaf_id: str, lv: int) -> Optional[dict]:
+        src = self._search(f"lc-{self._t}-*-leaf", [f"{leaf_id}:{lv}"], ["cls", "text"])
+        return {"cls": src["cls"], "text": src.get("text", "")} if src else None
+
+    def current_lv(self, leaf_id: str) -> Optional[int]:
+        src = self._search(f"lc-{self._t}-*-ctl", [f"lh:{leaf_id}"], ["current_lv"])
+        return int(src["current_lv"]) if src else None
+
+    def gen_status(self, gen: int) -> Optional[str]:
+        return None
+
+    def forwarding(self, gen: int, node_id: str) -> Optional[list]:
+        return None
