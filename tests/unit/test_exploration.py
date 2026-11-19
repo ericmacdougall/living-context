@@ -82,6 +82,20 @@ class Exploration(unittest.TestCase):
             self.check_propensity(broken_propensity_one=True)
         self.assertIn("logged propensity", str(cm.exception))
 
+    def test_broken_share_over_n_is_red_when_several_slots_are_drawn(self):
+        # DESIGN 9 `epsilon / n`: with epsilon the share, three slots drawn without replacement are logged at 0.25 / n, not 3 / n
+        with self.assertRaises(AssertionError) as cm:
+            n, hits, prop = 0, collections.Counter(), {}
+            n = 3000
+            for seed in range(n):
+                for o in place(RANKED * 3, POOL, rng=random.Random(seed), **{**KW, "share": 0.25, "broken_share_over_n": True}):
+                    if o.exploration:
+                        hits[o.leaf_id] += 1
+                        prop[o.leaf_id] = o.propensity
+            for leaf, p in prop.items():
+                self.assertAlmostEqual(hits[leaf] / n, p, delta=0.012, msg=f"logged propensity {p:.3f} but the leaf was shown with frequency {hits[leaf] / n:.3f}")
+        self.assertIn("logged propensity", str(cm.exception))
+
     def test_slot_count_is_a_share_of_the_final_digest(self):
         self.assertEqual([slots_for(n, 0.1) for n in (4, 9, 18, 27)], [0, 1, 2, 3])
 
