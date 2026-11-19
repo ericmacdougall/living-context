@@ -87,10 +87,18 @@ def input_texts(shown: Sequence[Mapping]) -> list[str]:
 ROOT = ""   # the virtual parent of the top-level holders (the originating agent's own parent step)
 
 
+class RecallAborted(Exception):
+    """The caller's authority epoch changed (a revoke or a class-grant removal) while the fan-out ran: nothing is returned."""
+
+
 class Recall:
     def __init__(self, port: ModelPort, tenant: str, cls: str, principal: str, *, consts: Optional[Constants] = None,
                  workers: int = 8, salt: str = "lc", check_reasons: bool = True, reasons_pass_through: bool = False,
-                 broken_organise_every_parent: bool = False, broken_one_global_organise: bool = False):
+                 broken_organise_every_parent: bool = False, broken_one_global_organise: bool = False,
+                 epoch_ok=None, broken_epoch_at_admission_only: bool = False):
+        self._epoch_ok = epoch_ok   # () -> bool: the session's authority epoch is still current (DESIGN 4.4); checked at each wave
+        self._epoch_admission_only = broken_epoch_at_admission_only   # BROKEN variant: checked once, before the first wave
+        self._epoch_checks = 0
         self._port, self.tenant, self.cls, self.principal = port, tenant, cls, principal
         self._c = consts or Constants()
         self._workers, self._salt = workers, salt
@@ -159,7 +167,16 @@ class Recall:
         return picked[: self._c.b_fanout * len(chunks)], rec
 
     # ---- the whole recall -----------------------------------------------------------------------------------
+    def _check_epoch(self) -> None:
+        """Before each wave of holder calls (and before the parent steps) the epoch is checked; a flipped epoch aborts the recall."""
+        if self._epoch_ok is None or (self._epoch_admission_only and self._epoch_checks > 0):
+            return
+        self._epoch_checks += 1
+        if not self._epoch_ok():
+            raise RecallAborted("the authority epoch changed during the recall")
+
     def recall(self, prompt: str, view: TreeView, *, direct: Sequence[Mapping] = (), linked: Sequence[Mapping] = ()) -> Result:
+        self._epoch_checks = 0
         c, cnt, lock = self._c, Counters(), threading.Lock()
         tops = view.top()
         budget = len(tops) + c.b_holders_extra
@@ -172,6 +189,7 @@ class Recall:
         results: dict[str, list] = {}      # holder ref(path) -> named children records for the parent step
         with cf.ThreadPoolExecutor(self._workers) as ex:
             while frontier or inflight:
+                self._check_epoch()   # each wave: admission, and again after every batch of answers
                 while frontier and len(inflight) < self._workers:
                     negc, depth, _, ref, path = frontier[0]
                     if used >= budget and depth > 1:
@@ -203,6 +221,7 @@ class Recall:
             for negc, depth, _, ref, path in frontier:  # budget reached: branch not opened
                 cnt.budget_reached = True
                 unopened.append((ref, path))
+        self._check_epoch()   # the last check: before anything is shaped into a digest
         ranked = sorted(cands, key=lambda k: (-k.confidence, k.depth, k.path, k.leaf_id))
         seen, tree_list = set(), []
         for k in ranked:  # dedupe by leaf id, keep the best path
