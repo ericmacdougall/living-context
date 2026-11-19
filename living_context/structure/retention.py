@@ -2,7 +2,9 @@
 
 Retention expiry removes the CONTENT of an expired generation (its node documents that no retained generation reaches) and
 leaves an `xp:<id>:<nv>` record (ids only) so a node pointer into it still resolves to `moved` (with the forwarding ids) or
-`expired`. It never removes or truncates ancestry: the ancestry list lives in the head and in every manifest, and the visibility
+`expired`. The member documents of a node id that no retained generation reaches any more, and that an expired generation retired
+(`gen_to`) in the ancestry of the oldest retained generation, go with it: every view that can still be pinned has that generation in its ancestry, so those members are invisible
+to all of them and only grow the index. It never removes or truncates ancestry: the ancestry list lives in the head and in every manifest, and the visibility
 rule needs all of it, because an adopted edge or member can outlive its `gen_from` generation and a retired one must stay retired
 after its `gen_to` generation has expired. `R_GEN` = the last `r_gen_count` adopted generations or `r_gen_days`, whichever keeps
 more.
@@ -25,11 +27,14 @@ from .publish import Publisher
 
 class Retention:
     def __init__(self, es: Callable[[], EsClient], tenant: str, cls: str, *, family: str = "topic",
-                 consts: Optional[Constants] = None, ancestry_truncate: bool = False):
+                 consts: Optional[Constants] = None, ancestry_truncate: bool = False, members_by_gen_from: bool = False,
+                 keep_dead_members: bool = False):
         self._es_fn, self.tenant, self.cls, self.family = es, tenant, cls, family
         self._c = consts or Constants()
         self.pub = Publisher(es, tenant, cls, family=family)
         self._truncate = ancestry_truncate   # BROKEN variant: expiry also truncates the ancestry (V2, V4 red)
+        self._by_gen_from = members_by_gen_from   # BROKEN variant: members are deleted by the generation that wrote them
+        self._keep_dead = keep_dead_members       # BROKEN variant: no member cleanup at all
 
     @property
     def _es(self) -> EsClient:
@@ -73,7 +78,7 @@ class Retention:
             mf = self.manifest(g)
             if mf is not None and mf.get("status") != "expired":
                 keep_nodes |= self._reachable(mf["top"])
-        expired = []
+        expired, deleted_ids = [], set()
         for g in adopted:
             mf = self.manifest(g)
             if g in retained or mf is None or mf.get("status") == "expired":
@@ -81,11 +86,14 @@ class Retention:
             for ref in mf.get("created_nodes", []):
                 if ref in keep_nodes:
                     continue
+                deleted_ids.add(ref.split(":")[0])
                 self._es.request("DELETE", f"/{self._idx('node')}/_doc/{ref}")
                 self.pub._put("ctl", f"xp:{ref}", self.pub._base("manifest", lin_nodes=[ref.split(":")[0]], family=self.family,
                                                                    gen=g, expired_node=ref))
             self.pub._put("ctl", f"mf:{self.family}:{g}", dict(mf, status="expired", top=[], created_nodes=[]))
             expired.append(g)
+        if expired and not self._keep_dead:
+            self._drop_dead_members(deleted_ids - {r.split(":")[0] for r in keep_nodes}, expired, min(retained))
         if self._truncate and expired:   # BROKEN variant
             keep = sorted(retained)
             self.pub._put("ctl", f"hd:{self.family}", dict(self.pub._base("head", lin_nodes=["none"], family=self.family,
@@ -94,6 +102,20 @@ class Retention:
         for kind in ("node", "ctl"):
             self._es.request("POST", f"/{self._idx(kind)}/_refresh")
         return expired
+
+    def _drop_dead_members(self, gone: set, expired: list, oldest_retained: int) -> int:
+        """Delete the members of node ids no retained generation reaches that a generation of the oldest retained generation's
+        ancestry retired: that generation is in the ancestry of every view that can still be pinned."""
+        self._es.request("POST", f"/{self._idx('member')}/_refresh")
+        if self._by_gen_from:   # BROKEN variant
+            q = {"terms": {"gen_from": expired}}
+        else:
+            if not gone:
+                return 0
+            anc0 = [int(g) for g in (self.manifest(oldest_retained) or {}).get("ancestry", [])]
+            q = {"bool": {"filter": [{"terms": {"parent_id": sorted(gone)}}, {"terms": {"gen_to": anc0}}]}}
+        st, r = self._es.request("POST", f"/{self._idx('member')}/_delete_by_query?refresh=true&conflicts=proceed", {"query": q})
+        return int(r.get("deleted", 0)) if st == 200 else 0
 
     # ---- rejection and rollback ------------------------------------------------------------------------------------------
     def discard_generation(self, gen: int) -> None:

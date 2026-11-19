@@ -28,10 +28,11 @@ def _now() -> str:
 
 class Placer:
     def __init__(self, es: Callable[[], EsClient], tenant: str, cls: str, wp: WritePath, *, family: str = "topic",
-                 consts: Optional[Constants] = None, theta: Sequence[float] = THETA):
+                 consts: Optional[Constants] = None, theta: Sequence[float] = THETA, stamp_gen: Optional[int] = None):
         self._es_fn, self.tenant, self.cls, self._wp, self.family = es, tenant, cls, wp, family
         self._c = consts or Constants()
         self._theta = theta
+        self._stamp_gen = stamp_gen   # BROKEN variant (V7): stamp the member with the next generation number, which a candidate takes
 
     @property
     def _es(self) -> EsClient:
@@ -63,8 +64,8 @@ class Placer:
             clearing = [t for t in scored if t[0] >= theta and t[0] > 0]
             if not clearing:
                 return []
-            if docs[0][1]["level"] == 1:
-                return [r.split(":")[0] for _, r, _ in clearing[: self._c.m_max]]
+            if clearing[0][2]["level"] == 1:   # a frontier may mix levels after a collapse: only level-1 nodes take members
+                return [r.split(":")[0] for _, r, d in clearing if d["level"] == 1][: self._c.m_max]
             best = clearing[0][2]
             level_refs = [f"{ch['child_id']}:{ch['child_version']}" for ch in best["children"] if not ch["is_leaf"]]
             depth += 1
@@ -79,6 +80,8 @@ class Placer:
                    "derivation": "placement", "erasure_rewrite": 0, "created_at": _now(), "schema_v": SCHEMA_V,
                    "parent_id": node_id, "child_id": f"{leaf_id}:{lv}", "score": 1.0 / (1 + n), "shaped_by": "placement",
                    "src_seq": int(src_seq), "title": title, "size_tokens": int(size_tokens)}
+            if self._stamp_gen is not None:
+                doc["gen_from"] = int(self._stamp_gen)
             mid = f"{node_id}>{leaf_id}:{lv}"
             if self._wp.write(job, class_index(self.tenant, self.cls, "member"), mid, doc):
                 out.append(mid)

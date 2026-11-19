@@ -70,11 +70,28 @@ class EsView:
         doc = self._get(self._wp_index, "wp")
         return int(doc["P"]) if doc else 0
 
+    def _feeders(self, ref: str) -> set:
+        """The parent ids whose pending members show under this node: its own, and those of nodes a generation of the pinned
+        ancestry replaced by it (a member written after the batch's P stays under its old parent and is reached through the
+        forwarding record: the first successor takes it, so a split or merge never strands a late member, SEC-V7)."""
+        nid = ref.split(":")[0]
+        out, frontier = {ref, nid}, {nid}
+        for _ in range(8):
+            if not frontier:
+                break
+            st, r = self._es.request("POST", f"/{self._ctl}/_search", {"size": 200, "query": {"bool": {"filter": [
+                {"term": {"family": self._family}}, {"term": {"forward": True}}, {"terms": {"new_ids": sorted(frontier)}},
+                {"terms": {"gen": [int(g) for g in self.ancestry]}}]}}})
+            nxt = {h["_source"]["old_id"] for h in (r["hits"]["hits"] if st == 200 else []) if h["_source"]["new_ids"][0] in frontier}
+            frontier = nxt - out
+            out |= nxt
+        return out
+
     def pending(self, ref: str) -> list:
         """Write-path members of this node above the pinned W and at most the pinned P (DESIGN 8.1, 13.2): code-built title
         and size only, no gist. A member whose `gen_to` names a generation of the pinned ancestry is retired."""
         rng = {"gt": self.W} if self._ignore_p else {"gt": self.W, "lte": self.P}
-        body = {"size": 1000, "query": {"bool": {"filter": [{"terms": {"parent_id": sorted({ref, ref.split(":")[0]})}}, {"range": {"src_seq": rng}}]}},
+        body = {"size": 1000, "query": {"bool": {"filter": [{"terms": {"parent_id": sorted(self._feeders(ref))}}, {"range": {"src_seq": rng}}]}},
                 "sort": [{"src_seq": "asc"}, {"child_id": "asc"}]}
         st, r = self._es.request("POST", f"/{self._member}/_search", body)
         if st != 200:

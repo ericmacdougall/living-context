@@ -101,7 +101,7 @@ class VersionsBase(unittest.TestCase):
         self.wipe()
         self.consts = consts
         self.wp = WritePath(self.structure(), self.T, consts=consts, **wp_kw)
-        self.writer = Writer(self.ingest(), self.ks, self.T, self.guard, write_path=self.wp, consts=consts)
+        self.writer = Writer(self.ingest(), self.ks, self.T, self.guard, write_path=self.wp, consts=consts, gate=getattr(self, "wgate", None))
         self.placer = Placer(self.structure(), self.T, "base", self.wp, consts=consts)
         self.backend = backend or StubBackend()
         self.new = []

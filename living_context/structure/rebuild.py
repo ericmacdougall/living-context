@@ -9,8 +9,15 @@ written with `gen_from`; new versions are path-copied up to the top and the inde
 written before every build call has succeeded: a failed call aborts the whole generation (W is never published past a node it
 did not summarise; INV-11 counts it) and the members stay pending. The commit then writes nodes, members and the manifest,
 refreshes every index written (the searchable-publication barrier) and flips the head by compare-and-set; a lost flip deletes
-this generation's unshared documents and the builder re-runs from the new head (rebase). Merge of an under-full node into its
-sibling and collapse of single-child chains are not built (docs/decisions/design-readings.md).
+this generation's unshared documents and the builder re-runs from the new head (rebase).
+
+Also here (DESIGN 7.6 step 3 and 6): a level-1 node under `F_MIN` children, among the children of a parent this rebuild touches,
+is merged into its most similar sibling when the union fits `F_MAX` (the old id forwards to the sibling's, its members get this
+generation in `gen_to`); a parent left with one child is collapsed (replaced by that child in its own parent, with a forwarding
+record); a new level-1 node started by members that cleared no node joins the most similar level-2 node of a taller tree; and
+before the head flips, under the shared side of the tenant's write gate, the published tombstones are checked against the
+generation's inputs: a tombstone newer than the one the attempt started with that names any of them aborts the attempt
+(nothing flips). Not built: merging under-full upper nodes, and merges or splits driven by co-confirmation (BUILD-PLAN 3A).
 """
 from __future__ import annotations
 
@@ -23,6 +30,7 @@ from typing import Callable, Optional
 from ..config import Constants
 from ..embed import stub as embed_stub
 from ..gateway.es import EsClient
+from ..gateway.gate import NoGate
 from ..gateway.indices import class_index
 from ..ids import new_node_id
 from ..ingest import segment, title
@@ -75,10 +83,12 @@ class Rebuilder:
     def __init__(self, es: Callable[[], EsClient], leaf_es: Callable[[], EsClient], port: ModelPort, tenant: str, cls: str,
                  wp: WritePath, *, family: str = "topic", consts: Optional[Constants] = None, principal: str = "service",
                  owner: str = "builder", clock: Callable[[], float] = time.time, pause: Optional[Callable[[str], None]] = None,
-                 rebase_tries: int = 5, abort_if: Optional[Callable[[], bool]] = None,
+                 rebase_tries: int = 5, abort_if: Optional[Callable[[], bool]] = None, gate=None, state=None,
+                 pins: Optional[dict] = None,
                  # the BROKEN variants of the tests:
                  refresh_before_flip: bool = True, use_cas: bool = True, publish_w_past_failed: bool = False,
-                 reuse_node_ids: bool = False, ancestry_limit: Optional[int] = None):
+                 reuse_node_ids: bool = False, ancestry_limit: Optional[int] = None, check_tombstones: bool = True,
+                 merge_drops_members: bool = False, ignore_pins: bool = False):
         self._es_fn, self._leaf_fn, self._port = es, leaf_es, port
         self.tenant, self.cls, self.family, self._wp = tenant, cls, family, wp
         self._c = consts or Constants()
@@ -86,8 +96,13 @@ class Rebuilder:
         self._pause, self._tries, self._abort_if = pause or (lambda s: None), rebase_tries, abort_if
         self._refresh, self._cas, self._past_failed = refresh_before_flip, use_cas, publish_w_past_failed
         self._reuse_ids, self._anc_limit = reuse_node_ids, ancestry_limit
+        self._gate, self._state = gate or NoGate(), state      # state: the erasure executor's State (published tombstones, redact set)
+        self._pins = {} if ignore_pins else dict(pins or {})   # evaluation only (EXPERIMENT 3.6): leaf id -> the donor sibling it stays with
+        self._check_tombs, self._merge_drops = check_tombstones, merge_drops_members
+        self.merges = self.collapses = self.merge_skipped = 0
         self.pub = Publisher(es, tenant, cls, family=family, refresh_before_flip=refresh_before_flip, use_cas=use_cas)
         self.calls = 0
+        self._P = 0
         self.failed_calls = 0   # counted (INV-11)
 
     @property
@@ -164,13 +179,23 @@ class Rebuilder:
     def _pending(self, W: int, P: int, anc: set) -> list:
         st, r = self._es.request("POST", f"/{self._idx('member')}/_search", {
             "size": 5000, "sort": [{"src_seq": "asc"}], "query": {"bool": {"filter": [{"range": {"src_seq": {"gt": W, "lte": P}}}]}}})
+        fwd = self._forwards(anc)
         out = []
         for h in (r["hits"]["hits"] if st == 200 else []):
             d = h["_source"]
             if anc & set(d.get("gen_to") or []):
                 continue
+            for _ in range(8):   # a member written under a node a later generation replaced goes to its successor
+                if d["parent_id"] not in fwd:
+                    break
+                d = dict(d, parent_id=fwd[d["parent_id"]])
             out.append(d)
         return out
+
+    def _forwards(self, anc: set) -> dict:
+        st, r = self._es.request("POST", f"/{self._idx('ctl')}/_search", {"size": 5000, "sort": [{"gen": "asc"}], "query": {
+            "bool": {"filter": [{"term": {"family": self.family}}, {"term": {"forward": True}}, {"terms": {"gen": sorted(anc)}}]}}})
+        return {h["_source"]["old_id"]: h["_source"]["new_ids"][0] for h in (r["hits"]["hits"] if st == 200 else [])}
 
     # ---- the pure part: plan the new nodes (model calls only) ---------------------------------------------------------
     def _call_l1(self, node_id: str, leaves: list[LeafRec]) -> dict:
@@ -205,6 +230,28 @@ class Rebuilder:
                     title.build_title(s, n=self._c.title_terms), sum(k.total_tokens for k in kids), [], [k.ref for k in kids],
                     sorted({x for k in kids for x in k.lin_subjects}))
 
+    def _split_groups(self, members: list[LeafRec]) -> list[list[int]]:
+        """Two balanced halves by embedding. A pinned leaf (evaluation only) does not take part in the clustering: it goes to the
+        half that holds its donor sibling, so a split never repairs a planted mis-filing by construction."""
+        ids = {l.leaf_id: i for i, l in enumerate(members)}
+        pinned = {i for i, l in enumerate(members) if self._pins.get(l.leaf_id) in ids and self._pins.get(l.leaf_id) != l.leaf_id}
+        free = [i for i in range(len(members)) if i not in pinned]
+        gi = cluster.balanced_groups([members[i].embedding for i in free], max(1, math.ceil(len(free) / 2)))
+        groups = [[free[j] for j in g] for g in gi]
+        for p in sorted(pinned):
+            donor = ids[self._pins[members[p].leaf_id]]
+            for _ in range(len(members)):   # a donor that is pinned itself: follow the chain to a free leaf
+                if donor not in pinned:
+                    break
+                donor = ids[self._pins[members[donor].leaf_id]]
+            target = next((g for g in groups if donor in g), groups[0])
+            target.append(p)
+        return [sorted(g) for g in groups]
+
+    def _members_of(self, n: Node) -> list[LeafRec]:
+        ids = [f"{ch['child_id']}:{ch['child_version']}" for ch in n.children if ch["is_leaf"]]
+        return self.leaf_recs(ids) if ids else []
+
     def _plan(self, nodes: dict, top: list, pending: list) -> dict:
         c = self._c
         by_id = {n.node_id: n for n in nodes.values()}
@@ -232,7 +279,7 @@ class Rebuilder:
                 total = sum(l.size_tokens for l in members)
                 over = len(members) > c.f_max
                 if over:
-                    groups_ix = cluster.balanced_groups([l.embedding for l in members], max(1, math.ceil(len(members) / 2)))
+                    groups_ix = self._split_groups(members)
                     outs = []
                     for gi in groups_ix:
                         part = [members[i] for i in gi]
@@ -284,20 +331,72 @@ class Rebuilder:
                 continue
             do_leaf_group(old, recs, len(recs))
 
+        by_ref_new = {n.ref: n for n in created}
+        old_ids = {n.node_id for n in nodes.values()}
+
+        def is_new_id(n: Node) -> bool:
+            return n.node_id not in old_ids
+
+        def merge_underfull(kids: list[Node]) -> list[Node]:
+            """DESIGN 7.6 step 3: a level-1 node under F_MIN children joins its most similar sibling when the union fits F_MAX."""
+            kids = list(kids)
+            for k in sorted([x for x in kids if x.level == 1 and len(x.children) < c.f_min], key=lambda x: x.node_id):
+                if k not in kids or len(kids) < 2:
+                    continue
+                sibs = sorted((x for x in kids if x is not k and x.level == 1 and len(x.children) + len(k.children) <= c.f_max),
+                              key=lambda x: (-embed_stub.cosine(k.summary_embedding, x.summary_embedding), x.node_id))
+                if not sibs:
+                    self.merge_skipped += 1
+                    continue
+                s = sibs[0]
+                recs = self._members_of(s) + ([] if self._merge_drops else self._members_of(k))
+                s_ref_changed = s.ref in {n.ref for n in created}
+                nv = s.nv if (s_ref_changed or is_new_id(s)) else s.nv + 1
+                merged = self._l1_node(s.node_id, nv, recs, self._call_l1(s.node_id, recs))
+                created[:] = [n for n in created if n.ref not in (s.ref, k.ref)] + [merged]
+                new_members[:] = [m for m in new_members if m[0] != k.node_id]
+                if is_new_id(k):   # never published: nothing to retire; a forwarding record that named it names the sibling
+                    for old, new in forward.items():
+                        forward[old] = [s.node_id if x == k.node_id else x for x in new]
+                else:
+                    retire_parents.append(k.node_id)
+                    forward[k.node_id] = [s.node_id]
+                have_members = {(m[0], m[1], m[2]) for m in new_members}
+                for l in self._members_of(k):
+                    if (s.node_id, l.leaf_id, l.lv) not in have_members:
+                        new_members.append((s.node_id, l.leaf_id, l.lv))
+                kids = [merged if x is s else x for x in kids if x is not k]
+                self.merges += 1
+            return kids
+
         # path copy: replace changed children in their parents up to the top
         level_nodes: dict[int, list[Node]] = {}
         for n in nodes.values():
             level_nodes.setdefault(n.level, []).append(n)
         top_level = max((nodes[r].level for r in top), default=1)
+        # a new level-1 node of a tree taller than one level joins the most similar level-2 node (the next batch rebalances it)
+        adopt: dict[str, list[Node]] = {}
+        if top_level > 1 and level_nodes.get(2) and new_top_nodes:
+            for nn in new_top_nodes:
+                best = sorted(level_nodes[2], key=lambda u: (-embed_stub.cosine(nn.summary_embedding, u.summary_embedding), u.node_id))[0]
+                adopt.setdefault(best.ref, []).append(nn)
+            new_top_nodes = []
         for level in range(2, top_level + 1):
             for u in sorted(level_nodes.get(level, []), key=lambda n: n.node_id):
-                if not any(f"{ch['child_id']}:{ch['child_version']}" in changed for ch in u.children):
+                if not (u.ref in adopt or any(f"{ch['child_id']}:{ch['child_version']}" in changed for ch in u.children)):
                     continue
                 kids: list[Node] = []
                 for ch in u.children:
                     ref = f"{ch['child_id']}:{ch['child_version']}"
                     kids += changed.get(ref, [nodes[ref]])
-                if len(kids) > c.f_max:
+                kids += adopt.get(u.ref, [])
+                if level == 2:
+                    kids = merge_underfull(kids)
+                if len(kids) == 1 and level >= 2:   # collapse a single-child chain: the child takes the node's place
+                    changed[u.ref] = list(kids)
+                    forward[u.node_id] = [kids[0].node_id]
+                    self.collapses += 1
+                elif len(kids) > c.f_max:
                     ix = cluster.balanced_groups([k.summary_embedding for k in kids], max(1, math.ceil(len(kids) / 2)))
                     outs = [self._upper_node(new_node_id(), 1, level, [kids[i] for i in gi]) for gi in ix]
                     changed[u.ref] = outs
@@ -311,12 +410,12 @@ class Rebuilder:
         for ref in top:
             new_top += changed.get(ref, [nodes[ref]])
         new_top += new_top_nodes   # nodes started from members that cleared no node join the top level (level 1 trees)
-        if new_top_nodes and top_level > 1:
-            raise RebuildAborted("a pending-new node in a tree taller than one level needs a parent (not built)")
+        if top_level == 1:
+            new_top = merge_underfull(new_top)
         # the index-of-indexes rule at the top
         def too_big(ns):
             return len(ns) > c.f_max or sum(segment.tokens_of(n.summary, c.chars_per_token_bound) for n in ns) > c.h_ctx
-        level = top_level
+        level = max((n.level for n in new_top), default=top_level)
         while too_big(new_top) and len(new_top) > 1:
             ix = cluster.balanced_groups([n.summary_embedding for n in new_top], c.f_target)
             up = [self._upper_node(new_node_id(), 1, level + 1, [new_top[i] for i in gi]) for gi in ix]
@@ -327,6 +426,7 @@ class Rebuilder:
 
     # ---- the commit ---------------------------------------------------------------------------------------------------
     def _attempt(self) -> RebuildResult:
+        seq0 = self._state.seq if self._state is not None else 0   # the published tombstone this attempt started with
         head = self.pub.head()
         if head is None:
             raise RebuildAborted("no head: bootstrap first")
@@ -334,6 +434,7 @@ class Rebuilder:
         W, anc = int(mf["W"]), {int(g) for g in mf["ancestry"]}
         self._es.request("POST", f"/{self._idx('member')}/_refresh")
         P = self._wp.read_p()
+        self._P = P
         pending = self._pending(W, P, anc)
         if not pending:
             return RebuildResult("nothing", head["gen"], W)
@@ -345,6 +446,7 @@ class Rebuilder:
             return RebuildResult("aborted", head["gen"], W, self.calls - before, reason=f"build call failed: {e}")
         if plan["failed"] and not self._past_failed:
             return RebuildResult("aborted", head["gen"], W, self.calls - before, reason="build call failed")
+        self._pause("planned")
         gen = self.pub.next_gen()
         written: list[tuple[str, str]] = []
         touched = set()
@@ -357,12 +459,28 @@ class Rebuilder:
             touched.add(kind)
 
         retired = []
-        try:
-            self._write(plan, gen, put, retired, touched)
-        except _Lost:
-            self._discard(gen, written, retired)
-            return RebuildResult("lost", head["gen"], W, self.calls - before)
-        return self._flip(head, plan, gen, W, P, anc, written, retired, touched, before)
+        with self._gate.shared():   # the commit (writes, refresh barrier, flip) runs under the shared side of the write gate
+            try:
+                self._write(plan, gen, put, retired, touched)
+            except _Lost:
+                self._discard(gen, written, retired)
+                return RebuildResult("lost", head["gen"], W, self.calls - before)
+            return self._flip(head, plan, gen, W, P, anc, written, retired, touched, before, pending, seq0)
+
+    def _hits_tombstone(self, plan, pending, seq0: int) -> bool:
+        """A tombstone published since the attempt started that names an input or anything the generation holds."""
+        if self._state is None or self._state.seq == seq0:
+            return False
+        ids = set()
+        for n in plan["created"]:
+            ids |= {n.ref, n.node_id, *n.lin_leaf_ids, *n.lin_nodes}
+            for ch in n.children:
+                ids |= {ch["child_id"], f"{ch['child_id']}:{ch['child_version']}"}
+        for m in pending:
+            ids |= {m["child_id"], m["child_id"].rsplit(":", 1)[0]}
+        for _, lid, lv in plan["new_members"]:
+            ids |= {lid, f"{lid}:{lv}"}
+        return bool(ids & (set(self._state.redact) | set(self._state.erased_leaves)))
 
     def _write(self, plan, gen, put, retired, touched) -> None:
         for n in plan["created"]:
@@ -377,12 +495,14 @@ class Rebuilder:
         retired.extend(plan["retire"])   # members of the replaced nodes: this generation joins their gen_to set
         if retired:
             self._es.request("POST", f"/{self._idx('member')}/_update_by_query?refresh=false&conflicts=proceed", {
-                "query": {"bool": {"filter": [{"terms": {"parent_id": retired}}]}},
+                # a member written after the plan's P (src_seq above it) is not in any new node: it stays unretired and is
+                # reached through the forwarding record of its old parent (view and next rebuild), so adoption never strands it (V7)
+                "query": {"bool": {"filter": [{"terms": {"parent_id": retired}}], "must_not": [{"range": {"src_seq": {"gt": self._P}}}]}},
                 "script": {"lang": "painless", "source": "if (ctx._source.gen_to == null) { ctx._source.gen_to = []; } ctx._source.gen_to.add(params.g);",
                            "params": {"g": gen}}})
             touched.add("member")
 
-    def _flip(self, head, plan, gen, W, P, anc, written, retired, touched, before) -> RebuildResult:
+    def _flip(self, head, plan, gen, W, P, anc, written, retired, touched, before, pending=(), seq0: int = 0) -> RebuildResult:
         def put(kind, doc_id, doc, create=True):
             self.pub._put(kind, doc_id, doc, create=create)
             written.append((kind, doc_id))
@@ -399,7 +519,8 @@ class Rebuilder:
                              parent_gen=head["gen"], ancestry=ancestry, status="candidate", levels=plan["levels"], tombstone_seq=0,
                              created_nodes=[n.ref for n in plan["created"]])
         put("ctl", f"mf:{self.family}:{gen}", mfd)
-        if self._abort_if is not None and self._abort_if():
+        self._pause("candidate")   # the candidate is written and open; nothing has flipped
+        if (self._abort_if is not None and self._abort_if()) or (self._check_tombs and self._hits_tombstone(plan, pending, seq0)):
             self._discard(gen, written, retired)
             return RebuildResult("aborted", head["gen"], W, self.calls - before, reason="a tombstone intersects the inputs")
         if self._refresh:   # searchable publication: nothing flips before every index written has been refreshed
