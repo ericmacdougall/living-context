@@ -44,9 +44,31 @@ def provision(directory: Path, size: int) -> tuple[Path, Path]:
     return j, s
 
 
+class RealIO:
+    """The journal's I/O behind one thin layer, so a test can replace it (fault injection, the power-loss simulation of R7)."""
+
+    def pwrite(self, fd: int, data: bytes, offset: int) -> None:
+        os.pwrite(fd, data, offset)
+
+    def fsync(self, fd: int) -> None:
+        os.fsync(fd)
+
+    def fsync_dir(self, directory: Path) -> None:
+        dfd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+
+    def exchange(self, a: str, b: str) -> None:
+        from . import fsx
+        fsx.exchange(a, b)
+
+
 class Journal:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, io=None):
         self.path = path
+        self.io = io or RealIO()
         self.size = path.stat().st_size
         self.records, self.end, self.torn = self._scan()
         self._fd = os.open(path, os.O_RDWR)
@@ -65,15 +87,18 @@ class Journal:
             pos += HEADER.size + length
         return out, pos, False
 
-    def append(self, record: dict) -> None:
+    def append(self, record: dict, sync: bool = True) -> None:
         body = json.dumps(record, sort_keys=True).encode()
         frame = HEADER.pack(len(body), zlib.crc32(body)) + body
         if self.end + len(frame) > self.size:
             raise JournalFull()
-        os.pwrite(self._fd, frame, self.end)
-        os.fsync(self._fd)
+        self.io.pwrite(self._fd, frame, self.end)
+        if sync:
+            self.io.fsync(self._fd)
         self.end += len(frame)
         self.records.append(record)
 
     def close(self) -> None:
-        os.close(self._fd)
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None

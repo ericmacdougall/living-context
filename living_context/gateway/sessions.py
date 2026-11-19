@@ -68,6 +68,18 @@ class EpochTable:
             k = (tenant, principal)
             return k not in self._revoked and self._epochs.get(k, 0) == epoch
 
+    def snapshot(self, tenant: str) -> list[tuple[str, int, bool]]:
+        with self._lock:
+            return sorted((p, e, (t, p) in self._revoked) for (t, p), e in self._epochs.items() if t == tenant)
+
+    def restore(self, tenant: str, principal: str, epoch: int, revoked: bool) -> None:
+        """Rebuild one row from the journal at start (no fence: nothing is admitted yet)."""
+        with self._lock:
+            k = (tenant, principal)
+            self._epochs[k] = max(self._epochs.get(k, 0), epoch)
+            if revoked:
+                self._revoked.add(k)
+
     def register_buffer(self, tenant: str, principal: str, buf: list) -> None:
         with self._lock:
             self._unsent.setdefault((tenant, principal), []).append(buf)
