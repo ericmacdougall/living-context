@@ -46,12 +46,17 @@ class RevocationService:
                  persist: Optional[Callable[[str, int], None]] = None, clock: Callable[[], float] = time.time,
                  broken_wait_for_journal: bool = False, broken_require_persist: bool = False,
                  broken_start_without_fsync: bool = False, broken_accept_unterminated: bool = False,
-                 broken_admins_first: bool = False, broken_shutdown_when_faulted: bool = False):
+                 broken_admins_first: bool = False, broken_shutdown_when_faulted: bool = False,
+                 broken_exchange_before_fsync: bool = False, broken_skip_dir_fsync: bool = False,
+                 broken_compaction_drops_start: bool = False, broken_lane_open_during_drain: bool = False,
+                 broken_shutdown_before_drain: bool = False):
         self.tenant, self._ep, self._dir = tenant, epochs, Path(directory)
         self._io, self._d_fsync, self._persist, self._clock = io or RealIO(), d_fsync_s, persist, clock
         self._b = dict(wait=broken_wait_for_journal, persist=broken_require_persist, nostart=broken_start_without_fsync,
                        unterminated=broken_accept_unterminated, admins_first=broken_admins_first,
-                       shutdown_faulted=broken_shutdown_when_faulted)
+                       shutdown_faulted=broken_shutdown_when_faulted, xchg_first=broken_exchange_before_fsync,
+                       skip_dir=broken_skip_dir_fsync, drop_start=broken_compaction_drops_start,
+                       lane_open_drain=broken_lane_open_during_drain, shutdown_first=broken_shutdown_before_drain)
         self._lock = threading.RLock()
         self.state, self.lane_open, self.fault = CLOSED, False, ""
         self.grant_admins: Optional[set] = None
@@ -104,16 +109,24 @@ class RevocationService:
         return self.state == OPEN
 
     def clean_stop(self) -> None:
-        self.lane_open = False           # admission and the revoke lane close first
-        with self._lock:                 # then the drain: an append in flight finishes
-            if self.state == OPEN or (self._b["shutdown_faulted"] and self.state == FAULT):
-                self._j.append({"t": "shutdown", "at": self._clock()})
-                self._io.fsync_dir(self._dir)
+        if not self._b["lane_open_drain"]:   # BROKEN variant: the lane stays open while the drain runs
+            self.lane_open = False           # admission and the revoke lane close first
+        if self._b["shutdown_first"]:        # BROKEN variant: the shutdown record is written without waiting for pending appends
+            self._write_shutdown()
+        with self._lock:                     # then the drain: an append in flight finishes
+            if not self._b["shutdown_first"]:
+                self._write_shutdown()
+            self.lane_open = False
             if self.state == OPEN:
                 self.state = CLOSED
             if self._j:
                 self._j.close()
                 self._j = None
+
+    def _write_shutdown(self) -> None:
+        if self._j is not None and (self.state == OPEN or (self._b["shutdown_faulted"] and self.state == FAULT)):
+            self._j.append({"t": "shutdown", "at": self._clock()})
+            self._io.fsync_dir(self._dir)
 
     # ---- revoke -----------------------------------------------------------------------------------------------
     def _append(self, rec: dict) -> bool:
@@ -169,14 +182,23 @@ class RevocationService:
             finally:
                 os.close(fd)
             sj = Journal(spare, self._io)
+            sync = not self._b["xchg_first"]           # BROKEN variant: the spare's bytes are fsynced only after the exchange
             try:
-                sj.append({"t": "start", "at": self._clock(), "compacted": True})
+                if not self._b["drop_start"]:          # BROKEN variant: the new file carries no start record
+                    sj.append({"t": "start", "at": self._clock(), "compacted": True}, sync=sync)
                 for principal, epoch, revoked in self._ep.snapshot(self.tenant):
-                    sj.append({"t": "revoke" if revoked else "bump", "principal": principal, "epoch": epoch})
+                    sj.append({"t": "revoke" if revoked else "bump", "principal": principal, "epoch": epoch}, sync=sync)
             finally:
                 sj.close()                             # every append fsynced the file
             self._io.exchange(str(self.journal_path), str(spare))   # an error here leaves the old journal in place
-            self._io.fsync_dir(self._dir)
+            if not self._b["skip_dir"]:                # BROKEN variant: the exchange is never made durable
+                self._io.fsync_dir(self._dir)
+            if not sync:
+                fd = os.open(self.journal_path, os.O_RDWR)
+                try:
+                    self._io.fsync(fd)
+                finally:
+                    os.close(fd)
             self._j.close()
             self._j = Journal(self.journal_path, self._io)
             self.events.append("compacted")
