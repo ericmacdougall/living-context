@@ -76,7 +76,7 @@ def roles_for(tenant: str, classes: list[str]) -> dict[str, dict]:
     rd["structure"] = desc(structure, ["read", "write", "view_index_metadata", "maintenance"])
     log = sum((kind_patterns(t, k) for k in ("log", "sq", "note", "cache")), [])
     rd["log"] = desc(log, ["read", "write", "view_index_metadata"])
-    rd["erase"] = desc([f"lc-{t}-*"], ["read", "delete", "view_index_metadata", "maintenance"])
+    rd["erase"] = desc([f"lc-{t}-*"], ["read", "delete", "view_index_metadata", "maintenance", "monitor"])
     rd["authz"] = desc([f"lc-{t}-authz", f"lc-{t}-authz-p*"], ["read", "write", "view_index_metadata"])
     return rd
 

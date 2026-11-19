@@ -32,6 +32,7 @@ from typing import Callable, Iterable, Optional
 from ..config import Constants
 from ..embed import stub as embed_stub
 from ..gateway import validator
+from ..gateway.gate import NoGate
 from ..gateway.es import EsClient
 from ..gateway.indices import TENANT_CLS, class_index, tenant_index
 from ..ids import new_leaf_id
@@ -77,10 +78,11 @@ def _now() -> str:
 class Writer:
     def __init__(self, es: Callable[[], EsClient], keystore: Keystore, tenant: str, guard: subjects.Guard, *,
                  consts: Optional[Constants] = None, embed: Callable[[str], list] = embed_stub.embed,
-                 pause: Optional[Callable[[str], None]] = None, use_cas: bool = True):
+                 pause: Optional[Callable[[str], None]] = None, use_cas: bool = True, gate=None):
         self._es_fn, self._ks, self.tenant, self._guard = es, keystore, tenant, guard
         self._c = consts or Constants()
         self._embed, self._pause, self._use_cas = embed, pause or (lambda step: None), use_cas
+        self._gate = gate or NoGate()
 
     # ---- plumbing -------------------------------------------------------------------------------
     @property
@@ -161,6 +163,15 @@ class Writer:
     def remember(self, principal: str, cls: str, text: str, *, subjects_declared: Iterable[str] = (),
                  key: Optional[str] = None, source_ref: Optional[dict] = None, refresh: bool = True,
                  _admitted: bool = False) -> WriteResult:
+        """A commit: takes the shared side of the tenant's write gate (an erasure's closure-to-boundary holds it
+        exclusively), and the guard check runs inside it so a tombstone published meanwhile is seen."""
+        with self._gate.shared():
+            return self._remember(principal, cls, text, subjects_declared=subjects_declared, key=key,
+                                  source_ref=source_ref, refresh=refresh, _admitted=_admitted)
+
+    def _remember(self, principal: str, cls: str, text: str, *, subjects_declared: Iterable[str] = (),
+                  key: Optional[str] = None, source_ref: Optional[dict] = None, refresh: bool = True,
+                  _admitted: bool = False) -> WriteResult:
         if cls == TENANT_CLS:
             return WriteResult(REFUSED)
         if not isinstance(text, str) or not text.strip():

@@ -7,7 +7,7 @@ it because every cache entry carries its call's lineage (`model/cache.py`).
 """
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Iterable, NamedTuple
 
 from ..gateway.es import EsClient
 from ..gateway.indices import check_id
@@ -19,8 +19,16 @@ class ScanError(Exception):
     pass
 
 
+class Hit(NamedTuple):
+    index: str
+    id: str
+    kind: str = ""
+    lin_leaf_ids: tuple = ()
+    lin_nodes: tuple = ()
+
+
 def find(es: EsClient, tenant: str, *, subjects: Iterable[str] = (), leaf_ids: Iterable[str] = (),
-         nodes: Iterable[str] = ()) -> list[tuple[str, str]]:
+         nodes: Iterable[str] = ()) -> list[Hit]:
     """Return (physical-or-alias index, doc id) of every document whose lineage names any of the given values."""
     pattern = f"lc-{check_id(tenant, 'tenant')}-*"
     should = [{"terms": {f: sorted(set(v))}} for f, v in (("lin_subjects", subjects), ("lin_leaf_ids", leaf_ids),
@@ -30,7 +38,7 @@ def find(es: EsClient, tenant: str, *, subjects: Iterable[str] = (), leaf_ids: I
     es.request("POST", f"/{pattern}/_refresh")
     out, after = [], None
     while True:
-        body = {"size": PAGE, "_source": False, "query": {"bool": {"should": should, "minimum_should_match": 1}},
+        body = {"size": PAGE, "_source": ["kind", "lin_leaf_ids", "lin_nodes"], "query": {"bool": {"should": should, "minimum_should_match": 1}},
                 "sort": [{"_doc": "asc"}]}
         if after is not None:
             body["search_after"] = after
@@ -40,13 +48,15 @@ def find(es: EsClient, tenant: str, *, subjects: Iterable[str] = (), leaf_ids: I
         hits = r["hits"]["hits"]
         if not hits:
             return out
-        out += [(h["_index"], h["_id"]) for h in hits]
+        out += [Hit(h["_index"], h["_id"], h["_source"].get("kind", ""), tuple(h["_source"].get("lin_leaf_ids", [])),
+                    tuple(h["_source"].get("lin_nodes", []))) for h in hits]
         after = hits[-1]["sort"]
 
 
-def delete(es: EsClient, found: Iterable[tuple[str, str]]) -> int:
+def delete(es: EsClient, found: Iterable[tuple]) -> int:
     n = 0
-    for index, doc_id in found:
+    for h in found:
+        index, doc_id = h[0], h[1]
         st, _ = es.request("DELETE", f"/{index}/_doc/{doc_id}")
         if st not in (200, 404):
             raise ScanError(f"delete failed ({st})")
