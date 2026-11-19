@@ -17,6 +17,7 @@ import os
 import re
 import sqlite3
 import struct
+import threading
 from pathlib import Path
 from typing import Iterable
 
@@ -57,10 +58,11 @@ class Keystore:
         if not _TENANT.match(tenant):
             raise KeystoreError("bad tenant id")
         self.tenant = tenant
+        self._lock = threading.RLock()  # one connection shared by the gateway's threads: calls are serialised
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fresh = not self.path.exists()
-        self._db = sqlite3.connect(str(self.path), isolation_level=None, timeout=self.BUSY_TIMEOUT_MS / 1000)
+        self._db = sqlite3.connect(str(self.path), isolation_level=None, check_same_thread=False, timeout=self.BUSY_TIMEOUT_MS / 1000)
         self._configure(self._db)
         if fresh:
             os.chmod(self.path, 0o600)
@@ -193,6 +195,19 @@ class Keystore:
 
     def close(self) -> None:
         self._db.close()
+
+
+def _locked(fn):
+    def wrapper(self, *a, **kw):
+        with self._lock:
+            return fn(self, *a, **kw)
+    wrapper.__name__, wrapper.__doc__ = fn.__name__, fn.__doc__
+    return wrapper
+
+
+for _name in ("subject_token", "digest", "has_key", "principal_token", "register_identifier", "encrypt",
+              "decrypt", "destroy", "count_keys"):
+    setattr(Keystore, _name, _locked(getattr(Keystore, _name)))
 
 
 class KeystoreSet:

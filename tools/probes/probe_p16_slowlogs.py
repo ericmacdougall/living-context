@@ -1,7 +1,7 @@
 """Probe P16: slow logs are off and nothing request- or document-shaped reaches the logs.
 
 Checks (N=7), on the secured test cluster whose container name is
-LC_ES_CONTAINER (default lc-es-16441): (1) search slow-log thresholds of -1
+LC_ES_CONTAINER (default lc-es-test): (1) search slow-log thresholds of -1
 are accepted and read back on every index kind; (2) the same for the indexing
 slow log; (3) with default logger levels, a marker in a document and a search
 body appears nowhere in the container logs or log files; (4) nor does a
@@ -25,7 +25,7 @@ from tools.probes import pcommon  # noqa: E402
 
 pcommon.start()
 es = pcommon.admin_client()
-NAME = os.environ.get("LC_ES_CONTAINER", "lc-es-16441")
+NAME = os.environ.get("LC_ES_CONTAINER", "lc-es-test")
 
 
 def log_text() -> bytes:

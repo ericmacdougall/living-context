@@ -1,5 +1,5 @@
 {
-  "commit": "74f7370fac482116374b730188d2f03d1312d67d",
+  "commit": "c411399623019fbc7aeafa0ee0cfb410fc383878",
   "date": "2026-11-19",
   "details": {
     "index_kinds": 12,
@@ -17,6 +17,6 @@
   "n": 7,
   "observed": "checks 1-7: 1, 1, 1, 1, 1, 1, 1",
   "script": "probe_p16_slowlogs.py",
-  "script_sha256": "aacc8f07272c714eddb5d6f9c015e94a51762e09a0bbd2d05e21138cf4e57831",
+  "script_sha256": "fca2f5a3e9380ca30b7de5e16f622161cc815163d4795f7a519cdc5ce51b2acb",
   "verdict": "PASS"
 }

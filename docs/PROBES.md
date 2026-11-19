@@ -56,7 +56,7 @@ Elasticsearch 9.5.6, Linux 6.8.
 | P3 | PASS | 1 | the credential file authenticates; 0 container log lines and 0 environment values hold it |
 | P4 | PASS | 3 | storing a `knn` query in a percolator field is refused ("the [knn] query is unsupported inside a percolator query"), top level and inside `bool`; a stored match query is accepted (control) |
 | P5 | PASS | 200 | 200 refresh rounds under 6 writers, 0 acknowledged writes missing after a returned refresh, 0 retirement updates invisible; the broken variant without the refresh is red (millions of misses counted); realtime GET works without refresh |
-| P6 | LIMITED | 1 | about 1.01 s to the first refusal, expected under 1 s; inside T7's 5 s; decision record `docs/decisions/P6-invalidation-latency.md` |
+| P6 | LIMITED | 1 | about 1.01 s to the first refusal, expected under 1 s; inside T7's 5 s; decision record `docs/decisions/P6-invalidation-latency.md` (proposed by the task owner, awaiting main) |
 | P7 | PASS | 40 | 40 of 40 restrictive-filter kNN queries (20 of 5,000 documents) returned k=10 hits; the control with `post_filter` returned fewer than k in 40 of 40 |
 | P8 | PASS | 400 | 400 atomic alias swaps under 4 readers (5,892 reads): 0 anomalies; the two-request control showed 3,558 anomalies in 6,417 reads |
 | P9 | PASS | 3 | `expunge_deletes_allowed: 0` accepted; `docs.deleted` 2,000 (soft-delete tombstones double the count) to 0 with repeated `only_expunge_deletes` passes |
@@ -64,9 +64,11 @@ Elasticsearch 9.5.6, Linux 6.8.
 | P11 | PASS | 100 | 100 of 100 stale `if_seq_no` writes got 409 and left the stored source unchanged; the current-value write succeeds (control) |
 | P12 | PASS | 50 | 50 of 50 `_msearch` calls with a missing-index sub-search: the other two answered, the failure was per item |
 | P13 | PASS | 4 | a terms query of 10,000 ids returns all 10,000 documents; default `index.max_terms_count` 65,536; 65,536 ids accepted, 65,537 refused |
-| P14 | PASS (premise only) | 3 | on a manual `read_only_allow_delete` block writes get 429 and reads work, unblocking restores writes; on a scratch node with a 160 MB tmpfs data directory and absolute watermarks (70/60/50 MB, monitor interval 10 s) filled until the node applied the block itself, writes got 429 about 14 s later and reads worked. This establishes the Elasticsearch side only; that the gateway's revoke is effective at once under both blocks is a Step 15 test, not claimed here |
+| P14 | LIMITED | 3 | on a manual `read_only_allow_delete` block writes get 429 and reads work, unblocking restores writes; on a scratch node with a 160 MB tmpfs data directory and absolute watermarks (70/60/50 MB, monitor interval 10 s) filled until the node applied the block itself, writes got 429 about 14 s later and reads worked. The premise holds, so the verdict is LIMITED: the expected result (the gateway's revoke is effective at once under both blocks) is not exercised here. The Step 15 gate stays closed on P14 until that test exists or a decision record is written. Open: `PENDING_REAL_TEST P14` |
 | P15 | PASS | 6 | a key owner (index privileges on its own tenant, `manage_own_api_key` only) creates keys that carry at most its privileges, rotates (create then invalidate) and invalidates its own keys; it cannot invalidate another owner's key; a gateway-style key (no cluster privilege) can neither create nor invalidate keys. Finding: the owner's invalidate request must carry `"owner": true`, without it Elasticsearch answers 403 |
 | P16 | PASS | 7 | slow-log thresholds of -1 are accepted and read back on all 12 index kinds, search and indexing; with default logger levels a random marker in a document, a search body and failing requests reaches no container log line or log file (count 0); with thresholds at 0 the marker appears for search (2) and indexing (1); setting -1 again stops it |
+
+N is a pinned count of executed checks per script, chosen by the task owner (ASSUMPTION, noted in `pinned_n.json`; P1 and P14 were adjusted to match their scripts).
 
 Security-off check: every probe script prints `security off: P2 not established`
 and exits 2 against a cluster that answers an unauthenticated request

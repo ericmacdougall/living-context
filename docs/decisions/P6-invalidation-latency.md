@@ -2,7 +2,7 @@
 
 Probe: P6
 Verdict: LIMITED
-Decided by: main, ASSUMPTION (not the owner's words)
+Decided by: PENDING. Proposed by the task owner, to be confirmed by main (labelled `main, ASSUMPTION` only so that the gate can read the record; it is not yet main's decision).
 
 Measured 1.01 s from invalidation to the first refusal on a single node, against an expected figure under 1 s. The plan's fallback is to report the measured latency as a limit; the security bound (T7) is 5 s and is met.
 

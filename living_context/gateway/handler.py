@@ -87,7 +87,7 @@ class Gateway:
                 return self._lookup(rec.tenant, p, lattice, request)
             if op == "write":
                 return self._write(rec.tenant, p, lattice, request)
-        except (EsError, ValueError, KeyError, TypeError):
+        except Exception:  # fail closed: every internal failure is the one typed answer, never a body or a trace
             return UNAVAILABLE
         return REFUSED
 

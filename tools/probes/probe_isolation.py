@@ -46,7 +46,7 @@ def unauth_status():
 def p3_log_check():
     """Count (never print) container log lines and environment values holding the credential."""
     import subprocess
-    name = os.environ.get("LC_ES_CONTAINER", "lc-es-16441")
+    name = os.environ.get("LC_ES_CONTAINER", "lc-es-test")
     with open(PWFILE, "rb") as f:
         pw = f.read().strip()
     logs = subprocess.run(["docker", "logs", name], capture_output=True, timeout=60)

@@ -1,8 +1,8 @@
 {
-  "commit": "74f7370fac482116374b730188d2f03d1312d67d",
+  "commit": "c411399623019fbc7aeafa0ee0cfb410fc383878",
   "date": "2026-11-19",
   "details": {
-    "container_log_lines_checked": 2037,
+    "container_log_lines_checked": 5044,
     "lines_holding_the_credential": 0
   },
   "expected": "bootstrap credential by file authenticates and appears in no log",
@@ -11,6 +11,6 @@
   "n": 1,
   "observed": "authenticates; 0 log lines and environment values hold it",
   "script": "probe_isolation.py",
-  "script_sha256": "b7b649dd60934b364b83ca1f5edc1617498770a37233d6818ce08a5ec7b491e6",
+  "script_sha256": "75f38083441434339a133bd7469b723e2e1bc31dd42ae20ff9c8e3e2a6bc0b4e",
   "verdict": "PASS"
 }

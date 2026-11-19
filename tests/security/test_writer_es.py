@@ -379,6 +379,33 @@ class WriterOnElasticsearch(unittest.TestCase):
         self.assertEqual(len(seqs), len(set(seqs)))
         self.assertEqual(max(seqs) - min(seqs) + 1, len(seqs))
 
+    def make_gateway(self, writers):
+        grants = {(T, "tok-user"): Principal(T, "tok-user", frozenset([Role.WRITER]), frozenset(["base"]), frozenset(["base"]))}
+        fences = {}
+        sessions = Sessions({T: Adapter()}, EpochTable(lambda t: fences.setdefault(t, SendFence())),
+                            lambda t, who: "tok-user", lambda t, p: grants.get((t, p)))
+        return Gateway(self.gate, sessions, {T: LAT}, writers=writers), sessions.mint(T, b"user")
+
+    def test_a_write_handled_on_another_thread_works(self):
+        """The server handles each connection on its own thread; the writer and keystore were built on this one."""
+        w = self.writer()
+        gw, tk = self.make_gateway(lambda t: w)
+        out = []
+        th = threading.Thread(target=lambda: out.append(gw.handle(tk, {"op": "write", "cls": "base", "doc": {"text": "thread write needle ocelot"}})))
+        th.start()
+        th.join(30)
+        self.assertTrue(out and out[0].get("ok"), out)
+
+    def test_every_internal_failure_is_the_one_typed_answer(self):
+        from living_context.gateway.handler import UNAVAILABLE
+
+        class Boom(Writer):
+            def remember(self, *a, **k):
+                raise wmod.WriterError("step failed (503)")
+
+        gw, tk = self.make_gateway(lambda t: self.writer(Boom))
+        self.assertEqual(gw.handle(tk, {"op": "write", "cls": "base", "doc": {"text": "x y z"}}), UNAVAILABLE)
+
     def test_every_document_is_validated_before_it_is_sent(self):
         w = self.writer()
         bad = w._base("leaf", "base")

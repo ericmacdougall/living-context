@@ -14,5 +14,6 @@
   "P13": 4,
   "P14": 3,
   "P15": 6,
-  "P16": 7
+  "P16": 7,
+  "_note": "ASSUMPTION (task owner, not the user's words): these Ns are the executed-check counts each script performs; P1 and P14 were adjusted to match their scripts. Change only with a recorded reason."
 }

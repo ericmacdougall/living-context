@@ -12,7 +12,9 @@ index). That the gateway's revoke is effective at once under these conditions
 is tested at Step 15 (revocation tests with the authz index blocked and with
 the flood-stage fill); this probe does not claim it.
 
-Checks (N=3): manual block refuses writes; reads work under the block;
+The recorded verdict is therefore LIMITED when the premise holds (the expected result, an effective revoke,
+is not exercised here), and the Step 15 gate stays closed on P14 until that test exists or a decision record is
+written. Checks (N=3): manual block refuses writes; reads work under the block;
 flood-stage block applied by the node refuses writes while reads work.
 Environment: LC_TEST_* for the secured cluster; LC_SCRATCH_URL (http) and
 LC_SCRATCH_CONTAINER for the scratch node. Without them the flood check is
@@ -101,12 +103,15 @@ def main():
                               False, 2, {"manual_write_status": st_w}, verdict="LIMITED")
     blocked, reads, st_fw, elapsed, dd_rc = f
     c3 = blocked and reads
-    ok = c1 and c2 and c3
+    premise = c1 and c2 and c3
     return pcommon.finish(
-        "P14", __file__, "authz writes refused and reads work under a manual block and the flood-stage block",
-        f"manual write {st_w}, reads {reads_ok}, unblock write {st_w2}; flood write {st_fw}, reads {reads}, blocked after {elapsed} s",
-        ok, 3, {"scope": "Elasticsearch premise only; the gateway revoke under these blocks is tested at Step 15",
-                "scratch": "throw-away node, 160 MB tmpfs data directory, absolute watermarks 70/60/50 MB"})
+        "P14", __file__, "revoke takes effect at once from the gateway's table while the authz index is blocked",
+        f"premise only (revoke not exercised): manual write {st_w}, reads {reads_ok}, unblock write {st_w2}; "
+        f"flood write {st_fw}, reads {reads}, blocked after {elapsed} s",
+        False, 3, {"premise_established": premise, "premise": "writes to the blocked authz index are refused while reads work",
+                   "not_tested": "the gateway's revoke under the block: a Step 15 test (R-series with authz blocked, and flood fill)",
+                   "scratch": "throw-away node, 160 MB tmpfs data directory, absolute watermarks 70/60/50 MB"},
+        verdict="LIMITED" if premise else "FAIL")
 
 
 if __name__ == "__main__":
