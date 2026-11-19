@@ -1,0 +1,32 @@
+{
+    "control_monitor_key": {
+        "examples": [
+            "GET /_cat/shards",
+            "GET /_cluster/state",
+            "GET /_nodes/stats",
+            "POST /_mget"
+        ],
+        "leak_count": 4,
+        "requests": 94
+    },
+    "license_type": "basic",
+    "p3_bootstrap_file_authenticates": true,
+    "p6_invalidation_to_first_refusal_s": 1.011,
+    "probe": "P2+P3+P6",
+    "ta_key": {
+        "cluster_apis_answered_200_with_no_foreign_name": {
+            "/_alias": "{\"lc-ta-base-leaf\": {\"aliases\": {\"lc-ta-alias-leaf\": {}}}, \"lc-ta-authz\": {\"aliases\": {}}, \"lc-ta-ctl\": {\"aliases\": {}}}",
+            "/_cat/aliases": "lc-ta-alias-leaf lc-ta-base-leaf - - - -\n",
+            "/_resolve/index/lc-*": "{\"indices\": [{\"name\": \"lc-ta-authz\", \"attributes\": [\"open\"], \"mode\": \"standard\"}, {\"name\": \"lc-ta-base-leaf\", \"aliases\": [\"lc-ta-alias-leaf\"], \"attributes\": [\"o",
+            "/lc-tb-base-leaf/_search_shards": "{\"nodes\": {}, \"indices\": {}, \"shards\": []}"
+        },
+        "error_echoed_requested_name_only": 70,
+        "leaks": [
+            "POST /_mget"
+        ],
+        "requests": 94
+    },
+    "ta_key_reads_own_index": true,
+    "unauthenticated_status": 401,
+    "verdict": "FAIL"
+}
