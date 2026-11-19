@@ -23,6 +23,7 @@ from living_context.gateway.sessions import EpochTable, Sessions
 from living_context.ingest import segment, title
 from living_context.ingest.segment import Turn
 from living_context.ingest.subjects import Guard, TokenSource
+from living_context.gateway.indices import class_index
 from living_context.ingest import writer as wmod
 from living_context.ingest.writer import Writer
 from living_context.keystore import Keystore
@@ -280,6 +281,63 @@ class WriterOnElasticsearch(unittest.TestCase):
         self.assertGreaterEqual(out["erased_skipped"], 1)
         st, r = self.admin.request("POST", f"/lc-{T}-base-leaf/_search", {"query": {"match": {"text": "quokka"}}})
         self.assertEqual(r["hits"]["total"]["value"], 0)  # never re-created from a destroyed key
+
+    # ---- quarantine of held items ---------------------------------------------------------------------
+    def check_quarantine(self, w):
+        self.guard.erase_identifier("nina.k@example.com", bare_name="Nina Kowalski")
+        mark = "quillfeather" + uuid.uuid4().hex[:6]
+        before = (self.count("src"), self.count("leaf"))
+        res = w.remember("tok", "base", f"Nina Kowalski repaired the {mark} fence")
+        self.assertEqual(res.status, wmod.HELD)
+        self.assertEqual((self.count("src"), self.count("leaf")), before, "a held write reached the leaf or source index")
+        held = [h for h in w.quarantine_list("base")]
+        self.assertTrue(held, "a held write was dropped instead of quarantined")
+        st, raw = self.admin.request("POST", f"/lc-{T}-*/_search", {"query": {"query_string": {"query": mark}}})
+        self.assertEqual(raw["hits"]["total"]["value"], 0, "held text is stored in plaintext")
+        return mark, held[-1]
+
+    def test_held_items_are_quarantined_as_ciphertext_and_reviewable(self):
+        w = self.writer()
+        mark, item = self.check_quarantine(w)
+        raw = self.doc(f"lc-{T}-base-ctl", f"qh:{item['qid']}")
+        self.assertEqual((raw["state"], raw["kind"]), ("held", "quarantine"))
+        self.assertTrue(raw["lin_subjects"] and raw["lin_leaf_ids"])  # inside the erasure closure
+        # admit: stored as an ordinary leaf, the held ciphertext stripped and its key gone
+        adm = w.quarantine_review("base", item["qid"], "admit")
+        self.assertTrue(adm.ok)
+        self.assertEqual(self.doc(f"lc-{T}-base-ctl", f"qh:{item['qid']}")["state"], "admitted")
+        self.assertNotIn("ct", self.doc(f"lc-{T}-base-ctl", f"qh:{item['qid']}"))
+        self.assertFalse(self.ks.has_key(item["qid"], 1))
+        self.assertEqual(w.quarantine_review("base", item["qid"], "admit").status, wmod.REFUSED)  # no second review
+        # reject: dropped, nothing stored as a leaf
+        res = w.remember("tok", "base", "Nina Kowalski also wrote about a second topic")
+        item2 = w.quarantine_list("base")[-1]
+        n = self.count("leaf")
+        self.assertEqual(w.quarantine_review("base", item2["qid"], "reject").status, "rejected")
+        self.assertEqual(self.count("leaf"), n)
+
+    def test_broken_silent_drop_and_plaintext_quarantine_are_red(self):
+        class Drop(Writer):
+            def _quarantine(self, *a, **kw):
+                return None
+
+            def quarantine_list(self, cls):
+                return []
+
+        msg = self.run_checked(self.check_quarantine, self.writer(Drop))
+        self.assertIn("dropped instead of quarantined", msg or "")
+
+        class Plain(Writer):
+            def _quarantine(self, principal, cls, text, declared, source_ref):
+                doc = self._base("quarantine", cls, lin_subjects=["x"], lin_leaf_ids=["plainq"], qid="plainq",
+                                 principal=principal, state="held", text_plain=text)
+                self._put(class_index(self.tenant, cls, "ctl"), "qh:plainq", doc, cls=cls)
+
+            def quarantine_list(self, cls):
+                return [{"qid": "plainq", "created_at": "", "state": "held"}]
+
+        msg = self.run_checked(self.check_quarantine, self.writer(Plain))
+        self.assertIn("plaintext", msg or "")
 
     # ---- subjects and holds ----------------------------------------------------------------------
     def test_erased_identifier_is_refused_and_a_bare_name_is_held_without_a_write(self):

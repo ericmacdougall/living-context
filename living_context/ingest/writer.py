@@ -159,7 +159,8 @@ class Writer:
 
     # ---- the write ---------------------------------------------------------------------------------
     def remember(self, principal: str, cls: str, text: str, *, subjects_declared: Iterable[str] = (),
-                 key: Optional[str] = None, source_ref: Optional[dict] = None, refresh: bool = True) -> WriteResult:
+                 key: Optional[str] = None, source_ref: Optional[dict] = None, refresh: bool = True,
+                 _admitted: bool = False) -> WriteResult:
         if cls == TENANT_CLS:
             return WriteResult(REFUSED)
         if not isinstance(text, str) or not text.strip():
@@ -170,7 +171,8 @@ class Writer:
         verdict = self._guard.check("\n".join(declared + [text]))
         if verdict == subjects.REFUSED:
             return WriteResult(REFUSED)
-        if verdict == subjects.HELD:
+        if verdict == subjects.HELD and not _admitted:
+            self._quarantine(principal, cls, text, declared, source_ref)
             return WriteResult(HELD)
         body = json.dumps({"cls": cls, "text": text, "subjects": declared, "ref": source_ref}, sort_keys=True).encode()
         claim = None
@@ -196,6 +198,50 @@ class Writer:
         if claim is not None:
             self._finish_claim(principal, key, cls)
         return WriteResult(STORED, leaf_id, lv, seq)
+
+    # ---- quarantine (DESIGN 7.3: a bare-name match of an erased identity is held for review, not refused) --------
+    def _quarantine(self, principal: str, cls: str, text: str, declared: list, source_ref) -> None:
+        """Keep the held write for review: ciphertext under its own data key whose subject tokens are those found in
+        the text, in the class's control index, with the same lineage fields, so erasure reaches both."""
+        qid = new_leaf_id()
+        tokens = sorted(set(self._guard.tokens_in("\n".join(declared + [text]))))
+        blob = json.dumps({"text": text, "subjects": declared, "ref": source_ref}, sort_keys=True).encode()
+        ct, nonce, key_ref = self._ks.encrypt(qid, 1, blob, tokens)
+        doc = self._base("quarantine", cls, lin_subjects=tokens or [self._ks.digest("quarantine", qid.encode())[:16]],
+                         lin_leaf_ids=[qid], qid=qid, principal=principal, state="held", ct=base64.b64encode(ct).decode(),
+                         nonce=base64.b64encode(nonce).decode(), key_ref=key_ref)
+        self._put(class_index(self.tenant, cls, "ctl"), f"qh:{qid}", doc, cls=cls, create=True)
+
+    def quarantine_list(self, cls: str) -> list[dict]:
+        """Held items of a class: id, time, state (never the content). Authorisation is the gateway's (class held)."""
+        idx = class_index(self.tenant, cls, "ctl")
+        self._es.request("POST", f"/{idx}/_refresh")
+        st, r = self._es.request("POST", f"/{idx}/_search", {"size": 1000, "_source": ["qid", "created_at", "state"],
+                                                              "query": {"term": {"kind": "quarantine"}}})
+        if st != 200:
+            raise WriterError("quarantine scan failed")
+        return sorted((h["_source"] for h in r["hits"]["hits"]), key=lambda d: d["created_at"])
+
+    def quarantine_review(self, cls: str, qid: str, decision: str) -> WriteResult:
+        """`admit` writes the held text as an ordinary leaf (the reviewer decided it is not the erased subject);
+        `reject` drops it. Either way the held ciphertext is stripped and its key destroyed."""
+        idx = class_index(self.tenant, cls, "ctl")
+        cur = self._get(idx, f"qh:{qid}")
+        if cur is None or cur["_source"].get("state") != "held" or decision not in ("admit", "reject"):
+            return WriteResult(REFUSED)
+        s = cur["_source"]
+        res = WriteResult(REFUSED)
+        if decision == "admit":
+            held = json.loads(self._ks.decrypt(qid, 1, base64.b64decode(s["ct"]), base64.b64decode(s["nonce"])))
+            res = self.remember(s["principal"], cls, held["text"], subjects_declared=held["subjects"],
+                                source_ref=held["ref"], _admitted=True)
+            if not res.ok:
+                return res
+        doc = {k: v for k, v in s.items() if k not in ("ct", "nonce", "key_ref")}
+        doc["state"] = "admitted" if decision == "admit" else "rejected"
+        self._put(idx, f"qh:{qid}", doc, cls=cls, cas=(cur["_seq_no"], cur["_primary_term"]))
+        self._ks.destroy(leaf_id=qid)
+        return res if decision == "admit" else WriteResult("rejected")
 
     # ---- idempotency ------------------------------------------------------------------------------
     def _claim_id(self, principal: str, cls: str, key: str) -> str:

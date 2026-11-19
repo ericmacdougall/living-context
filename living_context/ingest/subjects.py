@@ -59,6 +59,10 @@ class Guard:
         if bare_name:
             self._erased_bare.add(self._t.bare(bare_name))
 
+    def tokens_in(self, text: str) -> list[str]:
+        """Subject tokens (identifier and bare-name) found in `text`: the lineage of anything stored from it."""
+        return sorted({self._t.identifier(i) for i in identifiers(text)} | {self._t.bare(n) for n in bare_names(text)})
+
     def check(self, text: str, *, check_variants: Iterable[str] = ()) -> str:
         for ident in identifiers(text):
             if self._t.identifier(ident) in self._erased_ids:

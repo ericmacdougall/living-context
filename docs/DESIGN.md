@@ -1803,11 +1803,21 @@ https://www.elastic.co/guide/en/elasticsearch/reference/8.19/indices-forcemerge.
 Erasable indices stay live, so:
 
 - Default: delete, refresh, flush, then `_forcemerge?only_expunge_deletes=true`
-  with `expunge_deletes_allowed = 0`, then check `_stats` that
-  `docs.deleted == 0` and `_segments` shows no deletions
-  (PENDING_REAL_TEST P9 and P10: that this setting is accepted, and how long
-  soft-delete retention leases hold deleted documents; the earlier lab saw
-  22 to 30 s).
+  with `expunge_deletes_allowed = 0`, repeated every 5 s until `_stats` reports
+  `docs.deleted == 0` or the purge deadline passes, then check `_segments`
+  shows no deletions. Probe P9 (setting accepted; passes bring the count to 0)
+  and P10 measured that Elasticsearch drops soft-delete tombstones only when
+  the retention lease advances (a 30 s periodic sync): the count reached 0
+  about 30.4 s after the delete on one node (three trials, 30.37 to 30.44 s),
+  and one expunge pass immediately after the delete does nothing. The purge
+  is therefore a loop with a stated deadline (`P_PURGE_PASS = 120 s` per
+  index, ASSUMPTION; four times the measured figure), and the receipt reports
+  the measured time to zero. Two promises are kept apart. **B_ERASE** is the
+  in-memory boundary: from it no read path serves erased content. **Physical
+  purge** is the later moment the deleted-document count is 0 on every index
+  of the class; it is reported per receipt with its measured time and never
+  folded into B_ERASE; the EXPERIMENT thresholds are unchanged. A deadline
+  that passes with a non-zero count falls through to copy-and-swap (below).
 - Fallback, and for any index where the default leaves deleted documents:
   copy-and-swap. The gateway pauses writes to that (tenant, class, kind) for
   the swap, reindexes the alias's physical index into a new physical index
@@ -2212,6 +2222,10 @@ credentials.
 | Unclean gateway restart closes tenants | `revoke` returns before its journal write is durable (4.4), so a crash or power loss cannot be told apart from a lost revoke; every tenant whose journal lacks a clean shutdown record after its durable start record is closed until break-glass recovery and the named administrators' re-grants. Recovery can re-apply only the revokes whose receipts survive: a revoke denied in memory whose receipt was lost with the gateway (a revoking tool that crashed too) is unknown to the operator and is not re-applied, so its principal is re-admitted if an administrator re-grants it. Copy-on-write filesystems can still report no space inside a preallocated file; that also closes the tenant. Compaction needs an atomic exchange of two names (`RENAME_EXCHANGE` or `RENAME_SWAP`, ASSUMPTION); provisioning refuses a tenant whose journal filesystem lacks it. The power-loss cases are tested by simulation of the filesystem's durability rules (EXPERIMENT R7), not by cutting power to a real device |
 | A node whose build keeps failing holds W back | Publishing a W the tree does not represent would hide pending leaves (review 2, F6); the members stay pending and reachable, but gists and summaries for that class stop advancing until the call succeeds; failures are counted |
 | The gate's test assumes symmetric cluster means | The exact sign-flip test (13.3) is valid when cluster means are symmetric about 0 under no change; a candidate with frequent small gains and rare large losses can be adopted (simulated 0.17 at K = 8, about 0.07 at K = 60, EXPERIMENT 7.3). A test valid without the symmetry assumption (a Hoeffding bound) would need a mean of at least 0.87 at K = 8 and would almost never adopt. So the gate is an inspectable heuristic, not a false-adoption guarantee: the general replay guard limits visible losses on recent searches and RANDOM-FEEDBACK shows what random adoptions do to recall, but neither, nor the p-value, bounds the false-adoption rate; sign scoring sees how often clusters improve, not by how much. H3 and H4 are decided only on their independent forward and held-back measures (review 3) |
+| The tenant-wide counter and idempotency scope markers are readable by every class reader | The per-tenant `src_seq` counter lives in the tenant control index, which every class reader's key can read (4.3, 6.3); its value reveals the tenant's total write volume across classes. The idempotency scope marker (7.1: scope is (tenant, principal, key), so a key reused with another body in another class is refused) lives there too and holds only a keyed digest of the body, no leaf id; it reveals that a key was used by a principal. Per-class counters would remove the first but break the single monotone `src_seq` (5.6); accepted as a limit |
+| The "stub only" check rests on a name attribute | The model port refuses a backend whose `name` is not `stub` and a model id that is not the pinned stub id (18.1). A backend that lies about its name passes; the defence is the independent count in the S0 report (port calls against the stub's own invocation counter) and the absence of any network client or key in the build, not the check itself |
+| Titles rank terms by frequency in the leaf, not by tf-idf over the class | 5.2 names the top 4 tf-idf terms; the build holds no per-class document-frequency table (7.4 does not require one), so idf is 1 and terms rank by their count in the leaf, then spelling. The digit rule (INV-7) is unaffected. A per-class document-frequency table is a refinement behind the same function (`ingest/title.py`) |
+| Erasure has two promises with different clocks | The in-memory boundary `B_ERASE` (14.3) is the point from which erased content is served by no read path; physical purge on a live index is later, because Elasticsearch drops soft-delete tombstones only after the retention lease advances (P10: 30.4 s on one node, three trials), so the purge repeats the expunge pass until the deleted-document count is 0 or its deadline passes (14.5) |
 | Descriptors can convey an answer without a lookup (review 3, F11) | INV-7 is a field contract: no body, gist or fact field reaches a pointer or the digest, titles are code-built without digit tokens, reasons and labels are bounded. It is not semantic non-disclosure: a 4-term title or a 12-word reason can still name a decisive fact (a name, a place, a topic; a date as a month name, a spelled-out amount or an alphabetic code, since the digit rule drops only tokens containing a digit and reasons and outline labels have no digit rule; a leaf of a few words is nearly its own title). So `opened` measures lookups, not use: an unopened pointer may have been used, and "not opened" is never evidence of irrelevance by itself (9, 10, 11, 12); an edge used only through descriptors gets no confirmation and decays (16.4). Non-content descriptors would remove this, but the owner asks for "a tight summary" as well as "pure reference pointers"; the reading is an ASSUMPTION about the owner's intent (EXPERIMENT 12, X9) |
 | Erasure delays the tenant's own writes | The write gate of the erasure boundary delays that tenant's commits for at most `B_ERASE` (14.3, INV-9); other tenants are not affected |
 

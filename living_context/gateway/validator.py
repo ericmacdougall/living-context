@@ -11,7 +11,7 @@ from typing import Any, Mapping
 
 from .indices import CLASS_KINDS, TENANT_KINDS, ID
 
-KINDS = {"leaf", "src", "node", "edge", "log", "sq", "note", "cache", "manifest", "head", "tomb", "member", "dirty", "idem", "idem_scope", "counter"}
+KINDS = {"leaf", "src", "node", "edge", "log", "sq", "note", "cache", "manifest", "head", "tomb", "member", "dirty", "idem", "idem_scope", "counter", "quarantine"}
 LIST_FIELDS = ("lin_leaves", "lin_leaf_ids", "lin_nodes", "lin_subjects", "lin_queries")
 REQUIRED = ("tenant", "cls", "kind", "derivation", "erasure_rewrite", "created_at", "schema_v") + LIST_FIELDS
 
