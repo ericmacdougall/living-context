@@ -174,6 +174,42 @@ class ProtocolLogOnElasticsearch(unittest.TestCase):
         self.assertIsNone(self.row("restricted", LEAF_R))
         self.assertEqual(plog.write_failures, 1)
 
+    # ---- stored-query percolator and ask ------------------------------------------------------------------------
+    def test_the_stored_query_is_a_lexical_percolator_that_finds_a_matching_leaf_text(self):
+        self.plog().record_digest(self.sid, "actortok", "stub-1", ["base"], "orchard gate code heron", [self.offers()[0]])
+        self.admin.request("POST", f"/lc-{T}-*/_refresh")
+        def hits(text):
+            st, r = self.admin.request("POST", f"/lc-{T}-base-sq/_search", {"query": {"percolate": {"field": "q", "document": {"text": text}}}})
+            self.assertEqual(st, 200, r)
+            return [h["_id"] for h in r["hits"]["hits"]]
+        self.assertIn(self.sid, hits("the orchard gate code is blue heron"))
+        self.assertNotIn(self.sid, hits("compost drainage gravel"))
+
+    def check_ask(self, **kw):
+        from living_context.model.budget import Budget
+        from living_context.model.cache import DictStore
+        from living_context.model.port import ModelPort
+        from living_context.model.stub import StubBackend
+        plog = self.plog()
+        plog.record_digest(self.sid, "actortok", "stub-1", ["base"], "garden", [self.offers()[0]])
+        res = Resolver(Store(), ["base"], lambda lid: False, lambda ev: None)
+        lk = GatewayLookup(res, Store(), plog)
+        ptrs = [encode_pointer(Pointer(KIND_LEAF, 1, LEAF_B, 1)), encode_pointer(Pointer(KIND_LEAF, 1, LEAF_R, 1))]
+        with tempfile.TemporaryDirectory() as d:
+            port = ModelPort(StubBackend(), Budget(Path(d) / "b", 100), LAT, DictStore())
+            out = lk.ask(self.sid, ["base"], ptrs, "body", actor="actortok", port=port, tenant=T, cls="base", **kw)
+        self.assertEqual((out["status"], out["relied"]), ("ok", [ptrs[0]]), "ask served a leaf outside the read set")
+        row = self.row("base", LEAF_B, key="read-base")
+        self.assertTrue(row["asked"] and row["opened"], "ask did not log the served leaf as opened and asked")
+
+    def test_ask_logs_served_leaves_as_opened_and_asked_and_skips_unreadable_ones(self):
+        self.check_ask()
+
+    def test_broken_ask_that_does_not_log_is_red(self):
+        with self.assertRaises(AssertionError) as cm:
+            self.check_ask(broken_not_logged=True)
+        self.assertIn("did not log", str(cm.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

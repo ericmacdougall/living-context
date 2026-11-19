@@ -90,6 +90,7 @@ class ProtocolLog:
                 channel = self._lat.join(*reader_classes)
                 if store_query and not any(self._guard.token_erased(t) for t in q_tokens + [actor]):
                     sq = self._base("sq", channel, lin_subjects=sorted({actor, *q_tokens}), text=query_text,
+                                    q={"match": {"text": {"query": query_text, "minimum_should_match": "50%"}}},
                                     embedding=embed_stub.embed(query_text), search_id=search_id)
                     if not self._put(channel, "sq", search_id, sq):
                         self.write_failures += 1
@@ -137,6 +138,14 @@ class ProtocolLog:
         return self._flip(search_id, reader_classes, item_cls, leaf_id, lv, {"used_cited": True})
 
 
+    def mark_asked(self, search_id, reader_classes, item_cls, leaf_id, lv) -> bool:
+        return self._flip(search_id, reader_classes, item_cls, leaf_id, lv, {"asked": True})
+
+    def set_used_behavioural(self, search_id, reader_classes, item_cls, leaf_id, lv, used: bool) -> bool:
+        """Written only by the counterfactual audit (`feedback/audit.py`); never by an agent's claim."""
+        return self._flip(search_id, reader_classes, item_cls, leaf_id, lv, {"used_behavioural": bool(used)})
+
+
 class GatewayLookup:
     """The gateway's `lookup`: it serves the leaf through the resolver and, itself, writes `opened` for the offered row. No
     callback from the agent or from the resolver's sink decides it, so a claim of use without a lookup leaves it false."""
@@ -157,3 +166,31 @@ class GatewayLookup:
                 if doc is not None:
                     self._log.mark_opened(search_id, reader_classes, doc["cls"], p.id, p.version, actor)
         return out
+
+    def ask(self, search_id: str, reader_classes: Iterable[str], pointers: Iterable[str], question: str, *, actor: str,
+            port, tenant: str, cls: str, broken_not_logged: bool = False) -> dict:
+        """DESIGN 8.4 `ask`: a delegate model call over the leaves the reader may read. Each served leaf is logged as opened
+        and asked by the gateway; an unreadable pointer contributes nothing and is not distinguishable (one `unavailable`)."""
+        from ..ids import KIND_LEAF, IdError, decode_pointer
+        from ..model.port import CallContext, Task
+        texts, relied, ids = [], [], []
+        for ptr in pointers:
+            out = self._r.resolve(ptr, actor=actor)
+            if out.get("status") != "ok":
+                continue
+            try:
+                p = decode_pointer(ptr)
+            except IdError:
+                continue
+            doc = self._store.leaf(p.id, p.version) if p.kind == KIND_LEAF else None
+            if doc is None:
+                continue
+            texts.append(out["text"]); relied.append(ptr); ids.append(p.id)
+            if not broken_not_logged:
+                self._log.mark_opened(search_id, reader_classes, doc["cls"], p.id, p.version, actor)
+                self._log.mark_asked(search_id, reader_classes, doc["cls"], p.id, p.version)
+        if not texts:
+            return {"status": "unavailable"}
+        ctx = CallContext(tenant, cls, actor, (cls,), lin_leaf_ids=tuple(ids))
+        res = port.call(Task.ASK, {"question": question, "context": texts}, ctx=ctx)
+        return {"status": "ok", "answer": res.output["answer"] if res.ok else "", "relied": relied}
