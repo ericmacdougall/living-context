@@ -1,0 +1,22 @@
+{
+  "commit": "74f7370fac482116374b730188d2f03d1312d67d",
+  "date": "2026-11-19",
+  "details": {
+    "index_kinds": 12,
+    "marker_counts": {
+      "control_after_off": 0,
+      "control_index": 1,
+      "control_search": 2,
+      "default_doc_and_search": 0,
+      "default_failing_request": 0
+    }
+  },
+  "expected": "slow logs off on every kind; no request or document field in the logs; positive controls visible",
+  "id": "P16",
+  "image_digest": "sha256:79b4f1de4c15e6eca824723086a51e5934406d614d410cc11be77748cafac537",
+  "n": 7,
+  "observed": "checks 1-7: 1, 1, 1, 1, 1, 1, 1",
+  "script": "probe_p16_slowlogs.py",
+  "script_sha256": "aacc8f07272c714eddb5d6f9c015e94a51762e09a0bbd2d05e21138cf4e57831",
+  "verdict": "PASS"
+}

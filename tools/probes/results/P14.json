@@ -1,0 +1,16 @@
+{
+  "commit": "74f7370fac482116374b730188d2f03d1312d67d",
+  "date": "2026-11-19",
+  "details": {
+    "scope": "Elasticsearch premise only; the gateway revoke under these blocks is tested at Step 15",
+    "scratch": "throw-away node, 160 MB tmpfs data directory, absolute watermarks 70/60/50 MB"
+  },
+  "expected": "authz writes refused and reads work under a manual block and the flood-stage block",
+  "id": "P14",
+  "image_digest": "sha256:79b4f1de4c15e6eca824723086a51e5934406d614d410cc11be77748cafac537",
+  "n": 3,
+  "observed": "manual write 429, reads True, unblock write 201; flood write 429, reads True, blocked after 14.2 s",
+  "script": "probe_p14_authz_block.py",
+  "script_sha256": "8ccb761a7b9fcf5a07fc8259ffbb505e758aab6ab526e63f23a4adc196415e4c",
+  "verdict": "PASS"
+}

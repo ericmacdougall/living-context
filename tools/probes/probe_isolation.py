@@ -18,13 +18,16 @@ Prints one JSON line. No credential is printed.
 import json
 import os
 import ssl
+from pathlib import Path
 import sys
 import tempfile
 import time
 import urllib.error
 import urllib.request
 
-from living_context.gateway.es import EsClient, EsError
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from living_context.gateway.es import EsClient, EsError  # noqa: E402
+from tools.probes import pcommon  # noqa: E402
 
 URL, CA, PWFILE = sys.argv[1], sys.argv[2], sys.argv[3]
 MARK = {"tena": "MARKER-ALPHA-7f3a", "tenb": "MARKER-BRAVO-91c2", "tenbx": "MARKER-XRAY-5d0e"}
@@ -38,6 +41,20 @@ def unauth_status():
             return r.status
     except urllib.error.HTTPError as e:
         return e.code
+
+
+def p3_log_check():
+    """Count (never print) container log lines and environment values holding the credential."""
+    import subprocess
+    name = os.environ.get("LC_ES_CONTAINER", "lc-es-16441")
+    with open(PWFILE, "rb") as f:
+        pw = f.read().strip()
+    logs = subprocess.run(["docker", "logs", name], capture_output=True, timeout=60)
+    lines = (logs.stdout + b"\n" + logs.stderr).splitlines()
+    env = subprocess.run(["docker", "inspect", name, "--format", "{{json .Config.Env}}"],
+                         capture_output=True, timeout=30).stdout
+    hits = sum(1 for ln in lines if pw and pw in ln) + (1 if pw and pw in env else 0)
+    return hits, len(lines)
 
 
 def make_key(admin, name, tenant, cluster=()):
@@ -60,11 +77,8 @@ def stash(keydir, name, body):
 
 def main():
     out = {"probe": "P2+P3+P6"}
-    us = unauth_status()
-    out["unauthenticated_status"] = us
-    if us == 200:
-        print(json.dumps({"probe": "P2", "verdict": "security off: P2 not established"}))
-        return 2
+    pcommon.require_security(URL, CA)
+    out["unauthenticated_status"] = unauth_status()
     admin = EsClient(URL, CA, PWFILE, scheme="basic", user="elastic")
     st, _ = admin.request("GET", "/_security/_authenticate")
     out["p3_bootstrap_file_authenticates"] = st == 200
@@ -168,7 +182,26 @@ def main():
           and len(r_ctl["leaks"]) > 0 and out["p3_bootstrap_file_authenticates"])
     out["verdict"] = "PASS" if ok else "FAIL"
     print(json.dumps(out, sort_keys=True))
-    return 0 if ok else 1
+    n_p2 = r_ta["n"]
+    rc2 = pcommon.finish(
+        "P2", __file__, "all refused or empty, no names or query descriptions leaked",
+        "no leak" if not r_ta["leaks"] else "leaks: " + ", ".join(sorted(set(r_ta["leaks"]))),
+        not r_ta["leaks"] and out["ta_key_reads_own_index"] and len(r_ctl["leaks"]) > 0, n_p2,
+        {"control_monitor_key_leaks": len(r_ctl["leaks"]), "control_examples": sorted(set(r_ctl["leaks"]))[:6],
+         "own_index_readable": out["ta_key_reads_own_index"],
+         "error_echoed_requested_name_only": r_ta["echo_only"]})
+    log_hits, log_lines = p3_log_check()
+    pcommon.finish("P3", __file__, "bootstrap credential by file authenticates and appears in no log",
+                   "authenticates; %d log lines and environment values hold it" % log_hits,
+                   out["p3_bootstrap_file_authenticates"] and log_hits == 0 and log_lines > 0, 1,
+                   {"container_log_lines_checked": log_lines, "lines_holding_the_credential": log_hits})
+    v6 = "PASS" if lat is not None and lat < 1.0 else ("LIMITED" if lat is not None and lat < 5.0 else "FAIL")
+    pcommon.finish("P6", __file__, "invalidation to first refusal under 1 s",
+                   f"{lat} s", v6 == "PASS", 1,
+                   {"seconds": lat, "note": "LIMITED: slower than the expected 1 s, inside the T7 bound of 5 s; "
+                    "the fallback is to report the figure as a limit (a gateway drops its client for a revoked tenant at once)"},
+                   verdict=v6)
+    return rc2
 
 
 if __name__ == "__main__":

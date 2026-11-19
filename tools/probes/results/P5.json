@@ -1,0 +1,17 @@
+{
+  "commit": "74f7370fac482116374b730188d2f03d1312d67d",
+  "date": "2026-11-19",
+  "details": {
+    "acked_total": 123557,
+    "note": "N is the number of refresh rounds",
+    "retirement_updates_not_visible_after_refresh": 0
+  },
+  "expected": "acknowledged writes searchable after a returned refresh; realtime GET works",
+  "id": "P5",
+  "image_digest": "sha256:79b4f1de4c15e6eca824723086a51e5934406d614d410cc11be77748cafac537",
+  "n": 200,
+  "observed": "0 acknowledged writes missing after refresh",
+  "script": "probe_refresh.py",
+  "script_sha256": "567296c3a2a387afc588ebf4dd44802238514161802e7cafdb17f1add535e31a",
+  "verdict": "PASS"
+}

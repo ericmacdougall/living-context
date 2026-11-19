@@ -1,0 +1,18 @@
+{
+  "commit": "74f7370fac482116374b730188d2f03d1312d67d",
+  "date": "2026-11-19",
+  "details": {
+    "anomalies": 0,
+    "control_reads": 6417,
+    "control_two_request_anomalies": 3558,
+    "reads": 5892
+  },
+  "expected": "one _aliases request with add and remove is atomic under concurrent search",
+  "id": "P8",
+  "image_digest": "sha256:79b4f1de4c15e6eca824723086a51e5934406d614d410cc11be77748cafac537",
+  "n": 400,
+  "observed": "0 anomalies in 5892 reads",
+  "script": "probe_p8_alias_swap.py",
+  "script_sha256": "28d267b147b3a4211b3a61f97724625bbca53d479e4912a0602992dc3209a0e6",
+  "verdict": "PASS"
+}

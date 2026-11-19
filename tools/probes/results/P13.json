@@ -1,0 +1,15 @@
+{
+  "commit": "74f7370fac482116374b730188d2f03d1312d67d",
+  "date": "2026-11-19",
+  "details": {
+    "cap_setting": "65536"
+  },
+  "expected": "10,000 ids in one terms query work; the default cap is 65,536",
+  "id": "P13",
+  "image_digest": "sha256:79b4f1de4c15e6eca824723086a51e5934406d614d410cc11be77748cafac537",
+  "n": 4,
+  "observed": "10k ok=True, cap=65536, 65536 ok=True, 65537 refused=True",
+  "script": "probe_p13_terms.py",
+  "script_sha256": "007ad56f9076bac43d846a75e60cdcd70475c0c47d58e73a010336d7b032be91",
+  "verdict": "PASS"
+}

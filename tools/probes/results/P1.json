@@ -1,0 +1,26 @@
+{
+  "commit": "74f7370fac482116374b730188d2f03d1312d67d",
+  "date": "2026-11-19",
+  "details": {
+    "results": {
+      "alias": "status 200",
+      "bbq_disk": "status 200",
+      "dls": "licence_error",
+      "fls": "licence_error",
+      "force_merge": "status 200",
+      "knn_int8_hnsw_384": "status 200",
+      "linear": "licence_error",
+      "percolate": "status 200, hits 1",
+      "rrf": "licence_error",
+      "semantic_text": "mapping accepted, indexing status 403"
+    }
+  },
+  "expected": "licence errors for rrf, linear, DLS, FLS, semantic_text; the rest work",
+  "id": "P1",
+  "image_digest": "sha256:79b4f1de4c15e6eca824723086a51e5934406d614d410cc11be77748cafac537",
+  "n": 10,
+  "observed": "rrf: licence_error; linear: licence_error; dls: licence_error; fls: licence_error; semantic_text: mapping accepted, indexing status 403; bbq_disk: status 200; percolate: status 200, hits 1; knn_int8_hnsw_384: status 200; alias: status 200; force_merge: status 200",
+  "script": "probe_p1_licence.py",
+  "script_sha256": "731c13779292b3c741d4361af9cadaef3ae8f5ff826d8feeb483ca98c3e8cad8",
+  "verdict": "PASS"
+}

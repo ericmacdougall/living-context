@@ -1,0 +1,15 @@
+{
+  "commit": "74f7370fac482116374b730188d2f03d1312d67d",
+  "date": "2026-11-19",
+  "details": {
+    "control_current_value_write_failures": 0
+  },
+  "expected": "a stale if_seq_no returns 409 and writes nothing",
+  "id": "P11",
+  "image_digest": "sha256:79b4f1de4c15e6eca824723086a51e5934406d614d410cc11be77748cafac537",
+  "n": 100,
+  "observed": "100 of 100 stale writes refused with 409, source unchanged",
+  "script": "probe_p11_seqno.py",
+  "script_sha256": "61e1dbfb0be929bb1d309c7c7594b0f5f2e5be428fe45a630b9dce3d598cae6c",
+  "verdict": "PASS"
+}

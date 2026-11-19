@@ -36,3 +36,43 @@ is BUILD-PLAN P5 extended.
 
 Not verified: behaviour with a real (non-loopback) TCP peer, with TLS, and
 with autotuning enabled on the peer side.
+
+## Results bound to script, image and N (P1 to P16)
+
+Every row below is a file `tools/probes/results/<id>.json` holding {id, verdict,
+expected, observed, script, script_sha256, image_digest, n, commit, date}. The
+verdict is relative to the expected result of BUILD-PLAN section 2. N is the
+executed-check count and equals `tools/probes/pinned_n.json`. The image is the
+digest pinned in `docs/HOST.md`. `tools/probe_gate.py` refuses a step whose
+result is missing, whose script changed since (hash), whose image digest
+differs or whose N differs, and accepts a FAIL or LIMITED verdict only with a
+record in `docs/decisions/`. All runs: single node, security on, Basic licence,
+Elasticsearch 9.5.6, Linux 6.8.
+
+| Id | Verdict | N | Observed |
+|---|---|---|---|
+| P1 | PASS | 10 | rrf, linear, DLS, FLS refused with a licence error; `semantic_text` mapping accepted but indexing refused (403); `bbq_disk`, lexical percolate, int8_hnsw kNN at 384 dims, alias and force merge work |
+| P2 | FAIL | 94 | as above (names-only `_mget` channel on an alias); decision record `docs/decisions/P2-names-only-channel.md`, `main, ASSUMPTION`, awaiting the owner |
+| P3 | PASS | 1 | the credential file authenticates; 0 container log lines and 0 environment values hold it |
+| P4 | PASS | 3 | storing a `knn` query in a percolator field is refused ("the [knn] query is unsupported inside a percolator query"), top level and inside `bool`; a stored match query is accepted (control) |
+| P5 | PASS | 200 | 200 refresh rounds under 6 writers, 0 acknowledged writes missing after a returned refresh, 0 retirement updates invisible; the broken variant without the refresh is red (millions of misses counted); realtime GET works without refresh |
+| P6 | LIMITED | 1 | about 1.01 s to the first refusal, expected under 1 s; inside T7's 5 s; decision record `docs/decisions/P6-invalidation-latency.md` |
+| P7 | PASS | 40 | 40 of 40 restrictive-filter kNN queries (20 of 5,000 documents) returned k=10 hits; the control with `post_filter` returned fewer than k in 40 of 40 |
+| P8 | PASS | 400 | 400 atomic alias swaps under 4 readers (5,892 reads): 0 anomalies; the two-request control showed 3,558 anomalies in 6,417 reads |
+| P9 | PASS | 3 | `expunge_deletes_allowed: 0` accepted; `docs.deleted` 2,000 (soft-delete tombstones double the count) to 0 with repeated `only_expunge_deletes` passes |
+| P10 | PASS | 3 | `docs.deleted` reached 0 about 30.4 s after the delete in all three trials (30.37 to 30.44 s). Elasticsearch drops soft-delete tombstones only after the retention lease advances, a periodic sync (30 s default); one expunge pass right after the delete leaves them, so the purge must repeat the pass. The receipt bound is this measured figure plus the polling interval |
+| P11 | PASS | 100 | 100 of 100 stale `if_seq_no` writes got 409 and left the stored source unchanged; the current-value write succeeds (control) |
+| P12 | PASS | 50 | 50 of 50 `_msearch` calls with a missing-index sub-search: the other two answered, the failure was per item |
+| P13 | PASS | 4 | a terms query of 10,000 ids returns all 10,000 documents; default `index.max_terms_count` 65,536; 65,536 ids accepted, 65,537 refused |
+| P14 | PASS (premise only) | 3 | on a manual `read_only_allow_delete` block writes get 429 and reads work, unblocking restores writes; on a scratch node with a 160 MB tmpfs data directory and absolute watermarks (70/60/50 MB, monitor interval 10 s) filled until the node applied the block itself, writes got 429 about 14 s later and reads worked. This establishes the Elasticsearch side only; that the gateway's revoke is effective at once under both blocks is a Step 15 test, not claimed here |
+| P15 | PASS | 6 | a key owner (index privileges on its own tenant, `manage_own_api_key` only) creates keys that carry at most its privileges, rotates (create then invalidate) and invalidates its own keys; it cannot invalidate another owner's key; a gateway-style key (no cluster privilege) can neither create nor invalidate keys. Finding: the owner's invalidate request must carry `"owner": true`, without it Elasticsearch answers 403 |
+| P16 | PASS | 7 | slow-log thresholds of -1 are accepted and read back on all 12 index kinds, search and indexing; with default logger levels a random marker in a document, a search body and failing requests reaches no container log line or log file (count 0); with thresholds at 0 the marker appears for search (2) and indexing (1); setting -1 again stops it |
+
+Security-off check: every probe script prints `security off: P2 not established`
+and exits 2 against a cluster that answers an unauthenticated request
+(`tests/unit/test_probe_security_off.py` runs each script against a stub
+server).
+
+Not verified: multi-node behaviour of P6, P8, P9, P10 and P14; a real disk
+(the P14 volume is a tmpfs); the gateway's behaviour under the P14 blocks
+(Step 15).

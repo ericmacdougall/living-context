@@ -2,8 +2,9 @@
 write acknowledged before the refresh call began searchable?
 
 DESIGN 5.6 publishes the write-path watermark P and generation heads only
-after an explicit refresh has returned. Checks, against the cluster at argv[1]
-(http://host:port, no credential is sent; run against a scratch cluster):
+after an explicit refresh has returned. Checks, against the secured test
+cluster (LC_TEST_ES_URL, LC_TEST_CA, LC_TEST_PW; argument `no-refresh` runs the
+broken variant, which must be red):
   control   with refresh_interval -1, acknowledged writes are NOT searchable
             before the explicit refresh (so the probe can fail);
   realtime  a GET by id returns an acknowledged document without any refresh;
@@ -18,33 +19,27 @@ Prints one JSON verdict line.
 import json
 import sys
 import threading
-import urllib.request
+import time
 import uuid
+from pathlib import Path
 
-BASE = sys.argv[1].rstrip("/")
-BROKEN = len(sys.argv) > 2 and sys.argv[2] == "no-refresh"  # broken variant: must FAIL
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from tools.probes import pcommon  # noqa: E402
+
+pcommon.start()
+ES = pcommon.admin_client()
+BROKEN = len(sys.argv) > 1 and sys.argv[1] == "no-refresh"  # broken variant: must FAIL
 
 
 def req(method, path, body=None):
-    data = None if body is None else json.dumps(body).encode()
-    r = urllib.request.Request(BASE + path, data=data, method=method,
-                               headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(r, timeout=60) as resp:
-            return resp.status, json.loads(resp.read() or b"{}")
-    except urllib.error.HTTPError as e:
-        return e.code, json.loads(e.read() or b"{}")
+    return ES.request(method, path, body)
 
 
 def bulk(index, docs):
     lines = []
     for i, d in docs:
-        lines.append(json.dumps({"index": {"_index": index, "_id": i}}))
-        lines.append(json.dumps(d))
-    r = urllib.request.Request(BASE + "/_bulk", data=("\n".join(lines) + "\n").encode(), method="POST",
-                               headers={"Content-Type": "application/x-ndjson"})
-    with urllib.request.urlopen(r, timeout=60) as resp:
-        out = json.loads(resp.read())
+        lines += [{"index": {"_index": index, "_id": i}}, d]
+    _, out = ES.request("POST", "/_bulk", lines, ndjson=True)
     return [it["index"]["_id"] for it in out["items"] if it["index"]["status"] in (200, 201)]
 
 
@@ -103,6 +98,7 @@ def main():
     anomalies = []
     verified = {ix: set() for ix in idx}
     for r_ in range(rounds):
+        time.sleep(0.05)  # let the writers acknowledge something new before each snapshot
         with lock:
             snap = {ix: set(acked[ix]) - verified[ix] for ix in idx}
         # retirement update of one already-acked doc, acknowledged before the refresh
@@ -140,7 +136,13 @@ def main():
     out["broken_variant"] = BROKEN
     out["verdict"] = "PASS" if ok else "FAIL"
     print(json.dumps(out, sort_keys=True))
-    return 0 if ok else 1
+    if BROKEN:
+        return 0 if not ok else 1  # the broken variant must be red; no result file is written
+    return pcommon.finish(
+        "P5", __file__, "acknowledged writes searchable after a returned refresh; realtime GET works",
+        "0 acknowledged writes missing after refresh" if ok else f"{missing_total} missing, {retire_missing} retirements invisible",
+        ok, rounds, {"acked_total": out["acked_total"], "retirement_updates_not_visible_after_refresh": retire_missing,
+                     "note": "N is the number of refresh rounds"})
 
 
 if __name__ == "__main__":

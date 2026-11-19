@@ -1,0 +1,16 @@
+{
+  "commit": "74f7370fac482116374b730188d2f03d1312d67d",
+  "date": "2026-11-19",
+  "details": {
+    "control_post_filter_short_of_k": 40,
+    "restriction": "20 of 5000 documents"
+  },
+  "expected": "kNN filter with a restrictive filter returns k hits",
+  "id": "P7",
+  "image_digest": "sha256:79b4f1de4c15e6eca824723086a51e5934406d614d410cc11be77748cafac537",
+  "n": 40,
+  "observed": "40 of 40 queries returned 10 filtered hits",
+  "script": "probe_p7_knn_filter.py",
+  "script_sha256": "626b4b06386959059a2418c4ee5abe8c45af01a5f48276f201e3eed1eb27365e",
+  "verdict": "PASS"
+}

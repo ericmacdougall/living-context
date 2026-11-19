@@ -1,0 +1,20 @@
+{
+  "commit": "74f7370fac482116374b730188d2f03d1312d67d",
+  "date": "2026-11-19",
+  "details": {
+    "scope": "single node, 2,000 documents, explicit expunge merge",
+    "seconds_per_trial": [
+      30.436,
+      30.372,
+      30.429
+    ]
+  },
+  "expected": "time from delete to docs.deleted == 0 is measured",
+  "id": "P10",
+  "image_digest": "sha256:79b4f1de4c15e6eca824723086a51e5934406d614d410cc11be77748cafac537",
+  "n": 3,
+  "observed": "[30.436, 30.372, 30.429] s (max 30.436)",
+  "script": "probe_p9_p10_expunge.py",
+  "script_sha256": "96cd4538fd4cfbcff06edd974e8f7cf7a11fecc634ab2e73a147d67528e024b9",
+  "verdict": "PASS"
+}

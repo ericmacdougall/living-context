@@ -1,0 +1,13 @@
+{
+  "commit": "74f7370fac482116374b730188d2f03d1312d67d",
+  "date": "2026-11-19",
+  "details": {},
+  "expected": "one failing sub-search leaves the others intact",
+  "id": "P12",
+  "image_digest": "sha256:79b4f1de4c15e6eca824723086a51e5934406d614d410cc11be77748cafac537",
+  "n": 50,
+  "observed": "50 of 50 as expected",
+  "script": "probe_p12_msearch.py",
+  "script_sha256": "99369c35fc4295ff4a630dd98039bd4c2859c5fb04a4a8e9fe1e024438a00e07",
+  "verdict": "PASS"
+}

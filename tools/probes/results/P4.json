@@ -1,0 +1,18 @@
+{
+  "commit": "74f7370fac482116374b730188d2f03d1312d67d",
+  "date": "2026-11-19",
+  "details": {
+    "control_match_status": 201,
+    "in_bool_status": 400,
+    "reason_excerpt": "{'error': {'root_cause': [{'type': 'document_parsing_exception', 'reason': '[1:87] failed to parse: the [knn] query is unsupported inside a percolator query'}],",
+    "top_level_status": 400
+  },
+  "expected": "storing a knn query in a percolator field fails (unsupported)",
+  "id": "P4",
+  "image_digest": "sha256:79b4f1de4c15e6eca824723086a51e5934406d614d410cc11be77748cafac537",
+  "n": 3,
+  "observed": "unsupported (stored knn refused in both forms)",
+  "script": "probe_p4_percolate_knn.py",
+  "script_sha256": "0288737f8100e38bf05724491f3349c890339c426a7f6700e15ed11066349d5b",
+  "verdict": "PASS"
+}

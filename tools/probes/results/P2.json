@@ -1,0 +1,23 @@
+{
+  "commit": "74f7370fac482116374b730188d2f03d1312d67d",
+  "date": "2026-11-19",
+  "details": {
+    "control_examples": [
+      "GET /_cat/shards",
+      "GET /_cluster/state",
+      "GET /_nodes/stats",
+      "POST /_mget"
+    ],
+    "control_monitor_key_leaks": 4,
+    "error_echoed_requested_name_only": 70,
+    "own_index_readable": true
+  },
+  "expected": "all refused or empty, no names or query descriptions leaked",
+  "id": "P2",
+  "image_digest": "sha256:79b4f1de4c15e6eca824723086a51e5934406d614d410cc11be77748cafac537",
+  "n": 94,
+  "observed": "leaks: POST /_mget",
+  "script": "probe_isolation.py",
+  "script_sha256": "b7b649dd60934b364b83ca1f5edc1617498770a37233d6818ce08a5ec7b491e6",
+  "verdict": "FAIL"
+}

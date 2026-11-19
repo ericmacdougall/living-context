@@ -1,0 +1,29 @@
+{
+  "commit": "74f7370fac482116374b730188d2f03d1312d67d",
+  "date": "2026-11-19",
+  "details": {
+    "checks": {
+      "cannot_invalidate_foreign": true,
+      "gateway_key_cannot_create": true,
+      "gateway_key_cannot_invalidate": true,
+      "limited_by_owner": true,
+      "owner_invalidates_own": true,
+      "rotation_create": true
+    },
+    "foreign_invalidate_with_owner_flag_status": 200,
+    "foreign_invalidate_without_owner_flag_status": 403,
+    "owner_invalidates_own_detail": {
+      "listed": true,
+      "refused_after": true,
+      "status": 200
+    }
+  },
+  "expected": "a key owner manages only its own keys; created keys carry at most its privileges",
+  "id": "P15",
+  "image_digest": "sha256:79b4f1de4c15e6eca824723086a51e5934406d614d410cc11be77748cafac537",
+  "n": 6,
+  "observed": "checks 1-6: 1, 1, 1, 1, 1, 1",
+  "script": "probe_p15_key_owner.py",
+  "script_sha256": "ed750a18a9bd36eefa1757613e771b1f13560ecdc4a8a1e1de9ccbc92c31213b",
+  "verdict": "PASS"
+}
