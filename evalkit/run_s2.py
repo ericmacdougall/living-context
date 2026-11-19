@@ -49,7 +49,7 @@ def run(a, pick_questions, *, embedder=None, runner=None, loader=None) -> int:
     stamp = run_dir / "STAMP.json"
     if not stamp.exists():
         stamp.write_text(json.dumps({"stage": a.stage, "commit": a.commit, "cap": a.approved_cap, "approval_ref": a.approval_ref,
-                                     "n_questions": a.n_questions, "a0_fields": a.a0_fields, "embedder": e5.MODEL_ID,
+                                     "n_questions": a.n_questions, "a0_fields": a.a0_fields, "shuffled_n": int(getattr(a, "shuffled_n", 0) or 0), "embedder": e5.MODEL_ID,
                                      "started": time.time()}, sort_keys=True))
     if loader:
         dev, hashes, clusters = loader(a)
@@ -106,7 +106,20 @@ def run(a, pick_questions, *, embedder=None, runner=None, loader=None) -> int:
         direct = s2_stage.Recorder(et.direct())
         tr = s2_stage.Recorder(arms.TreeRetriever(port, view, a.tenant, CLS, "px", consts, workers=1))
         sh = s2_stage.Recorder(arms.TreeRetriever(port, arms.PermutedView(view), a.tenant, CLS, "px", consts, workers=1))
-        s2_stage.run_questions(dev, hashes, direct, tr, sh, world, ledger, beta=a.beta, stop=port.stop_requested,
+        beta = a.beta
+        if a.stage == "S3":
+            # S3 fits the length-prior beta once, on the development questions' A0 lists (no model call), and freezes it in the run directory
+            bp = run_dir / "beta.json"
+            if bp.exists():
+                beta = json.loads(bp.read_text())["beta"]
+            else:
+                dfn = et.direct()
+                rows = [(list(dfn(q.question))[:arms.WINDOW], sorted({hashes[s] for s in q.gold_session_ids}))
+                        for q in dev if q.gold_session_ids and not q.is_abstention]
+                beta = arms.fit_beta(rows, world)
+                bp.write_text(json.dumps({"beta": beta, "n_questions": len(rows), "grid": "evalkit.arms.fit_beta default"}))
+            print("A0+LEN beta (frozen):", beta, flush=True)
+        s2_stage.run_questions(dev, hashes, direct, tr, sh, world, ledger, beta=beta, shuffled_n=int(getattr(a, "shuffled_n", 0) or 0), stop=port.stop_requested,
                                progress=lambda s: print(s, "counter", budget.count(), flush=True))
     except StageStopped:
         state = "STOPPED"

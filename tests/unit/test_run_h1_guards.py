@@ -67,6 +67,15 @@ class Guards(unittest.TestCase):
         self.assertTrue(any("stamped run" in w for w in run_h1.check_prereqs(args(run_dir=d), embed=real_embed)))
         self.assertEqual(run_h1.check_prereqs(args(run_dir=d, resume=True), embed=real_embed), [])
 
+    def test_s3_is_registered_on_102_questions_with_shuffled_on_50_and_needs_the_same_approvals(self):
+        ok = dict(stage="S3", n_questions=102, shuffled_n=50, approved_cap=17252)
+        self.assertEqual(run_h1.check_prereqs(args(**ok), embed=real_embed), [])
+        for kw, word in ((dict(n_questions=30), "102 pilot"), (dict(shuffled_n=0), "50 questions"), (dict(shuffled_n=30), "50 questions"),
+                         (dict(approved_cap=0), "call cap"), (dict(approval_ref=""), "approval"), (dict(model_kind="stub"), "real model port")):
+            self.assertIn(word, " ".join(run_h1.check_prereqs(args(**{**ok, **kw}), embed=real_embed)), kw)
+        self.assertTrue(any("pinned real embedder" in w for w in run_h1.check_prereqs(args(**ok), embed=embed_stub.embed)))
+        self.assertTrue(any("on all" in w for w in run_h1.check_prereqs(args(shuffled_n=50), embed=real_embed)))   # S2 runs SHUFFLED on all
+
     def test_the_dev_stub_smoke_needs_no_approval_and_no_embedding_port(self):
         self.assertEqual(run_h1.check_prereqs(args(stage="DEV-STUB", approved_cap=0, approval_ref="", model_kind="stub", n_questions=3)), [])
 

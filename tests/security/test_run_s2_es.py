@@ -177,6 +177,23 @@ class S2Body(unittest.TestCase):
             self.assertLessEqual(self.state(d)["counter"], cc.MAX_CLI_FAILURE_STREAK)
             self.assertEqual(self.state(d)["counter"], r.n)
 
+    def test_s3_fits_beta_once_runs_shuffled_on_the_first_n_only_and_a_resume_keeps_beta(self):
+        with tempfile.TemporaryDirectory() as d:
+            r = Runner(stop_at=12, stop_file=Path(d) / "STOP")
+            self.assertEqual(self.go(d, r, stage="S3", shuffled_n=2, n_questions=4), 3)
+            beta = json.loads((Path(d) / "beta.json").read_text())["beta"]
+            (Path(d) / "STOP").unlink()
+            self.assertEqual(self.go(d, Runner(), stage="S3", shuffled_n=2, n_questions=4, resume=True), 0)
+            self.assertEqual(json.loads((Path(d) / "beta.json").read_text())["beta"], beta)
+            rows = [json.loads(l) for l in (Path(d) / "done.jsonl").read_text().splitlines()]
+            self.assertEqual(sorted(("SHUFFLED" in x["arms"]) for x in rows), [False, False, True, True])
+            self.assertTrue((Path(d) / "results" / "arm_A0_plus_LEN.json").exists())
+            self.assertEqual(json.loads((Path(d) / "results" / "arm_SHUFFLED.json").read_text())["n"], 2)
+            comp = json.loads((Path(d) / "results" / "comparisons.json").read_text())
+            self.assertEqual(comp["A1_minus_A0"]["n"], 4)
+            self.assertEqual(comp["A1_minus_A0_plus_LEN"]["n"], 4)
+            self.assertEqual(comp["SHUFFLED_control"]["n"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

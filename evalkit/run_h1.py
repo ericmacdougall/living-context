@@ -32,7 +32,9 @@ from living_context.embed import e5, stub as embed_stub
 from . import arms, dataset as ds, stats
 from .score import question_scores, write_result
 
-STAGES = ("DEV-STUB", "S2")
+STAGES = ("DEV-STUB", "S2", "S3")
+REGISTERED_N = {"S2": 30, "S3": 102}      # pilot questions per stage (EXPERIMENT 10); S3 scores the non-abstention ones with gold
+SHUFFLED_N = {"S3": 50}                    # S3 runs SHUFFLED-SUMMARIES on the first 50 questions of the seeded order
 SEED = ds.SPLIT_SEED
 
 
@@ -44,36 +46,39 @@ def check_prereqs(a, *, embed=embed_stub.embed) -> List[str]:
         why.append("unknown stage")
     if a.splits != ["pilot"]:
         why.append("only the pilot split may be run here; the held-out and fresh questions are never loaded")
-    if a.stage == "S2":
+    if a.stage in ("S2", "S3"):
         if not (a.approved_cap and a.approved_cap > 0):
-            why.append("S2 needs the owner's approval of the stage with its call cap (--approved-cap)")
+            why.append("%s needs the owner's approval of the stage with its call cap (--approved-cap)" % a.stage)
         if not (a.approval_ref or "").strip():
-            why.append("S2 needs a reference to the owner's approval (--approval-ref)")
+            why.append("%s needs a reference to the owner's approval (--approval-ref)" % a.stage)
         try:
-            e5.require_real(embed, stage="S2")
+            e5.require_real(embed, stage=a.stage)
         except e5.PinError:
             why.append("the pinned real embedder (multilingual-e5-small, BUILD-PLAN 1.3) is required; the stub embedder weakens flat search and "
                        "biases H1")
         if not (a.commit or "").strip():
-            why.append("S2 needs the commit under test (--commit)")
+            why.append("%s needs the commit under test (--commit)" % a.stage)
         if a.model_kind != "claude":
-            why.append("S2 uses the real model port (--model-kind claude)")
-        if a.n_questions != 30:
-            why.append("S2 is registered on 30 pilot questions")
+            why.append("%s uses the real model port (--model-kind claude)" % a.stage)
+        if a.n_questions != REGISTERED_N[a.stage]:
+            why.append("%s is registered on %d pilot questions" % (a.stage, REGISTERED_N[a.stage]))
+        if int(getattr(a, "shuffled_n", 0) or 0) != SHUFFLED_N.get(a.stage, 0):
+            why.append("%s runs SHUFFLED-SUMMARIES on %s questions (--shuffled-n)" % (a.stage, SHUFFLED_N.get(a.stage, "all")))
         if getattr(a, "a0_fields", "strong") not in ("strong", "text"):
             why.append("--a0-fields must be strong or text")
     stamp = Path(a.run_dir) / "STAMP.json"
     if stamp.exists() and not a.resume:
         why.append("a stamped run already exists in the run directory (one stamped run per stage; --resume continues the same run)")
-    if stamp.exists() and a.resume and a.stage == "S2":
+    if stamp.exists() and a.resume and a.stage in ("S2", "S3"):
         try:
             old = json.loads(stamp.read_text())
         except ValueError:
             old = {}
-        for k, now in (("commit", a.commit), ("cap", a.approved_cap), ("n_questions", a.n_questions), ("a0_fields", getattr(a, "a0_fields", "strong"))):
-            if old.get(k) != now:
+        for k, now in (("commit", a.commit), ("cap", a.approved_cap), ("n_questions", a.n_questions), ("a0_fields", getattr(a, "a0_fields", "strong")),
+                         ("shuffled_n", int(getattr(a, "shuffled_n", 0) or 0))):
+            if old.get(k, 0 if k == "shuffled_n" else None) != now:
                 why.append("--resume must continue the same run: %s differs from the stamp (a new cap needs a new approval and a new run)" % k)
-    if a.stage == "S2" and (Path(a.run_dir) / "STOP").exists():
+    if a.stage in ("S2", "S3") and (Path(a.run_dir) / "STOP").exists():
         why.append("a stop file is present in the run directory; remove it to start or resume")
     return why
 
@@ -118,21 +123,22 @@ def main(argv: Optional[list] = None) -> int:
     ap.add_argument("--threads", type=int, default=6)
     ap.add_argument("--a0-fields", default="strong", choices=["strong", "text"],
                     help="BM25 fields of A0 and of A1's direct list: strong = text,title,entities (default, the stronger baseline); text = text only")
+    ap.add_argument("--shuffled-n", type=int, default=0, help="run SHUFFLED-SUMMARIES on the first N questions only (0 = all; S3 requires 50)")
     ap.add_argument("--max-retries", type=int, default=3, help="throttle retries per call before the stage pauses")
     ap.add_argument("--base-delay", type=float, default=30.0, help="first throttle back-off in seconds (doubles, capped at 600)")
     a = ap.parse_args(argv)
     embedder = None
-    if a.stage == "S2" and a.embed_dir:
+    if a.stage in ("S2", "S3") and a.embed_dir:
         try:
             embedder = e5.E5Embedder(a.embed_dir, threads=a.threads)
         except e5.PinError as e:
             print("REFUSED:\n  the embedder files are not the pinned ones: %s" % e)
             return 2
-    why = check_prereqs(a, **({"embed": embedder} if a.stage == "S2" else {}))
+    why = check_prereqs(a, **({"embed": embedder} if a.stage in ("S2", "S3") else {}))
     if why:
         print("REFUSED:\n  " + "\n  ".join(why))
         return 2
-    if a.stage == "S2":
+    if a.stage in ("S2", "S3"):
         from . import run_s2
         return run_s2.run(a, pick_questions, embedder=embedder)
     run_dir = Path(a.run_dir)

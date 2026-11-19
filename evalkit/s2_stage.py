@@ -68,7 +68,7 @@ class Recorder:
 
 def run_questions(dev: Sequence[ds.Question], hashes: Mapping[str, str], direct: Recorder, tree: Recorder, shuffled: Recorder,
                   world: arms.World, ledger: Ledger, *, beta: Optional[float] = None, stop: Callable[[], bool] = lambda: False,
-                  progress: Callable[[str], None] = lambda s: None) -> None:
+                  progress: Callable[[str], None] = lambda s: None, shuffled_n: int = 0) -> None:
     """Completes every question not yet in the ledger, in the given order. Raises `StageStopped` (stop file) or `CapReached`
     before recording a question that did not complete; whatever the model port raised (`StagePaused`, `BudgetExceeded` outside a
     recall) propagates, again without recording the question."""
@@ -79,8 +79,11 @@ def run_questions(dev: Sequence[ds.Question], hashes: Mapping[str, str], direct:
         if stop():
             raise StageStopped("stop file present")
         g = sorted({hashes[s] for s in q.gold_session_ids})
-        o = arms.run_question(q.question, direct, tree, world, beta=beta or 0.0, shuffled_tree=shuffled)
-        for rec in (tree, shuffled):
+        shf = shuffled if (not shuffled_n or n <= shuffled_n) else None      # S3: SHUFFLED on the first `shuffled_n` questions only
+        o = arms.run_question(q.question, direct, tree, world, beta=beta or 0.0, shuffled_tree=shf)
+        for rec in (tree, shf):
+            if rec is None:
+                continue
             if rec.last is not None and not rec.last.ok and rec.last.error == "BudgetExceeded":
                 raise CapReached("call cap reached during question %d" % n)
         src = arms.source_of_gold(o["A1"], tree.last.ids, [i for i, _ in direct.last], g, world) if o["A1"].sessions else {}
@@ -132,15 +135,27 @@ def write_arm_results(out_dir: Path, ledger: Ledger, qids: Sequence[str], *, com
 def comparisons(ledger: Ledger, qids: Sequence[str], clusters: Mapping[str, str], resamples: int = 10_000) -> dict:
     """Exploratory comparisons of the S2 row: A1 minus A0, and the SHUFFLED-SUMMARIES control (A1-tree-only minus SHUFFLED), plus
     the tree-only source share of 2.2 (c). The stage gate itself is a human reading of these with the failure rate."""
-    s = {a: _scores(ledger, a, qids)[0] for a in ARMS_H1}
+    s = {a: _scores(ledger, a, qids)[0] for a in ARMS_H1 + ("A0+LEN",)}
     out: dict = {}
-    if all(len(v) >= 2 for v in s.values()) and len({tuple(sorted(v)) for v in s.values()}) == 1:
-        a1a0 = stats.clustered_bootstrap(stats.paired_differences(s["A1"], s["A0"]), clusters, resamples=resamples)
-        drop = stats.clustered_bootstrap(stats.paired_differences(s["A1-tree-only"], s["SHUFFLED"]), clusters, resamples=resamples)
-        ctrl = stats.shuffled_control(drop)
+    # A1 minus A0 (and minus A0+LEN, the length control, when a beta was fitted) over the questions both arms answered; the SHUFFLED
+    # control over the questions where SHUFFLED ran (S3 runs it on a subset), A1-tree-only restricted to the same ones
+    def paired(x, y, keep=None):
+        ks = sorted(set(s[x]) & set(s[y]) & (set(keep) if keep is not None else set(s[x])))
+        return ({k: s[x][k] for k in ks}, {k: s[y][k] for k in ks})
+    a, b = paired("A1", "A0")
+    if len(a) >= 2:
+        a1a0 = stats.clustered_bootstrap(stats.paired_differences(a, b), clusters, resamples=resamples)
         out["A1_minus_A0"] = {"point": a1a0.point, "lo": a1a0.lo, "hi": a1a0.hi, "n": a1a0.n_questions, "clusters": a1a0.n_clusters}
+    a, b = paired("A1", "A0+LEN")
+    if len(a) >= 2:
+        d = stats.clustered_bootstrap(stats.paired_differences(a, b), clusters, resamples=resamples)
+        out["A1_minus_A0_plus_LEN"] = {"point": d.point, "lo": d.lo, "hi": d.hi, "n": d.n_questions, "clusters": d.n_clusters}
+    a, b = paired("A1-tree-only", "SHUFFLED")
+    if len(a) >= 2:
+        drop = stats.clustered_bootstrap(stats.paired_differences(a, b), clusters, resamples=resamples)
+        ctrl = stats.shuffled_control(drop)
         out["SHUFFLED_control"] = {"drop_point": drop.point, "drop_lo": drop.lo, "drop_hi": drop.hi, "passes_registered_rule": ctrl.passed,
-                                   "rule": ctrl.reason + " (registered for 50 questions; shown here for 30, exploratory)"}
+                                   "n": drop.n_questions, "rule": ctrl.reason + " (registered for 50 questions; exploratory)"}
     withgold = [r for r in ledger.rows.values() if r["sources"]]
     out["tree_only_share"] = {"questions_with_gold_in_A1_top10": len(withgold),
                               "of_which_tree_only": sum("tree_only" in r["sources"] for r in withgold)}
