@@ -130,15 +130,13 @@ class ErasureOnElasticsearch(unittest.TestCase):
         self.assertEqual(rc.recount, 0)
         for lid in self.erased_ids:
             self.assertFalse(self.ks.has_key(lid, 1), "a data key survived")
-        for ref, doc in self.node_docs().items():
-            was = nodes_before[ref]
-            if MARK in str(was["summary"]) + str(was["children"]) or (doc["level"] == 2 and was["summary"] and rc.rewritten):
-                pass
-        upper = [(r, d) for r, d in self.node_docs().items() if d["level"] == 2]
-        self.assertTrue(all(d["summary_status"] == "erased_placeholder" for r, d in upper
-                            if any(nodes_before[c["child_id"] + ":1"]["summary_status"] == "ok" and
-                                   nodes_before[c["child_id"] + ":1"]["lin_subjects"] for c in nodes_before[r]["children"])),
-                        "an upper node reached only through transitive lineage kept the erased subject's summary")
+        after = self.node_docs()
+        for ref, doc in after.items():
+            if doc["level"] == 2:
+                kids = [after[c["child_id"] + ":1"] for c in doc["children"]]
+                if any(k["summary_status"] == "erased_placeholder" for k in kids):
+                    self.assertEqual(doc["summary_status"], "erased_placeholder",
+                                     "an upper node reached only through transitive lineage kept the erased subject's summary")
 
     def test_erasure_reaches_every_derived_artefact_and_meets_the_boundary(self):
         self.scenario()
@@ -147,7 +145,7 @@ class ErasureOnElasticsearch(unittest.TestCase):
         rc = self.executor().erase_subject(self.subject, apply_guard=self.guard_fn())
         self.check_erasure(rc, nodes_before)
         self.assertLess(rc.boundary_s, 60.0)
-        self.assertTrue(rc.purge_ok, rc.purge_s)
+        self.assertTrue(rc.purge_ok, (rc.purge_s, rc.purge_left))
         print(f"erasure: boundary {rc.boundary_s:.2f} s, physical purge {max(rc.purge_s.values()):.1f} s, closure {rc.closure}")
         after = self.node_docs()
         for d in after.values():

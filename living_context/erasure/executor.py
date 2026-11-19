@@ -56,6 +56,7 @@ class Receipt:
     deleted: int = 0
     rewritten: int = 0
     purge_s: dict = field(default_factory=dict)
+    purge_left: dict = field(default_factory=dict)
     purge_ok: bool = True
     recount: int = -1
 
@@ -138,6 +139,7 @@ class Executor:
         with ThreadPoolExecutor(max(1, min(8, len(touched)))) as ex:  # the tombstone clocks run side by side
             for ix, res in ex.map(one, sorted(touched)):
                 rc.purge_s[ix] = round(res.seconds, 1)
+                rc.purge_left[ix] = res.deleted_left
                 rc.purge_ok &= res.ok
         er.request("POST", f"/lc-{self.tenant}-*/_refresh")
         remaining = [h for h in scan.find(er, self.tenant, subjects=[subject], leaf_ids=leaves) if h.kind not in KEEP_KINDS | REWRITE_KINDS]
