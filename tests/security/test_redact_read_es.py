@@ -11,7 +11,7 @@ from tests.security import test_erasure_es as E
 
 
 class RedactedRead(E.ErasureOnElasticsearch):
-    def window(self, consult):
+    def window(self, consult, only=None):
         self.scenario()
         seen = {}
         p = Principal(E.T, "p-base", frozenset([Role.READER]), frozenset(["base"]), frozenset())
@@ -33,17 +33,24 @@ class RedactedRead(E.ErasureOnElasticsearch):
 
         r = self.executor(pause=pause, purge_deadline_s=2).erase_subject(self.subject, apply_guard=self.guard_fn())
         self.assertTrue(r.seq)
-        self.assertEqual([i for i in seen["direct"] if i.split(":")[0] in self.erased_ids], [],
-                         "direct search returned an erased leaf after the boundary")
-        self.assertFalse([t for t in seen["tree"] if E.MARK in t], "the tree view showed erased content after the boundary")
+        if only in (None, "direct"):
+            self.assertEqual([i for i in seen["direct"] if i.split(":")[0] in self.erased_ids], [],
+                             "direct search returned an erased leaf after the boundary")
+        if only in (None, "tree"):
+            self.assertFalse([t for t in seen["tree"] if E.MARK in t], "the tree view showed erased content after the boundary")
 
     def test_read_path_consults_the_redact_set(self):
         self.window(True)
 
-    def test_broken_redact_set_not_consulted_is_red(self):
+    def test_broken_redact_set_not_consulted_is_red_for_direct_search(self):
         with self.assertRaises(AssertionError) as cm:
-            self.window(False)
-        self.assertIn("after the boundary", str(cm.exception))
+            self.window(False, only="direct")
+        self.assertIn("direct search returned", str(cm.exception))
+
+    def test_broken_redact_set_not_consulted_is_red_for_the_tree_view(self):
+        with self.assertRaises(AssertionError) as cm:
+            self.window(False, only="tree")
+        self.assertIn("tree view showed", str(cm.exception))
 
 
 for _n in [n for n in dir(E.ErasureOnElasticsearch) if n.startswith("test_") and n not in RedactedRead.__dict__]:
