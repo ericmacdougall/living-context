@@ -1245,3 +1245,57 @@ control of sections 1 to 8.
 - Consequence for reading S1: its figures describe the client and the prompts on a fixture of synthetic notes, where token counts
   per character differ from English text. Section 10.2 is replaced by measured figures only through the separate amendment that
   follows the run, which states the prompt sizes beside each figure.
+
+### 14.2 Measured per-call figures from S1 (replaces the CLI column of 10.2; 2026-11-19)
+
+Run: stage S1 as amended in 14.1, on commit 924c9f6, the synthetic fixture (64 leaves of nonsense-word notes, four of them long),
+the headless CLI on the subscription, model tier Sonnet; the CLI reported one model id on every call (claude-sonnet-5-5) and one turn
+per call. 22 of the 25 permitted calls were made (the durable counter reads 22; 3 held in reserve and not used). No call was
+throttled, none failed, all 22 outputs were schema valid and all 22 passed the consumer-strict checks (entry count equals leaf
+count, labels among those presented, confidence 0 to 3, reasons and labels at most 12 words, pointers among those presented).
+
+Invocation (frozen, part of the registered client from here on): the CLI from an empty working directory with the prompt on stdin,
+`-p --model <id> --output-format json --no-session-persistence --tools "" --disable-slash-commands --strict-mcp-config` and the
+settings overlay `{"disableAllHooks":true}`, a minimal system prompt that asks for one JSON object, and the child environment
+switches that turn off instruction files, auto-memory and self-update. Not `--bare` (it does not read the subscription login).
+
+Fixed per-call overhead, measured: about 645 input tokens (a 158-character prompt came to 682 total input tokens and a 178-character
+prompt to 689). The 10.5k figure of 10.2 was measured on a default CLI session (default system prompt, tools, instruction files);
+with this invocation the CLI basis is the API basis plus about 645 tokens, not plus 10,500. The prompt is billed as cache creation by
+the CLI (all 22 calls: 2 uncached input tokens, the rest cache creation, no cache reads); the totals below add the three input fields.
+
+| Task kind | Calls | Prompt chars | Total input tokens (CLI) | Output tokens | Latency s (range) | Valid |
+|---|---|---|---|---|---|---|
+| route | 8 | 4,403 to 5,206 | 2,714 to 2,972 | 24 to 391 (median 24) | 2.05 to 4.33 (median 2.09) | 8 of 8 |
+| organise | 2 | 1,024 | 1,251 and 1,257 | 427 and 380 | 3.94 and 3.66 | 2 of 2 |
+| build_l1 (16 leaves, 3,800 characters) | 4 | 3,791 to 3,806 | 2,392 to 2,444 | 1,559 to 1,836 | 9.27 to 10.71 | 4 of 4 |
+| build_upper (4 summaries) | 1 | 3,605 | 2,090 | 176 | 3.00 | 1 of 1 |
+| type_edges (c0 and 5 items) | 1 | 2,475 | 1,842 | 115 | 2.54 | 1 of 1 |
+| judge_relevance | 1 | 1,870 | 1,558 | 18 | 2.03 | 1 of 1 |
+| query_variants | 1 | 158 | 682 | 69 | 2.37 | 1 of 1 |
+| synthetic_queries | 1 | 1,819 | 1,526 | 138 | 2.96 | 1 of 1 |
+| ask | 1 | 1,861 | 1,560 | 107 | 2.81 | 1 of 1 |
+| reader_answer | 1 | 1,821 | 1,540 | 78 | 2.49 | 1 of 1 |
+| answer_judge | 1 | 178 | 689 | 9 | 1.88 | 1 of 1 |
+
+What this does and does not replace. The fixed overhead (645 tokens against 10,500), the output tokens, the latency per kind and
+the validity of every kind are measured. The per-kind INPUT sizes are fixture-sized: the 16 leaves of a build_l1 prompt fit in 3,800
+characters of prompt including its instructions (10.1 assumes leaves of 1,100 tokens), nonsense words cost about 0.46 tokens per character
+where English costs less, and the route entries are short. So the registered API ranges of 10.2 stay as the estimate for real-data
+inputs and S2 measures them at real sizes; the measured totals above are lower bounds for kinds whose input scales with text
+(build_l1, build_upper, route, type_edges, judge_relevance, ask, reader_answer). Output tokens per build_l1 call (about 1,700, for 16
+entries and a summary) scale with the number of leaves, not their length. Latency measured on short prompts is a floor.
+
+Effect on 10.3 (`evalkit/budget_measured.py`, which runs `evalkit/budget.py` unchanged with the measured overhead; the calls per
+stage do not change, because S1 measures tokens and time, not how many calls a stage makes):
+
+| Stage | Calls | CLI input Mtok (registered API ranges plus 645 per call) | Fixture-sized lower bound, Mtok | Output Mtok | Hours at the measured mean latency per kind, concurrency 2 (a floor) |
+|---|---|---|---|---|---|
+| S2 | 2,391 to 5,454 | 14 to 46 (10.3 had 37 to 100) | 6 to 13 | 0.9 to 1.6 | 1.3 to 2.6 (10.3 had 3 to 7 at 9.36 s per call) |
+| S3 | 7,022 to 17,252 | 43 to 152 (112 to 322) | 16 to 41 | 2.8 to 5.2 | 3.8 to 8.3 (9 to 22) |
+| S6-H1 | 23,104 to 35,574 | 144 to 398 (371 to 749) | 58 to 89 | 11.0 to 16.9 | 13.8 to 21.2 (30 to 46) |
+| S2 + S3 + S6-H1 | 32,517 to 58,280 | 200 to 597 | 80 to 143 | 14.7 to 23.7 | 18.9 to 32.1 (42 to 76 for the path with S1) |
+
+The hours are a floor and not a promise: the measured latencies come from 22 sequential calls on short prompts, the subscription's
+sustained limits were not exercised (no call was throttled), and S2 measures calls per 5-hour window (section 10, S2 gate).
+The rest of 10.3 (S6-H2 and the loop stages) is not restated here.
