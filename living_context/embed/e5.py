@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import time
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
 
@@ -104,16 +105,26 @@ class E5Embedder:
         self._tok = AutoTokenizer.from_pretrained(str(d), local_files_only=True)
         self._model = AutoModel.from_pretrained(str(d), local_files_only=True).eval()
         self._batch, self._no_prefix, self._no_norm = batch_windows, broken_no_prefix, broken_no_normalise
+        self.stats = {"calls": 0, "windows": 0, "seconds": 0.0}     # for throughput reports
         self._cls, self._sep, self._pad = self._tok.cls_token_id, self._tok.sep_token_id, self._tok.pad_token_id
         self._prefix_ids = {k: self._tok(p, add_special_tokens=False)["input_ids"]
                             for k, p in (("query", QUERY_PREFIX), ("passage", PASSAGE_PREFIX))}
 
     # one text, either kind -> a 384-float list
     def _encode(self, kind: str, text: str) -> List[float]:
+        t0 = time.monotonic()
+        try:
+            return self._encode_inner(kind, text)
+        finally:
+            self.stats["calls"] += 1
+            self.stats["seconds"] += time.monotonic() - t0
+
+    def _encode_inner(self, kind: str, text: str) -> List[float]:
         ids = self._tok(text, add_special_tokens=False, truncation=False)["input_ids"]
         pre = [] if self._no_prefix else self._prefix_ids[kind]
         seqs = [[self._cls] + pre + w + [self._sep] for w in (windows(ids) if kind == "passage" else [ids[:WINDOW_TOKENS]])]
         vecs: List[List[float]] = []
+        self.stats["windows"] += len(seqs)
         for i in range(0, len(seqs), self._batch):
             vecs += self._run(seqs[i:i + self._batch])
         return mean_normalised(vecs)

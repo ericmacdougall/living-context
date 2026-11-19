@@ -4,7 +4,7 @@ Sessions are segmented by the real segmenter and written leaf by leaf through th
 embedding, source log, heads). The write path receives, per leaf, the text and ONE opaque session reference; nothing else of the
 dataset record exists on this side (`dataset.Question` carries no other field). The harness keeps the leaf to session-content-hash
 map itself and never sends it to a model. The tree is built by the real builder, published as a generation, and read through
-the pinned `EsView`; the direct list is the real `DirectSearch` over the leaf index.
+the pinned `EsView`; the direct list is `flat.FlatSearch` (the `DirectSearch` request shape; the BM25 field set is a parameter).
 
 Credentials are passed by PATH only (the files are read by the Elasticsearch client, mode 0600 enforced). Nothing is printed."""
 from __future__ import annotations
@@ -22,13 +22,13 @@ from living_context.ingest.subjects import Guard, TokenSource
 from living_context.ingest.writer import Writer
 from living_context.keystore import Keystore
 from living_context.policy import ClassLattice, Principal, Role
-from living_context.recall.direct import DirectSearch
 from living_context.recall.view import EsView
 from living_context.structure import build
 from living_context.structure.build import LeafRec
 from living_context.structure.publish import Publisher
 
 from .arms import World
+from .flat import A0_FIELDS_DEFAULT, FlatSearch
 from .corpus import session_leaf_texts
 from .dataset import opaque_ref
 
@@ -45,23 +45,42 @@ def reset_tenant(admin: EsClient, tenant: str) -> None:
 
 class EvalTenant:
     def __init__(self, es_url: str, ca_path: str, admin_credential_path: str, tenant: str, root: Path, *,
-                 consts: Optional[Constants] = None, embed: Callable[[str], list] = embed_stub.embed, reset: bool = True):
+                 consts: Optional[Constants] = None, embed: Callable[[str], list] = embed_stub.embed, reset: bool = True,
+                 query_embed: Optional[Callable[[str], list]] = None, a0_fields: Sequence[str] = A0_FIELDS_DEFAULT,
+                 attach: bool = False):
+        """`embed` embeds leaf text (the passage side); `query_embed` embeds a query (the query side; the hashed stub has one
+        function for both, so it defaults to `embed`). `a0_fields` is the field set of the flat BM25 list (flat.py). `attach` re-opens a
+        tenant this process (or an earlier one, same root) already built: nothing is reset or provisioned, the key files and the
+        keystore under `root` are reused and `load_state` restores the harness-side maps."""
         self.tenant, self.root, self.consts, self._embed = tenant, Path(root), consts or Constants(), embed
+        self._query_embed, self.a0_fields = query_embed or embed, tuple(a0_fields)
+        self._last_vec: Optional[Tuple[str, list]] = None
         self.admin = EsClient(es_url, ca_path, admin_credential_path, scheme="basic", user="elastic")
-        if reset:
-            reset_tenant(self.admin, tenant)
-        keys = provision_tenant(self.admin, tenant, [CLS], key_dir=self.root / "keys", data_root=self.root / "data",
-                                journal_size=65536)["keys"]
+        if attach:
+            keys = {p.stem: str(p) for p in sorted((self.root / "keys" / tenant).glob("*.key"))}
+            if not keys:
+                raise RuntimeError("nothing to attach to: no key files under the tenant root")
+        else:
+            if reset:
+                reset_tenant(self.admin, tenant)
+            keys = provision_tenant(self.admin, tenant, [CLS], key_dir=self.root / "keys", data_root=self.root / "data",
+                                    journal_size=65536)["keys"]
         self.gate = EsGate(es_url, ca_path, {tenant: keys})
         self.ks = Keystore(self.root / "ks" / f"{tenant}.db", tenant)
         self.writer = Writer(lambda: self.gate.client(tenant, "ingest"), self.ks, tenant, Guard(TokenSource(self.ks)),
-                             consts=self.consts, embed=embed)
+                             consts=self.consts, embed=self._emb)
         self.leaves: List[LeafRec] = []
         self.leaf_session: Dict[str, str] = {}
         self.session_tokens: Dict[str, int] = {}
         self._seen: set = set()
         self.max_seq = 0
         self.principal = Principal(tenant, "p-eval", frozenset([Role.READER]), frozenset([CLS]), frozenset())
+
+    def _emb(self, text: str) -> list:
+        """The writer's embedder; keeps the vector so the leaf record does not embed the same text a second time."""
+        v = self._embed(text)
+        self._last_vec = (text, v)
+        return v
 
     # ---- ingest -------------------------------------------------------------------------------------------------
     def ingest(self, sessions: Sequence[Tuple[str, Sequence[Tuple[str, str]]]]) -> int:
@@ -78,13 +97,32 @@ class EvalTenant:
                     raise RuntimeError("the write path refused a leaf: %s" % res.status)
                 size = segment.tokens_of(text, self.consts.chars_per_token_bound)
                 self.leaves.append(LeafRec(res.leaf_id, res.lv, text, title.build_title(text, n=self.consts.title_terms),
-                                           self._embed(text), size, (), res.src_seq))
+                                           self._vector_of(text), size, (), res.src_seq))
                 self.leaf_session[res.leaf_id] = h
                 self.session_tokens[h] = self.session_tokens.get(h, 0) + size
                 self.max_seq = max(self.max_seq, res.src_seq)
                 wrote += 1
         self.admin.request("POST", f"/lc-{self.tenant}-{CLS}-leaf/_refresh")
         return wrote
+
+    def _vector_of(self, text: str) -> list:
+        if self._last_vec is not None and self._last_vec[0] == text:
+            return self._last_vec[1]
+        return self._embed(text)
+
+    def save_state(self, path: Path) -> None:
+        """The harness-side maps (leaf to session content hash, session sizes, last source sequence) so a resumed run can attach to
+        the built tenant instead of ingesting and building again."""
+        import json
+        Path(path).write_text(json.dumps({"leaf_session": self.leaf_session, "session_tokens": self.session_tokens, "max_seq": self.max_seq,
+                                          "leaves": len(self.leaves)}, sort_keys=True))
+
+    def load_state(self, path: Path) -> int:
+        import json
+        d = json.loads(Path(path).read_text())
+        self.leaf_session, self.session_tokens, self.max_seq = d["leaf_session"], d["session_tokens"], d["max_seq"]
+        self._seen = set(self.session_tokens)
+        return int(d["leaves"])
 
     @property
     def world(self) -> World:
@@ -108,8 +146,9 @@ class EvalTenant:
         return EsView(self.gate.client(self.tenant, f"read-{CLS}"), self.tenant, CLS, "topic")
 
     # ---- the direct list (A0) -------------------------------------------------------------------------------------
-    def direct(self, window: int = 50) -> Callable[[str], List[Tuple[str, float]]]:
-        ds = DirectSearch(lambda c: self.gate.client(self.tenant, f"read-{c}"), self.tenant, embed=self._embed)
+    def direct(self, window: int = 50, fields: Optional[Sequence[str]] = None) -> Callable[[str], List[Tuple[str, float]]]:
+        ds = FlatSearch(lambda c: self.gate.client(self.tenant, f"read-{c}"), self.tenant, embed=self._query_embed,
+                        fields=tuple(fields) if fields else self.a0_fields)
 
         def run(query: str) -> List[Tuple[str, float]]:
             hits = ds.search(self.principal, LATTICE, query, size=window, classes=[CLS])
