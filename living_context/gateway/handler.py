@@ -19,6 +19,7 @@ from typing import Any, Callable, Mapping, Optional
 from ..ids import IdError, KIND_LEAF, Pointer, decode_pointer, encode_pointer
 from ..policy import ClassLattice, Op, decide
 from .es import EsClient, EsError
+from ..recall.direct import DirectSearch
 from .indices import class_index
 from .sessions import Sessions
 
@@ -96,13 +97,9 @@ class Gateway:
             return REFUSED
         if not decide(p, Op.RECALL, tenant=tenant, lattice=lattice, cls=cls):
             return UNAVAILABLE  # no distinction between forbidden and missing
-        st, body = self._es.client(tenant, f"read-{cls}").request(
-            "POST", f"/{class_index(tenant, cls, 'leaf')}/_search",
-            {"size": 10, "_source": ["title", "size_tokens"],
-             "query": {"multi_match": {"query": text, "fields": ["text", "title", "entities"]}}})
-        if st != 200 or not isinstance(body, dict):
-            return UNAVAILABLE
-        hits = [h for h in (self._shape_hit(tenant, cls, x) for x in body.get("hits", {}).get("hits", [])) if h]
+        ds = DirectSearch(lambda c: self._es.client(tenant, f"read-{c}"), tenant)
+        hits = [h for h in (self._shape_hit(tenant, x.cls, {"_id": x.doc_id, "_source": {"title": x.title, "size_tokens": x.size}})
+                            for x in ds.search(p, lattice, text, classes=[cls])) if h]
         return {"ok": True, "hits": hits}
 
     def _lookup(self, tenant, p, lattice, req):

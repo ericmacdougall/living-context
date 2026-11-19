@@ -124,7 +124,9 @@ class IsolationOnElasticsearch(unittest.TestCase):
         self.assertEqual(len(r["hits"]), 1)
         self.assertIn(MARK["tena"], r["hits"][0]["title"])  # the title is code-built from the text
         # another tenant's marker is not found; a class outside the grant is typed unavailable
-        self.assertEqual(self.gw.handle(tk, {"op": "search", "cls": "base", "text": MARK["tenb"]})["hits"], [])
+        r = self.gw.handle(tk, {"op": "search", "cls": "base", "text": MARK["tenb"]})  # vector search returns the
+        self.assert_clean(r)                                                          # nearest OWN leaves, never foreign ones
+        self.assertEqual(len(r["hits"]), 1)
         self.assertEqual(self.gw.handle(tk, {"op": "search", "cls": "restricted", "text": "gardens"}), UNAVAILABLE)
         self.assertEqual(self.gw.handle(tk, {"op": "search", "cls": "nothere", "text": "gardens"}), UNAVAILABLE)
         # forged pointers (other tenant, restricted class, random) all resolve to the same answer

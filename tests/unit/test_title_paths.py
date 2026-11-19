@@ -14,12 +14,14 @@ def is_build_title_call(node) -> bool:
 
 
 def is_allowed_value(node) -> bool:
-    """build_title(...); a read of an existing title (`x.get("title", ...)`, output shaping); a field mapping
+    """build_title(...); a read of an existing title (`x.get("title", ...)`, `hit.title`: output shaping); a field mapping
     (`{"type": ...}`), which declares the field and writes no value."""
     if is_build_title_call(node):
         return True
     if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get"
             and node.args and isinstance(node.args[0], ast.Constant) and node.args[0].value == "title"):
+        return True
+    if isinstance(node, ast.Attribute) and node.attr == "title":  # reading a stored title off a hit
         return True
     return isinstance(node, ast.Dict) and any(isinstance(k, ast.Constant) and k.value == "type" for k in node.keys)
 
