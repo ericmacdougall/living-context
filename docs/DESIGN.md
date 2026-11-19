@@ -976,7 +976,8 @@ it performs.
 
 1. Read at most `MAX_LINE = 1 MiB` (ASSUMPTION) before parsing; count JSON
    structures before parsing and refuse past a limit; one semaphore around
-   parse and dispatch; idle deadline; bounded per-tenant queue and slots
+   parsing only (it is released before dispatch, so a slow Elasticsearch call
+   never holds a parse slot); idle deadline; bounded per-tenant queue and slots
    (LAB-R5).
 2. Resolve the session (realtime GET in `lc-<t>-authz`, the tenant taken from
    the token's prefix), check the authority epoch in the gateway's table (4.4), derive
@@ -2193,6 +2194,7 @@ credentials.
 | Model provider sees leaf text | Holder, build, judge and reader calls need content. Removing it needs a local model of adequate quality; out of scope for the first build |
 | Noisy-neighbour latency across tenants and classes on a shared cluster | Elasticsearch thread pools and nodes are shared; gateway quotas bound it, only a separate cluster removes it |
 | The 64 KiB kernel-held bound is measured on loopback only | Probe LC-PB measured TCP and unix sockets on loopback with a peer that does not read. Remote peers, TLS records and peer-side receive-buffer autotuning are not measured; the bound there is a target, not a result |
+| Unauthenticated connections share one pool | Before a session is resolved no tenant is known, so connections that have not presented a valid token share one pool (cap 64, idle deadline 2 s by default); a flood of them can fill the pool and delay new connections of every tenant until the deadline expires, but cannot reach any tenant data or a tenant's queue. Per-source limits need a network layer outside the gateway |
 | Tenant boundary: one names-only channel | Probe P2 failed as worded: `_mget` on another tenant's alias name returns the concrete index name to a tenant key. Tenant keys never leave the gateway, no Elasticsearch response is forwarded, and physical suffixes are random; whether that suffices or tenants move to separate clusters is the owner's decision (ASSUMPTION until then). The cluster boundary sits behind the provisioning interface so one cluster per tenant is a configuration choice |
 | Canonicalisation over-matches by design | The confusables skeleton can map two different people (`clark` and `dark`) to one token. Registration of an identifier whose token equals an existing identity's is refused (fail closed); two existing identities are never merged and an erasure of one token reaches only the identifiers declared under it. Held matches go to the review queue (7.3) |
 | Mentions under undeclared spellings or paraphrase in source leaves | Detection cannot find what it was not told about; lineage closure covers derived artefacts, not new leaves that mention the person in a new way |

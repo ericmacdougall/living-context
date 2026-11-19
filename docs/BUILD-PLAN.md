@@ -99,7 +99,7 @@ design already names.
 | Id | Probe | Expected | Fallback if not |
 |---|---|---|---|
 | P1 | Basic licence matrix: `rrf` and `linear` retrievers, DLS role (`query`), FLS role (`field_security`), `semantic_text` indexing, `bbq_disk` mapping; lexical percolate; kNN with `int8_hnsw` at 384 dims; aliases; force merge | licence errors for the first five; the rest work (LAB observed) | none needed for refusals; any surprise is recorded and the design re-checked |
-| P2 | API key with role descriptor on `lc-ta-*` only and no cluster privilege, security on: search, get, mget, msearch, count, kNN, percolate, terms lookup, `_cat/indices`, `_field_caps`, `_mapping`, wildcard and comma lists, alias names against `lc-tb-*` (including `lc-tb-authz`) and the look-alike `lc-tbx-*`; plus the cluster APIs `_cluster/state`, `_cat/shards`, `_cat/aliases`, `_tasks?detailed`, `_resolve/index`, `_search_shards`, `_nodes/stats`, `_cluster/stats`. Control: the same with a key holding `cluster: monitor` must leak through at least one cluster API (so the probe can fail) | all refused or empty, no names or query descriptions leaked | this is the hard boundary: if it fails, dedicated tenants move to separate clusters and the gap is reported before any other step |
+| P2 | API key with role descriptor on `lc-tena-*` only and no cluster privilege, security on: search, get, mget, msearch, count, kNN, percolate, terms lookup, `_cat/indices`, `_field_caps`, `_mapping`, wildcard and comma lists, alias names against `lc-tenb-*` (including `lc-tenb-authz`) and the look-alike `lc-tenbx-*`; plus the cluster APIs `_cluster/state`, `_cat/shards`, `_cat/aliases`, `_tasks?detailed`, `_resolve/index`, `_search_shards`, `_nodes/stats`, `_cluster/stats`. Control: the same with a key holding `cluster: monitor` must leak through at least one cluster API (so the probe can fail) | all refused or empty, no names or query descriptions leaked | this is the hard boundary: if it fails, dedicated tenants move to separate clusters and the gap is reported before any other step |
 | P3 | `ELASTIC_PASSWORD_FILE` honoured; the password appears in no container log | yes | operator runs the reset tool with output redirected to a 0600 file |
 | P4 | Percolate a stored `knn` query | fails or unsupported | already designed lexical-only; record |
 | P5 | Realtime GET by id returns a document version immediately after the index call returns, without refresh (used for sessions and heads; tombstones and epochs are in the gateway's own memory, DESIGN 4.4, 5.9); and an explicit `_refresh` that has returned makes every write acknowledged before it searchable (the searchable-publication barrier, DESIGN 5.6; review 2, F4) | yes | for heads: the gateway keeps heads in memory too, reloaded on start; for refresh: none, P and heads are not published, and the gap blocks Step 13 |
@@ -111,8 +111,8 @@ design already names.
 | P11 | Index with stale `if_seq_no` returns 409 and writes nothing | yes | lease document per head with the same probe on the lease |
 | P12 | `_msearch` with one failing sub-search: others succeed, per-item errors | yes | one request per sub-search |
 | P13 | `terms` on `src_id` with 10,000 ids; `index.max_terms_count` default 65,536 | works | batch the ids |
-| P14 | Revoke with `lc-ta-authz` blocked (`index.blocks.read_only_allow_delete`) and, separately, with the disk driven to the flood-stage watermark on a scratch volume | revoke takes effect at once from the gateway's table; the Elasticsearch persist is retried and reported | none: revocation must not depend on the write (DESIGN 4.4); a failure here blocks Step 15 |
-| P15 | A tenant key owner (native user with index privileges on `lc-ta-*` and `manage_own_api_key` only) creates, rotates and invalidates its own keys; created keys carry at most its privileges; the gateway's keys cannot create or invalidate keys | yes | the operator keeps the bootstrap credential reachable for rotation; the gap is reported as a limit |
+| P14 | Revoke with `lc-tena-authz` blocked (`index.blocks.read_only_allow_delete`) and, separately, with the disk driven to the flood-stage watermark on a scratch volume | revoke takes effect at once from the gateway's table; the Elasticsearch persist is retried and reported | none: revocation must not depend on the write (DESIGN 4.4); a failure here blocks Step 15 |
+| P15 | A tenant key owner (native user with index privileges on `lc-tena-*` and `manage_own_api_key` only) creates, rotates and invalidates its own keys; created keys carry at most its privileges; the gateway's keys cannot create or invalidate keys | yes | the operator keeps the bootstrap credential reachable for rotation; the gap is reported as a limit |
 | P16 | Search and indexing slow logs disabled (`-1`) are accepted on every index kind; with default logger levels, no request body or document field reaches the Elasticsearch or container logs; with a scratch index at slow-log threshold 0, a control marker does appear (positive control) | yes | raise logger thresholds further and repeat; report |
 
 Commit: `test(probes): platform probes and recorded results`. Failing-first:
@@ -198,7 +198,7 @@ Each step: what, failing-first test, done when.
   each broken control turns it red, never reported as a T5 pass; the full T5
   is S0-load, Step 22); T6 key-space collision;
   the validator refuses a document without `lin_subjects`; an authz document
-  of `ta` is unreachable with any `tb` key. Broken controls: `lc-*`
+  of `tena` is unreachable with any `tenb` key. Broken controls: `lc-*`
   descriptor; tenant from body; parse before admission; 32-bit lock key; key
   with `cluster: monitor`; no byte cap. Each must turn its probe red.
 
@@ -456,7 +456,7 @@ Each step: what, failing-first test, done when.
 - Failing-first: SEC-R1 to R7 and T7 with their broken controls, including: no
   send fence with the injected delay (must fail deterministically); a
   blocking socket write inside the fence with a slow-reading client; revoke that requires the
-  Elasticsearch write (with `lc-ta-authz` blocked, P14); revoke that waits for
+  Elasticsearch write (with `lc-tena-authz` blocked, P14); revoke that waits for
   the journal fsync (over the bound with the fsync delayed); a journal error
   that does not close the tenant; a start that accepts a journal without a
   shutdown record; compaction in place instead of into the spare; one
