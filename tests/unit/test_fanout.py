@@ -241,5 +241,75 @@ class Contract(unittest.TestCase):
         self.assertEqual(len(r.digest["sources"]["direct"]), 1)
 
 
+class AllRoute(StubBackend):
+    """Routes to every presented child (so the parent steps are fixed by the tree), and records organise inputs."""
+    def __init__(self):
+        super().__init__()
+        self.organise_inputs = []
+
+    def run(self, task, inputs):
+        name = getattr(task, "value", task)
+        if name == "route":
+            labs = [k["label"] for k in inputs["children"]]
+            return {"selected": labs, "reasons": {}, "confidence": {lab: 2 for lab in labs}}
+        if name == "organise":
+            self.organise_inputs.append(inputs)
+        return super().run(task, inputs)
+
+
+def hand_tree():
+    """root -> T; T -> A (leaves a1, a2), B (leaf b1). Parent steps: A has two non-empty children, B one, T two (A and B),
+    and the root one (T)."""
+    def leaf(i, t):
+        return {"child_id": f"{i:032x}", "child_version": 1, "is_leaf": True, "title": t, "gist": f"gist {t}", "facts": [],
+                "entities": [], "size_tokens": 10, "total_tokens": 10}
+
+    def node(nid, level, kids, title):
+        return build.Node(nid, 1, level, kids, f"summary {title}", [0.0], [], title, 10 * len(kids), [], [], [])
+
+    def ref(n):
+        return {"child_id": n.node_id, "child_version": 1, "is_leaf": False, "title": n.title, "gist": n.summary, "facts": [],
+                "entities": [], "size_tokens": 0, "total_tokens": n.total_tokens}
+
+    a = node("a" * 32, 1, [leaf(1, "alpha"), leaf(2, "beta")], "alpha beta")
+    b = node("b" * 32, 1, [leaf(3, "gamma")], "gamma")
+    t = node("c" * 32, 2, [ref(a), ref(b)], "all")
+    tr = build.Tree(nodes={f"{n.node_id}:1": n for n in (a, b, t)}, top=[f"{t.node_id}:1"], levels=2)
+    return tr
+
+
+class ParentStep(unittest.TestCase):
+    """DESIGN 8.3: one organise call per parent holder with two or more non-empty children; a single non-empty child passes
+    its result up unchanged."""
+    def run_one(self, **kw):
+        be = AllRoute()
+        with tempfile.TemporaryDirectory() as d:
+            port, _ = mk(d, be)
+            res = Recall(port, "tena", "base", "px", **kw).recall("anything", MemView(hand_tree()))
+        return res, be
+
+    def test_organise_runs_once_per_parent_with_two_non_empty_children(self):
+        res, be = self.run_one()
+        self.assertEqual(res.counters.organise_calls, 2)
+        self.assertEqual(sorted(len(i["pointers"]) for i in be.organise_inputs), [2, 3])
+
+    def test_broken_organise_at_every_parent_is_red(self):
+        res, _ = self.run_one(broken_organise_every_parent=True)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(res.counters.organise_calls, 2)
+        self.assertEqual(res.counters.organise_calls, 4)
+
+    def test_broken_one_global_organise_is_red(self):
+        res, _ = self.run_one(broken_one_global_organise=True)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(res.counters.organise_calls, 2)
+
+    def test_the_digest_outline_comes_from_the_top_parent_step(self):
+        res, be = self.run_one()
+        self.assertTrue(res.digest["outline"])
+        in_outline = {x for o in res.digest["outline"] for x in o["pointers"]}
+        self.assertEqual(in_outline, {p["pointer"] for p in res.digest["pointers"]})
+
+
 if __name__ == "__main__":
     unittest.main()

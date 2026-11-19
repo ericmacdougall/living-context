@@ -84,13 +84,18 @@ def input_texts(shown: Sequence[Mapping]) -> list[str]:
     return [t for e in shown for t in [e.get("gist", "")] + list(e.get("facts", []))]
 
 
+ROOT = ""   # the virtual parent of the top-level holders (the originating agent's own parent step)
+
+
 class Recall:
     def __init__(self, port: ModelPort, tenant: str, cls: str, principal: str, *, consts: Optional[Constants] = None,
-                 workers: int = 8, salt: str = "lc", check_reasons: bool = True, reasons_pass_through: bool = False):
+                 workers: int = 8, salt: str = "lc", check_reasons: bool = True, reasons_pass_through: bool = False,
+                 broken_organise_every_parent: bool = False, broken_one_global_organise: bool = False):
         self._port, self.tenant, self.cls, self.principal = port, tenant, cls, principal
         self._c = consts or Constants()
         self._workers, self._salt = workers, salt
         self._check = check_reasons
+        self._every_parent, self._one_global = broken_organise_every_parent, broken_one_global_organise  # BROKEN variants for tests
 
     # ---- one holder -----------------------------------------------------------------------------------------
     def _ctx(self, ref: str) -> CallContext:
@@ -204,6 +209,7 @@ class Recall:
             if k.leaf_id not in seen:
                 seen.add(k.leaf_id)
                 tree_list.append(k)
+        results[ROOT] = [("node", t) for t in tops]
         digest = self._digest(prompt, view, tree_list, unopened, direct, linked, cnt, results)
         return Result(digest, cnt, tree_list, log)
 
@@ -211,6 +217,56 @@ class Recall:
     def _pointer(self, view, k: Cand) -> dict:
         return dg.make_pointer(encode_pointer(Pointer(KIND_LEAF, view.gen, k.leaf_id, k.lv)), k.title, k.size,
                                ">".join(k.path), k.reason, k.confidence)
+
+    def _organise(self, view, cands: list, cnt, by_ptr: Mapping) -> list:
+        c = self._c
+        ptr = {k.leaf_id: self._pointer(view, k)["pointer"] for k in cands}
+        ctx = CallContext(self.tenant, self.cls, self.principal, (self.cls,),
+                          lin_nodes=tuple(sorted({n for k in cands for n in k.path})))
+        res = self._port.call(Task.ORGANISE, {"pointers": [{"pointer": ptr[k.leaf_id], "path": ">".join(k.path), "score": k.confidence}
+                                                            for k in cands]}, ctx=ctx)
+        cnt.organise_calls += 1
+        out = []
+        if res.ok:
+            for o in res.output["outline"]:
+                label = o["label"]
+                if not dg.reason_ok(label, [], c.reason_max_words, c.reason_ngram):  # DESIGN 8.3: failing label -> holder path
+                    cnt.label_failures += 1
+                    label = "branch"
+                out.append({"label": label, "pointers": [x for x in o["pointers"] if x in by_ptr]})
+        return out
+
+    def _parent_steps(self, view, results: Mapping, cnt, by_ptr: Mapping, tree_list: list) -> list:
+        """DESIGN 8.3, per parent holder: when all named children have answered, merge their pointers (dedupe by leaf id,
+        best path); if two or more children returned non-empty results, ONE organise call groups them; a holder with a single
+        non-empty child passes its result up unchanged. Returns the outline of the top parent step."""
+        c = self._c
+
+        def step(ref: str):
+            parts = []
+            for kind, x in results.get(ref, []):
+                if kind == "leaf":
+                    parts.append(([x], None))
+                else:
+                    sub = step(x)
+                    if sub[0]:
+                        parts.append(sub)
+            merged: dict[str, Cand] = {}
+            for cands, _ in parts:
+                for k in cands:
+                    cur = merged.get(k.leaf_id)
+                    if cur is None or (-k.confidence, k.depth, k.path) < (-cur.confidence, cur.depth, cur.path):
+                        merged[k.leaf_id] = k
+            cands = sorted(merged.values(), key=lambda k: (-k.confidence, k.depth, k.path, k.leaf_id))
+            if not cands:
+                return [], []
+            if (len(parts) >= 2 or self._every_parent) and cnt.organise_calls < c.b_organise:
+                return cands, self._organise(view, cands, cnt, by_ptr)
+            return cands, (parts[0][1] or []) if len(parts) == 1 else []
+
+        if self._one_global:   # BROKEN variant: one organise call over everything, not one per parent
+            return self._organise(view, tree_list, cnt, by_ptr) if len({k.path for k in tree_list}) >= 2 else []
+        return step(ROOT)[1]
 
     def _digest(self, prompt, view, tree_list, unopened, direct, linked, cnt, results) -> dict:
         c = self._c
@@ -222,23 +278,11 @@ class Recall:
         fused = rrf_salted([[key(p) for p in tree_ptrs], [key(p) for p in d_ptrs], [key(p) for p in l_ptrs]], self._salt)
         allp = {key(p): p for p in tree_ptrs + d_ptrs + l_ptrs}
         pointers = [allp[i] for i, _ in fused]
-        outline = []
         groups: dict[str, list] = {}
         for p in tree_ptrs:
             groups.setdefault(p["path"], []).append(p)
-        if len(groups) >= 2 and cnt.organise_calls < c.b_organise:
-            ctx = CallContext(self.tenant, self.cls, self.principal, (self.cls,), lin_nodes=tuple(sorted({n for g in groups for n in g.split(">")})))
-            res = self._port.call(Task.ORGANISE, {"pointers": [{"pointer": p["pointer"], "path": p["path"], "score": p["confidence"]}
-                                                                for p in tree_ptrs]}, ctx=ctx)
-            cnt.organise_calls += 1
-            if res.ok:
-                for o in res.output["outline"]:
-                    label = o["label"]
-                    if not dg.reason_ok(label, [], c.reason_max_words, c.reason_ngram):
-                        cnt.label_failures += 1
-                        label = "branch"
-                    outline.append({"label": label, "pointers": [x for x in o["pointers"] if x in by_ptr]})
-        elif groups:
+        outline = self._parent_steps(view, results, cnt, by_ptr, tree_list)
+        if not outline and groups:
             outline = [{"label": path, "pointers": [p["pointer"] for p in ps]} for path, ps in sorted(groups.items())]
         node_ptrs = []
         for ref, path in unopened:
