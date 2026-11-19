@@ -1,0 +1,100 @@
+{
+    "kernel": "6.8.0-147-generic",
+    "largest_request_with_effective_le_64KiB": {
+        "inet": 32768,
+        "unix": 32768
+    },
+    "naive_request_64KiB_violates_bound": true,
+    "probe": "LC-PB",
+    "rows": [
+        {
+            "bytes_accepted_until_eagain": 91968,
+            "effective": 8192,
+            "effective_within_64KiB": true,
+            "family": "inet",
+            "gateway_capped_peak_queue": 55104,
+            "gateway_capped_peak_within_64KiB": true,
+            "queue_exceeds_64KiB_without_cap": false,
+            "requested": 4096,
+            "unsent_in_sender_queue": 55104
+        },
+        {
+            "bytes_accepted_until_eagain": 142976,
+            "effective": 65536,
+            "effective_within_64KiB": true,
+            "family": "inet",
+            "gateway_capped_peak_queue": 65536,
+            "gateway_capped_peak_within_64KiB": true,
+            "queue_exceeds_64KiB_without_cap": true,
+            "requested": 32768,
+            "unsent_in_sender_queue": 106112
+        },
+        {
+            "bytes_accepted_until_eagain": 193984,
+            "effective": 131072,
+            "effective_within_64KiB": false,
+            "family": "inet",
+            "gateway_capped_peak_queue": 65536,
+            "gateway_capped_peak_within_64KiB": true,
+            "queue_exceeds_64KiB_without_cap": true,
+            "requested": 65536,
+            "unsent_in_sender_queue": 157120
+        },
+        {
+            "bytes_accepted_until_eagain": 296000,
+            "effective": 262144,
+            "effective_within_64KiB": false,
+            "family": "inet",
+            "gateway_capped_peak_queue": 65536,
+            "gateway_capped_peak_within_64KiB": true,
+            "queue_exceeds_64KiB_without_cap": true,
+            "requested": 131072,
+            "unsent_in_sender_queue": 259136
+        },
+        {
+            "bytes_accepted_until_eagain": 8128,
+            "effective": 8192,
+            "effective_within_64KiB": true,
+            "family": "unix",
+            "gateway_capped_peak_queue": 10496,
+            "gateway_capped_peak_within_64KiB": true,
+            "queue_exceeds_64KiB_without_cap": false,
+            "requested": 4096,
+            "unsent_in_sender_queue": 10496
+        },
+        {
+            "bytes_accepted_until_eagain": 57344,
+            "effective": 65536,
+            "effective_within_64KiB": true,
+            "family": "unix",
+            "gateway_capped_peak_queue": 63232,
+            "gateway_capped_peak_within_64KiB": true,
+            "queue_exceeds_64KiB_without_cap": true,
+            "requested": 32768,
+            "unsent_in_sender_queue": 68096
+        },
+        {
+            "bytes_accepted_until_eagain": 110592,
+            "effective": 131072,
+            "effective_within_64KiB": false,
+            "family": "unix",
+            "gateway_capped_peak_queue": 63232,
+            "gateway_capped_peak_within_64KiB": true,
+            "queue_exceeds_64KiB_without_cap": true,
+            "requested": 65536,
+            "unsent_in_sender_queue": 131328
+        },
+        {
+            "bytes_accepted_until_eagain": 221184,
+            "effective": 262144,
+            "effective_within_64KiB": false,
+            "family": "unix",
+            "gateway_capped_peak_queue": 63232,
+            "gateway_capped_peak_within_64KiB": true,
+            "queue_exceeds_64KiB_without_cap": true,
+            "requested": 131072,
+            "unsent_in_sender_queue": 262656
+        }
+    ],
+    "verdict": "PASS_WITH_HALVED_REQUEST"
+}

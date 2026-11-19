@@ -1,0 +1,30 @@
+{
+    "acked_but_not_searchable_after_refresh": 9043526,
+    "acked_total": 151035,
+    "anomalies": [
+        [
+            "lcpc-07bc9116-a",
+            0,
+            1
+        ],
+        [
+            "lcpc-07bc9116-a",
+            1,
+            27
+        ],
+        [
+            "lcpc-07bc9116-b",
+            1,
+            7
+        ]
+    ],
+    "broken_variant": true,
+    "control_not_searchable_before_refresh": true,
+    "note": "each round verifies the ids acknowledged since the previous round",
+    "probe": "LC-PC",
+    "realtime_get_without_refresh": true,
+    "retirement_updates_not_visible_after_refresh": 200,
+    "rounds": 200,
+    "searchable_after_refresh": true,
+    "verdict": "FAIL"
+}

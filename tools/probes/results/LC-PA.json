@@ -1,0 +1,31 @@
+{
+    "kernel": "6.8.0-147-generic",
+    "machine": "x86_64",
+    "paths": {
+        "libc.renameat2": {
+            "bogus_flag_refused": true,
+            "concurrent_exchanges": 20000,
+            "concurrent_reads": 61906,
+            "exchange_errno": 0,
+            "exchange_rc": 0,
+            "ok": true,
+            "reader_anomalies": [],
+            "sizes_unchanged": true,
+            "swapped": true
+        },
+        "syscall": {
+            "bogus_flag_refused": true,
+            "concurrent_exchanges": 20000,
+            "concurrent_reads": 75388,
+            "exchange_errno": 0,
+            "exchange_rc": 0,
+            "ok": true,
+            "reader_anomalies": [],
+            "sizes_unchanged": true,
+            "swapped": true
+        }
+    },
+    "probe": "LC-PA",
+    "python": "3.12.3",
+    "verdict": "PASS"
+}

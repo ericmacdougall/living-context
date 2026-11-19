@@ -1,0 +1,14 @@
+{
+    "acked_but_not_searchable_after_refresh": 0,
+    "acked_total": 78082,
+    "anomalies": [],
+    "broken_variant": false,
+    "control_not_searchable_before_refresh": true,
+    "note": "each round verifies the ids acknowledged since the previous round",
+    "probe": "LC-PC",
+    "realtime_get_without_refresh": true,
+    "retirement_updates_not_visible_after_refresh": 0,
+    "rounds": 200,
+    "searchable_after_refresh": true,
+    "verdict": "PASS"
+}
