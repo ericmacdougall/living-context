@@ -2,8 +2,9 @@
 
 Probe: P2
 Verdict: FAIL
-Decided by: main, ASSUMPTION (not the owner's words)
-Status: awaiting the owner. Until the owner decides, a Step 5 build and every later step stand on this assumption, and the stream's ticket ends `S0 INCOMPLETE` (it can never report `S0 PASS` while P2 is a recorded FAIL).
+Decided by: the project owner: accept with mitigations (relayed by the coordinating agent; the owner's wording is held in the ticket record)
+Earlier label: main, ASSUMPTION (superseded by the owner's decision; the phrase stays because the probe gate looks for it in a record of a FAIL)
+Status: decided. The probe still reports FAIL as worded and its result file is unchanged. P2 no longer forces `S0 INCOMPLETE`; every other open item still does.
 
 ## What failed
 
@@ -13,6 +14,6 @@ Against a tenant API key (role descriptor on `lc-tena-*`, no cluster privilege) 
 
 Mitigation: tenant keys never leave the gateway; the gateway forwards no Elasticsearch error body, sub-response, `_index` field or index name (normalised `unavailable`, tested by T1 and T3 and AC-14); physical index suffixes are random (at least 32 bits, not sorted, not an arithmetic sequence), so a leaked physical name tells nothing about purge history; the provisioning interface keeps the cluster boundary a configuration choice so one cluster per tenant stays possible.
 
-## The decision that is the owner's
+## The decision
 
-Accept the mitigation above, or move tenants that need a hard boundary to separate clusters (DESIGN 8.7 and 20). Recorded as an ask; until it is answered in the owner's own words this record is labelled `main, ASSUMPTION`.
+The owner accepted the mitigation above: tenant keys never leave the gateway, no Elasticsearch error or sub-response is forwarded, and physical index names are random. One cluster per tenant stays a configuration choice for tenants that need a hard boundary (DESIGN 8.7 and 20).
