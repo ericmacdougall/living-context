@@ -1,9 +1,10 @@
 # living-context: experiment plan (pre-registration)
 
-Status: written before any run, revised twice after adversarial reviews
-(first review: findings F1 to F21 and M1 to M5, cited as "review F<n>";
-second review: findings F1 to F14, cited as "review 2, F<n>"; section 13 maps
-each to its fix). This file
+Status: written before any run, revised three times after adversarial
+reviews (first review: findings F1 to F21 and M1 to M5, cited as "review
+F<n>"; second review: findings F1 to F14, cited as "review 2, F<n>"; third
+review: open findings F2, F7, F9, F11 and F15, cited as "review 3, F<n>";
+section 13 maps each to its fix). This file
 is committed alone, before the first stage that it governs. Any later change
 is an amendment committed alone before the run it affects, with the reason;
 results never move a threshold. The amendments this plan already requires
@@ -80,8 +81,10 @@ read underpowered nulls as failures (review F12).
 - H4 HOLDS only if all three hold, each with lo > 0:
   - Existence: LOOP minus FROZEN repair over all plants (paired; Tango score
     interval).
-  - Cause: LOOP minus NO-AUDIT repair over plants in strata 2 and 3 after the
-    offer audit (section 3.6; paired; Tango).
+  - Cause: LOOP minus NO-AUDIT repair over plants in strata 2 and 3 as fixed
+    by the prefix selection before any arm runs (section 3.6; the same plants
+    in both arms; the offer audit is descriptive and changes no stratum;
+    review 3, F2; paired; Tango).
   - Search-driven: LOOP repair of plants in strata 2 and 3 minus LOOP repair of
     decoys (unpaired; Newcombe hybrid score interval).
   The outcome word is the worst of the three.
@@ -300,41 +303,38 @@ list):
   pool was offered). Stream construction replays A0 over each prefix; A0
   depends only on leaf text and embeddings, so the rank is the same in every
   arm. Stratum 1: best rank 1 to 10; stratum 2: 11 to 50; stratum 3: above
-  50. The strata are a selection device only: they do not guarantee that no
-  source offered the plant (the digest's direct section is the top 10 not
-  already offered by the tree, DESIGN 8.5, which can reach below direct rank
-  10, and the fused list cuts each list at 50, 5.1). Whether a plant was
-  actually offered is decided by the offer audit below. Plants are chosen
-  with quotas S7b 12 / 24 / 24 and S4b 8 / 16 / 16 (if a stratum cannot fill,
-  the shortfall is reported and filled from the next stratum up).
-  Pre-registered predictions: in stratum 1 the direct-search pool (b) of
-  reflection may repair; in strata 2 and 3, after the offer audit, only the
-  deeper pool (c) and the reverse audit can; stratum 3 is where the reverse
-  audit's rank-independent percolation and query-vector kNN should matter
-  most. Stratum 1 is reported
-  but excluded from the cause and search-driven comparisons.
-- Offer audit (review 2, F2), from the protocol logs (DESIGN 9) after the
-  end checkpoint: a plant is exposed if, for any logged search before its
-  repair (a reader's `explore` call is a recall and is logged as one), in
-  any agent-routed E2b arm, it was offered by the tree, offered in the
-  digest's direct section (DESIGN 8.5, reflection's pool (b)), offered in an
-  exploration slot, or opened or asked by the reader: everything NO-AUDIT's
-  pools (a) and (b) and the opened signal can learn from. An exposed plant is
-  reclassified to stratum 1 and excluded from the cause and
-  search-driven comparisons in every arm. "Before its repair" means before the
-  first adopted generation that changed the plant's membership, title or gist
-  in that arm, or before the end checkpoint if none did. The scheduled-search
-  ranks above cannot see offers to filler searches, reader explores or
-  exploration slots; this audit does. Counts moved, per stratum and per
-  source, are reported, with the count of offer-row writes that failed
-  (DESIGN 9 counts them; the audit cannot see what they offered). Offers no
-  NO-AUDIT learner can use (a direct rank below the direct section that only
-  feeds the fused ranking of 5.1, a linked offer never opened) are counted
-  and reported but do not reclassify: counting them would empty stratum 2 by
-  construction, since a stratum-2 plant ranks 11 to 50 in direct search at
-  its own source question. Decoys are not reclassified (dropping offered decoys
-  would lower decoy repair and favour the search-driven condition); their
-  offers are counted and reported.
+  50. The strata are fixed by this selection, before any arm runs, and do not
+  depend on any arm's outcome (review 3, F2); they are the confirmatory
+  population of the cause and search-driven comparisons in every arm, and no
+  later observation moves a plant between strata or removes it. They do not
+  guarantee that no source offered the plant (the digest's direct section is
+  the top 10 not already offered by the tree, DESIGN 8.5, which can reach
+  below direct rank 10, and the fused list cuts each list at 50, 5.1); the
+  offer audit below reports what was actually offered, as description only.
+  Plants are chosen with quotas S7b 12 / 24 / 24 and S4b 8 / 16 / 16 (if a
+  stratum cannot fill, the shortfall is reported and filled from the next
+  stratum up). Pre-registered predictions: in stratum 1 the direct-search
+  pool (b) of reflection may repair; in strata 2 and 3 mostly only the
+  deeper pool (c) and the reverse audit can, so the cause comparison (LOOP
+  minus NO-AUDIT on strata 2 and 3) measures what pool (c) and the audit add
+  over everything NO-AUDIT keeps, including any exposure it had; stratum 3 is
+  where the reverse audit's rank-independent percolation and query-vector kNN
+  should matter most. Stratum 1 is reported but excluded from the cause and
+  search-driven comparisons.
+- Offer audit (review 2, F2; descriptive only since review 3, F2), from the
+  protocol logs (DESIGN 9) after the end checkpoint: per arm, stratum and
+  source, the plants that any logged search before the end checkpoint (a
+  reader's `explore` call is a recall and is logged as one) offered through
+  the tree, the digest's direct section (DESIGN 8.5, reflection's pool (b)),
+  an exploration slot, or a reader's open or `ask`, with the count of
+  offer-row writes that failed (DESIGN 9 counts them; the audit cannot see
+  what they offered). Offers that only feed the fused ranking of 5.1 (a
+  direct rank below the direct section, a linked offer never opened) are
+  counted apart. Decoys' offers are counted the same way. The audit is
+  mechanism evidence: it explains how repairs happened in each arm and never
+  moves a plant between strata, removes it from the confirmatory population,
+  or enters any H4 decision (it would otherwise condition the comparison on
+  exposure, which the compared mechanisms themselves change).
 - Eligibility (review 2, F3), reported separately from repair: per arm and
   stratum, the share of plants with at least `S_MIN = 2` distinct logged
   searches judged relevant by the run's judge and missed by the tree before
@@ -349,10 +349,13 @@ Planting (review F3a, F3b):
 
 - When a target block is inserted, the leaves of its chosen gold session are
   placed under the least-similar level-1 node instead of the placement rule's
-  choice (the "host"). Each planted leaf gets plausible wrong metadata: the
-  title and gist of a real child of the host node (the "donor sibling",
-  seeded), not a marker such as "misc notes". Text is unchanged, so the direct
-  search can still find it (the safety net is part of the system).
+  choice (the "host"). Each planted leaf's child entry gets plausible wrong
+  metadata: the code-built title and the gist of a real child of the host
+  node (the "donor sibling", seeded) in place of its own, not a marker such
+  as "misc notes". This changes only what holders see; a pointer to the
+  plant still carries its own stored title (DESIGN INV-7). Text is unchanged,
+  so the direct search can still find it (the safety net is part of the
+  system).
 - Pinning: in every arm equally, normal batch rebuilds (DESIGN 7.6) neither
   regenerate the planted entry's title and gist nor move its membership; a
   split or merge carries it with its donor sibling. Only feedback-driven
@@ -373,7 +376,9 @@ Measurement (review F3e):
 - Repair = at least one leaf of the planted session is offered by the TREE
   source within the first 10 distinct sessions for probe 2 (exploration slots
   removed). Reported per arm and stratum with Wilson intervals and as paired
-  differences.
+  differences. This held-back tree retrieval is the only definition of
+  repair in this plan (review 3, F2): no metadata or membership change counts
+  as a repair, and nothing else ends an observation window.
 
 ### 3.7 Leakage rules
 
@@ -423,12 +428,20 @@ reader.
   and H4 read NOT ESTABLISHED (signal void). This catches both a reader that
   opens nothing and a reader that opens everything (which would bring back the
   exposure-biased co-offer signal, DESIGN 11.1).
+- Interpretation (review 3, F11): `opened` records lookups, not use. Titles
+  and reasons are descriptors derived from content and can convey an answer
+  (DESIGN INV-7, 20), so a reader can use a pointer without opening it; "not
+  opened" never means "not used" and is never counted as evidence of
+  irrelevance by itself, in any measure or learner signal. The opened-share
+  bounds above test that the actor looks things up, not what it used.
 - Reported per arm (review 2, F14: these are recall-level quantities, not
   independent binary trials): opens per recall, mean opened share per recall
   and `ask` share of opens, each with a percentile bootstrap interval over
   recalls (10,000 resamples, seed 16096); the share of `used_behavioural` rows
   in the behavioural-use sample, a binary outcome per sampled row, with a
-  Wilson interval.
+  Wilson interval; the sample is drawn from every offered row of the sampled
+  recalls, opened or not (DESIGN 9), so use through a descriptor alone can
+  be seen.
 
 ## 4. Arms (each adds one thing)
 
@@ -456,9 +469,11 @@ embedding-valley segmentation. They are not needed for H1 and run after
 S6-H1 (BUILD-PLAN 3A), each under its own approval and call cap; they are not
 counted in 10.3 and cannot change anything already frozen (3.7).
 
-### 4.1 Lookups forced
+### 4.1 Pointers only, lookups logged
 
-Every arm returns pointers only. Recall metrics are computed from the offered
+Every arm returns pointers only, with their descriptors (title, size, path,
+reason, confidence); no arm forces a lookup to reach content, because a
+descriptor can convey an answer (DESIGN INV-7, 20). Recall metrics are computed from the offered
 pointer list (exploration slots removed). Answer-level runs (secondary) and
 the stream reader (section 3.8) give the reader only the digest and the
 `lookup`, `ask`, `explore` tools, and `opened` is taken from the gateway's log,
@@ -511,8 +526,12 @@ supporting evidence and never compared with agent-routed results.
   of sessions and total characters to the arm's list (LAB: session length
   predicts gold, AUROC 0.687; length matching cut earlier gains by about a
   quarter). A0+LEN is the deciding length control for H1.
-- Holder reasons, titles and outline labels: share rejected by the 5-gram
-  leak check (DESIGN 8.2, 8.3), per task and arm.
+- Holder reasons and outline labels: share rejected by the 5-gram check
+  (DESIGN 8.2, 8.3), per task and arm; titles are code-built (DESIGN INV-7)
+  and need no check. Opens, opened share and `ask` share are reported as
+  lookup behaviour, never as relevance or use: a descriptor can convey an
+  answer, so "not opened" is never evidence of irrelevance by itself (3.8;
+  review 3, F11).
 - Cost: model calls per recall by task kind, input and output tokens, wall
   latency p50 and p90, Elasticsearch requests, holder calls that hit the
   budget, fallbacks, hallucinated ids, failures, product cache hits.
@@ -522,7 +541,9 @@ supporting evidence and never compared with agent-routed results.
 ## 6. Controls that must fail for their stated reason
 
 Each control has a pre-registered expected failure and a check that it failed
-for that reason (not a crash). A control that does not fail voids its arm. All
+for that reason (not a crash). A control that does not fail voids its arm;
+NO-AUDIT, the comparator of the cause test, has a switch check instead
+(review 3, F2). All
 deciding controls run agent-routed; the proxy world only supports.
 
 | Control | For | Broken change | Must show (decision rule) | Check that it is the stated reason |
@@ -531,7 +552,7 @@ deciding controls run agent-routed; the proxy world only supports.
 | RANDOM-EDGES | A2 | edges rewired to random leaves of the same class, degree kept | A2's gain over A1 on all-gold@10 disappears: upper bound of (A2-RANDOM minus A1) below the A2 minus A1 point estimate, and point at most +0.01 | expanded leaves are non-gold at the base rate |
 | RANDOM-FEEDBACK | LOOP (E2a and E2b, agent-routed) | opened, used and judge signals replaced by random draws at LOOP's measured rates; no reader | E2a: RANDOM-FEEDBACK minus FROZEN on the "history helps" measure (tree-only recall@10) has hi < m; E2b: its repair in strata 2 and 3 at most 0.10. Valid only if the gate positive controls that cover that stage held (7.3) | gate decisions and adopted operations logged; repairs, if any, traced to random signals |
 | SHUFFLED-LOG | LOOP (proxy only, supporting) | log rows reassigned to random searches | as RANDOM-FEEDBACK, reported | same |
-| NO-AUDIT | H4 cause (E2b, agent-routed) | reflection's deep pool (c) and the reverse audit removed; pools (a), (b) and opened kept | its own expected failure, separate from the H4 decision: repair in strata 2 and 3 (after the offer audit of 3.6) at most 0.10, checked in NO-AUDIT's own logs | every NO-AUDIT repair traces to a pool (a) or (b) note or an opened signal; a repair in strata 2 or 3 traced to an exposure of 3.6 (tree or direct-section offer, exploration slot, open) before repair means the offer audit missed it and voids the cause test |
+| NO-AUDIT | H4 cause (E2b, agent-routed) | reflection's deep pool (c) and the reverse audit removed; pools (a), (b) and opened kept | the switch holds, checked in NO-AUDIT's own logs: no NO-AUDIT note, candidate or adopted operation comes from pool (c) or the reverse audit; a trace to either voids the arm. Its repair in strata 2 and 3 (prediction: at most 0.10) is reported with the offer audit's exposure counts and is not a void condition (review 3, F2: on the fixed strata NO-AUDIT may legitimately repair a plant it saw through pool (b) or an open, and that success belongs in the cause comparison) | every NO-AUDIT repair traces to a pool (a) or (b) note, an opened signal, or no adopted operation at all (a probe-2 retrieval like FROZEN's, through normal rebuilds; counted apart and compared with FROZEN's rate) |
 | FROZEN-CEILING | E2b plants | none (FROZEN as run) | FROZEN repair over all plants at most 0.10 | any FROZEN repair traced to normal rebuilds; plant survival logged |
 | DECOY | H4 search-driven | decoy plants (no relevant constructed search) | the search-driven condition of 2.2 | decoy repairs traced to their signals |
 | RECENCY-ONLY | E2a and E2b replay | offer the 10 most recently inserted leaves' sessions | upper 95% bound of (RECENCY-ONLY minus RANDOM-10) recall@10 at most 0.03. `L` is per stream: a failure on a stream's development stage (S4b for E2b, S4a for E2a) may raise that stream's `L` by an amendment in its freeze commit (3.7), before its confirmatory stage (S7b, S7a); after that stage has started its `L` never moves, and a confirmatory replay that fails is reported VOID and is not rerun (the run driver refuses both, 3.7) | the 10 most recent contents logged per question |
@@ -565,9 +586,9 @@ deciding controls run agent-routed; the proxy world only supports.
 - Sample sizes: H1 n = 293 primary (299 sensitivity; 312 with abstention,
   reported apart); H2 n = up to 175; H3 the exposed recurring queries
   (expected 60 to 150 of about 210) and 312 real questions; H4 48 plants in
-  strata 2 and 3 as selected, before the offer audit of 3.6 (the counts after
-  the audit are reported, and S4b's measured reclassification rate enters the
-  H4 power amendment), 60 in all, 20 decoys.
+  strata 2 and 3, fixed by the prefix selection before any arm runs (the
+  offer audit of 3.6 is descriptive and changes no count; review 3, F2), 60
+  in all, 20 decoys.
 - Provisional power (review F12): per-question differences of recall@10 lie
   close to {-1, 0, 1}, so their standard deviation is about the square root of
   the discordance rate d. With d = 0.2, sd is about 0.45, the 95% half-width
@@ -584,8 +605,19 @@ deciding controls run agent-routed; the proxy world only supports.
 - The low-overlap stratum (about 80 questions expected) resolves only about
   0.13 at d = 0.2 and is reported, not decided.
 
-### 7.3 The replay gate inside the loop (DESIGN 13.3; review F4, F12d; review 2, F12)
+### 7.3 The replay gate inside the loop (DESIGN 13.3; review F4, F12d; review 2, F12; review 3)
 
+- What the gate is (review 3): an inspectable heuristic that decides which
+  candidates the loop adopts, not a 5% false-adoption guarantee. Its p-value
+  is exact only under the symmetry and independence assumptions below, and
+  neither the p-value nor RANDOM-FEEDBACK (section 6) is ever cited as proof
+  of a bounded false-adoption rate. Sign scoring counts how often clusters
+  improve, not by how much: frequent tiny gains can outweigh rare large
+  losses in the gate while mean recall falls. So the outcomes of H3 and H4
+  rest only on their independent measures (2.2: forward recall on the
+  stream for H3, held-back probe-2 repair for H4), never on the gate's
+  statistics; the gate is part of the fixed learning algorithm those
+  measures evaluate.
 - One method, fixed horizon, evaluated once per candidate (no repeated
   looks). It replaces the betting confidence sequence of the previous
   revision, which took each search as an independent observation: sixty
@@ -621,7 +653,9 @@ deciding controls run agent-routed; the proxy world only supports.
   per cell; model of per-query signs: +1 with probability p+, -1 with p-,
   else 0, either shared by every query of a cluster (fully correlated) or
   drawn per query (independent)). Printed results:
-  - Null coverage (p+ = p-; adoption must be at most 0.05): largest observed
+  - Null coverage under these symmetric sign models only (p+ = p-; target at
+    most 0.05, met in every printed cell; not a guarantee for other
+    distributions, see the asymmetric null below): largest observed
     adoption 0.0413 (10 held-out singletons plus 10 leaf clusters of 5,
     independent within cluster, p+ = p- = 0.20); 60 single-query clusters
     0.0140 / 0.0300 / 0.0370 at p+ = p- = 0.05 / 0.20 / 0.30; 10 clusters of 6
@@ -641,9 +675,13 @@ deciding controls run agent-routed; the proxy world only supports.
     valid for every mean-zero distribution of cluster means in [-1, 1] (a
     Hoeffding bound) would need a mean T of at least 0.87 at K = 8, 0.55 at
     K = 20 and 0.32 at K = 60 (printed by the script) and would almost never
-    adopt at the K a candidate reaches, so it is not used; the general replay guard, the count of adoptions per arm and RANDOM-FEEDBACK
-    (section 6) are what bound its effect, and S4a and S4b report the
-    distribution of cluster means of rejected and adopted candidates.
+    adopt at the K a candidate reaches, so it is not used. Nothing bounds
+    the false-adoption rate: the general replay guard limits visible losses
+    on recent searches, the count of adoptions per arm is reported,
+    RANDOM-FEEDBACK (section 6) shows what adoptions driven by random
+    signals do to recall, and S4a and S4b report the distribution of cluster
+    means of rejected and adopted candidates; the effect of any false
+    adoption on recall is seen only in the independent measures of H3 and H4.
   - Power (p- = 0.05; p+ = 0.20 / 0.30 / 0.40 / 0.60): 60 single-query
     clusters 0.70 / 0.96 / 1.00 / 1.00; 20 clusters of 3, fully correlated
     0.19 / 0.45 / 0.70 / 0.96, independent 0.68 / 0.94 / 1.00 / 1.00; 10
@@ -667,11 +705,11 @@ deciding controls run agent-routed; the proxy world only supports.
     30). At a per-candidate null adoption of 0.02 the chance of at least one
     false adoption is 0.30 over 18 null candidates and 0.45 over 30 (printed
     by the script); under the rare-large-losses pattern above it is far
-    higher. The number of adoptions per arm is reported, and
-    RANDOM-FEEDBACK (section 6) is the control for what false adoptions do to
-    recall.
+    higher. The number of adoptions per arm is reported; RANDOM-FEEDBACK
+    (section 6) shows what adoptions driven by random signals do to recall
+    and is not a bound on the false-adoption rate.
   - Cost of one exact evaluation at K = 60: under 0.1 s (the script prints
-    the slowest of 200; runs gave 0.007 to 0.071 s, depending on the
+    the slowest of 200; runs gave 0.006 to 0.071 s, depending on the
     machine and its load). With
     raw fractional recall differences instead of signs, a trial evaluation at
     K = 60 took up to about 100 s, which is why the sign is the registered
@@ -791,22 +829,23 @@ queries on both.
 | A5 notes and cache | no reflection note or cache entry readable by the base reader derives from restricted leaves or restricted-channel queries; no prompt-bearing cache entry is shared across principals | cache key without class; cache class equal to the node's class instead of the join with the prompt's class; route cache shared across principals; log row stored in the item's class instead of the join |
 | A6 relabel | a base leaf relabelled to restricted is `unavailable` to a base reader, and absent from every base artefact a base reader can reach, from the moment the relabel call returns (it returns at its erasure boundary, DESIGN 14.1, 14.3) | relabel that waits for the next generation; relabel that leaves the base summary unchanged; relabel that returns before its boundary |
 | A7 wall-clock timing | 2,000 interleaved requests per corpus, and the A4 pair; KS statistic under 0.0515 (alpha 0.01) and median difference under 2% | REPORTED, not gating: a failure is recorded as a disclosed timing channel (expected cause: shared node load; DESIGN 20). A1 to A6 are gating |
-| A8 digest content | no digest carries a gist, fact or leaf text; no reason, title or organise outline label in any digest shares a 5-gram with the leaf text, facts or gists it derives from; titles and reasons are at most 12 words; the fixture includes one-sentence leaves (review 2, F11) | holder whose reasons quote child facts; pointer that carries its leaf's gist (on a one-sentence leaf it returns the whole leaf); title copied from the leaf's first sentence |
+| A8 digest field contract (review 2, F11; review 3, F11) | no pointer or digest entry carries a body, gist or fact field (schema check on every digest); every title equals the code-built title of its leaf or node (top 4 tf-idf terms) and contains no token with a digit; every reason and organise outline label is at most 12 words and shares no 5-gram with the leaf text, facts or gists in its call's input; the fixture includes one-sentence leaves and leaves whose top terms include dates, amounts and account codes written with digits (their digit-free forms, such as a month name or a spelled-out number, may reach a title and are not a failure, DESIGN INV-7, 20). A8 tests this field contract and the digit rule only: it does not show that titles and reasons disclose nothing (DESIGN 20), and its result is never read as such | holder whose reasons quote child facts; pointer that carries its leaf's gist (on a one-sentence leaf it returns the whole leaf); a model-written title copied from the leaf's first sentence; a code-built title that keeps tokens containing a digit |
 
 ### 9.3 Revocation (SEC-R)
 
 | Probe | Pass | Broken control |
 |---|---|---|
-| R1 revoke a reader while it floods recalls, holds 8 requests open, reads its socket slowly, and logs out and in to re-arm; a test hook injects a delay between the final epoch check and the hand-off to the kernel | 0 responses handed to the kernel after the epoch flip (gateway trace), in 100 of 100 trials plus 100 trials with the injected delay; bytes arriving after `revoke` returns come only from responses handed over before the flip and total at most the socket send buffer; `revoke` returns within 2 s at p99 | revocation checked only at session start; revoke that waits on a lock the session holds; no send fence (the injected delay must make it red deterministically); socket write inside the fence with a slow-reading client (revoke latency over bound) |
+| R1 revoke a reader while it floods recalls, holds 8 requests open, reads its socket slowly, and logs out and in to re-arm; a test hook injects a delay between the final epoch check and the hand-off to the kernel | 0 responses handed to the kernel after the epoch flip (gateway trace), in 100 of 100 trials plus 100 trials with the injected delay; measured at the gateway, the bytes the kernel still holds in each of the principal's connections' output queues at the flip are at most 64 KiB (the effective send buffer the gateway set, DESIGN 4.4), and every byte the client receives after `revoke` returns comes from hand-offs completed before the flip (bytes already in the client's receive buffer are outside the bound); `revoke` returns within 2 s at p99 | revocation checked only at session start; revoke that waits on a lock the session holds; no send fence (the injected delay must make it red deterministically); a blocking socket write inside the fence with a slow-reading client (revoke latency over bound) |
 | R2 revoke a writer mid-write | no write admitted after `revoke` returns; writes admitted before commit within 30 s | same |
 | R3 revoke under stress | revoke still effective and under 2 s at p99 under a flood from the revoker's own tenant, and with `lc-<t>-authz` made unwritable (index blocked read-only, and the disk at the flood-stage watermark, P14) | revoke sharing the general admission queue; revoke that requires the Elasticsearch write to succeed |
 | R4 administrators | a tenant administrator cannot grant itself any role or class; revoking an administrator or a revoker needs two distinct administrators; the operator's break-glass revoke works when every tenant administrator is compromised | self-grant allowed; single-administrator revoke of a revoker; break-glass removable by a tenant administrator |
 | R5 class-grant removal | removing one class from a principal bumps its epoch; an in-flight fan-out over that class returns nothing further from that class | removal without an epoch bump |
 | R6 key rotation | the tenant key owner (DESIGN 4.4) rotates and invalidates the tenant's keys without the bootstrap credential; the gateway key cannot | rotation that needs the superuser; gateway key with `manage_api_key` |
-| R7 epoch journal faults (review 2, F9) | with the tenant's journal volume out of space (ENOSPC), with fsync delayed by 10 s through a test hook, and with the gateway stopped abruptly at each persistence boundary (before the append, after the append before the fsync, after the fsync, during compaction before the rename, after the rename), and with a clean stop while an append is pending: `revoke` returns `denied` within 2 s at p99 in every case and the revoked principal is handed nothing afterwards; on a journal fault the tenant is closed (all its principals denied) within `D_FSYNC`, and another tenant's revoke still returns within 2 s; after every abrupt stop, the restarted gateway either holds the revoke durably or has closed the tenant, and never re-admits the revoked principal; `durable_at` is set only after the fsync returns | revoke that waits for the fsync (latency over bound under the delayed fsync); shutdown record written before pending appends drain (re-admission after a clean stop with an append pending); journal error that does not close the tenant (re-admission after restart); start that accepts a journal without a shutdown record; compaction without the atomic rename (a torn snapshot accepted); one journal file shared by all tenants (one tenant's fault delays another's revoke) |
+| R7 epoch journal faults (review 2, F9; review 3, F9) | with the tenant's journal volume out of space (ENOSPC), with fsync delayed by 10 s through a test hook, and with the gateway stopped abruptly at each persistence boundary (before the append, after the append before the fsync, after the fsync, during compaction before the name exchange, after the exchange), with a clean stop while an append is pending, and with a clean stop during which a revoke arrives after the drain has begun; and with a simulated power loss (a test I/O layer under the journal module records every write, fsync, name exchange and directory fsync and, at the injected point, treats as uncertain everything the filesystem's durability rules do not guarantee: file contents written after the file's last completed fsync may be kept, lost or torn, and each directory change after the directory's last completed fsync may be kept or lost, independently of the data, and every combination is run; ASSUMPTION: a model of those rules, not a power cut on a real device) (i) before the start record's fsync returns, (ii) after a previous clean shutdown and a durable start, between a revoke's denial in memory and its fsync, and (iii) at each compaction step (while writing the new file, after its fsync before the name exchange, after the exchange before the directory fsync, after the directory fsync), and (iv) during break-glass recovery after a case (ii) in which the revoke was a two-administrator revoke of an administrator, before and after the recovery's revokes are fsynced: `revoke` returns `denied` within 2 s at p99 in every case except a revoke that arrives during a clean stop (refused, below) and the revoked principal is handed nothing afterwards; on a journal fault the tenant is closed (all its principals denied) within `D_FSYNC`, stays closed across restarts until break-glass recovery, and another tenant's revoke still returns within 2 s; no request of the tenant is admitted before its start record and the directory are durable (layer trace); after every abrupt stop and every simulated power loss, the table rebuilt from the durable journal (the table that start and break-glass recovery use) holds every revoke whose `durable_at` was reported, checked on the table itself and not only by the principal being denied, since a closed tenant denies everyone; the restarted gateway either holds the other revokes or has closed the tenant, and never re-admits a revoked principal; after (ii) it comes up closed; in the clean-stop case a revoke arriving after the drain has begun is refused with a typed retryable failure, never answered `denied`; in (iv) recovery appends and fsyncs the revokes carried from the receipts without `durable_at` before any grant call is admitted, admits grant calls only from the administrators the operator named, refuses every call of the revoked administrator, and a power loss at either point leaves the tenant closed; `durable_at` is set only after the fsync returns | revoke that waits for the fsync (latency over bound under the delayed fsync); shutdown record written before pending appends drain (re-admission after a clean stop with an append pending); journal error that does not close the tenant (re-admission after restart); start that accepts a journal without a shutdown record; compaction that writes the snapshot in place instead of into the spare (a torn snapshot accepted); one journal file shared by all tenants (one tenant's fault delays another's revoke); admission that does not wait for the start record's fsync (layer trace shows a request admitted before the start record was durable, in (i)); start record appended without fsync (in (ii) the durable journal ends in the previous clean shutdown and the revoked principal is re-admitted); compaction that exchanges the names before fsyncing the new file (in (iii) a revoke reported durable before compaction is lost); compaction without the directory fsync (in (iii) the old file returns and a revoke reported durable after the exchange is lost); these two leave the tenant closed either way and go red only through the rebuilt-table check above; compaction that copies the previous run's shutdown state instead of the current start record (a later power loss reads as a clean shutdown and re-admits); a clean stop that writes a shutdown record for a fault-closed tenant (the restarted gateway serves it without break-glass recovery); a clean stop that leaves the revoke lane open during the drain (a revoke answered `denied` after the shutdown record is lost and its principal re-admitted after restart); break-glass recovery that reopens grant calls to every administrator of the durable table before re-applying the receipts' revokes (in (iv) the revoked administrator re-grants a colluding principal) |
 
 N: R1 200 trials (100 plain, 100 with the injected delay); R2, R3 100 each;
-R4, R5, R6 20 each; R7 20 per fault kind and 20 per stop point.
+R4, R5, R6 20 each; R7 20 per fault kind, 20 per stop point, 20 per
+simulated power-loss point and 20 per recovery point.
 
 ### 9.4 Erasure (SEC-E)
 
@@ -822,10 +861,10 @@ plaintext log files are grepped for every canary).
 | E1 residue | after erasure: 0 canaries by text, kNN, percolate, get, lineage query, in every index (authz included), every retained generation, every replay set, in the plaintext Elasticsearch, container and gateway logs, and (raw grep for the short canary) in every file that the gateway, its workers or the model port write under the run's data root outside Elasticsearch's own data directory, so a model-output store outside the closure is found (review 2, F10; test captures of prompts and responses are held in memory, not under the data root); closure residue 0; `docs.deleted == 0` after purge | erase only the current generation; key destroyed only (embedding left behind); raw-file grep of segments as verifier (the long canary must make it miss); closure without the authz index; a model-port wrapper that keeps outputs in a file outside the indices (the removed evaluation cache) |
 | E2 paraphrase | a node whose summary paraphrases the subject without the canary string is caught by lineage | string-search-only closure |
 | E3 resurrection | quarantine, retry, reseal, replay, rebuild, restore-from-snapshot and restore of an older snapshot together with an older keystore backup (both taken before the erasure) cannot bring erased content back; re-ingest of content naming the erased subject (in any canonical variant) is refused; after every restore, the verifier's residue checks (direct reads with its own keys, `lc-<t>-authz` included) find 0 before the tenant is enabled, so an erased principal's sessions and grants restored from the old snapshot are gone (review 2, F8) | reseal-before-quarantine; no erased-identifier HMACs; restore that serves before re-applying tombstones; tombstones kept only inside the snapshot (the older snapshot must resurrect content); keystore restore that does not destroy keys named by newer tombstones; restore that re-applies tombstones but does not replay the closure over restored authz records |
-| E4 concurrency | erasure while a rebuild, a reflection pass and a gate replay are mid-flight | fence removed |
+| E4 concurrency | erasure while a rebuild, a reflection pass and a gate replay are mid-flight: each job's commit waits at the tenant's write gate and aborts when the published tombstones cover its inputs | commit-time tombstone check removed (a job commit that does not check the published tombstones) |
 | E5 hold | legal hold placed: erasure queued, receipt states the delay; hold released: erasure completes | hold ignored |
 | E6 receipt | receipt counts match an independent recount by the verifier; no id lists; the requester's copy shows only totals over the requester's read set | receipt that says done while a log row still names the subject; requester copy with per-class counts |
-| E8 boundary (review 2, F7) | test hooks pause the executor (a) between the request and the boundary, including mid-way through the closure walk before it reaches an upper node linked only through transitive `lin_nodes` lineage, (b) between the boundary and the physical rewrite, and (c) inside a `lookup` and a recall of the subject, between their reads (before the boundary) and their send hand-off (after it). In (a) no promise holds yet and commits of the tenant wait at the gate; in (c) the response is aborted with a typed failure and only bytes of a hand-off whose check preceded the boundary (at most 64 KiB) may arrive, while a response of another class's reader that carries nothing the boundary covers is sent unchanged; in (b) and at every later point, holders, organise calls, reflection, readers and direct searches that touch an affected leaf or ancestor node receive the placeholder or `unavailable`, never the old summary, gist, facts or text (stub prompts and gateway responses captured); request-to-boundary time is recorded against `B_ERASE` | redact set not consulted when presenting nodes; tombstone published before the closure is complete (an upper node reached only through transitive lineage leaks in (b)); commits not held at the gate during the closure (a leaf written mid-closure that names the subject survives); send hand-off without the tombstone re-check (a lookup read before the boundary is sent in full after it, in (c)) |
+| E8 boundary (review 2, F7; review 3, F7) | test hooks pause the executor (a) between the request and the boundary, including mid-way through the closure walk before it reaches an upper node linked only through transitive `lin_nodes` lineage, (b) between the boundary and the physical rewrite, and (c) inside a `lookup` and a recall of the subject, between their reads (before the boundary) and their send hand-off (after it); and (d) with `N_SEND = 8` concurrent senders of the tenant (ASSUMPTION), each a `lookup` or recall carrying the subject, paused by the hook of R1 after its final tombstone and epoch check and before its socket write while the boundary is published. In (a) no promise holds yet and commits of the tenant wait at the gate; in (c) the response is aborted with a typed failure and only bytes handed to the kernel before the boundary may still reach the peer (those the kernel still holds at the boundary at most 64 KiB per connection, measured at the gateway), while a response of another class's reader that carries nothing the boundary covers is sent unchanged; in (d) the gateway trace shows no hand-off whose check precedes the boundary and whose write follows it (the publication step waits on the tenant's send fence until every paused sender has written, and each later hand-off of those responses is aborted), and the bytes the kernel still holds in each paused sender's output queue at the boundary are at most 64 KiB, measured at the gateway; in (b) and at every later point, holders, organise calls, reflection, readers and direct searches that touch an affected leaf or ancestor node receive the placeholder or `unavailable`, never the old summary, gist, facts or text (stub prompts and gateway responses captured); request-to-boundary time is recorded against `B_ERASE` | redact set not consulted when presenting nodes; tombstone published before the closure is complete (an upper node reached only through transitive lineage leaks in (b)); commits not held at the gate during the closure (a leaf written mid-closure that names the subject survives); send hand-off without the tombstone re-check (a lookup read before the boundary is sent in full after it, in (c)); send hand-off that does not hold the tenant's send fence (in (d) a paused sender writes covered bytes after the boundary) |
 | E9 query-shaped artefacts | erasing subject X removes: X's own queries and log rows; other people's queries, stored queries, cache entries and notes that mention X; summaries re-made, `co_used` edges and memberships moved because of X's queries (reverted in every retained generation) | subject detection on leaves only; closure over `lin_subjects` of leaf-derived artefacts only |
 | E7 scale and bound | a subject with 100,000 events in a 1,000,000-document tenant finishes; request to boundary within `B_ERASE` (a measurement above it fails E7 and is reported; the bound is not moved); physical purge within `P_PURGE` of the boundary; the delay of the tenant's own commits during the gate and the latency of other tenants reported | (scale test, no control) |
 
@@ -851,7 +890,7 @@ BLOCK. The older-snapshot restore case of E3 runs 3 times per run.
 |---|---|---|
 | key with `cluster: monitor` | T1 | every cluster API x 2 tenants |
 | cache class equals node class; route cache shared across principals | A5 | 300 queries |
-| injected delay between check and send; slow reader inside the fence | R1 | 100 each |
+| injected delay between check and send; blocking socket write inside the fence with a slow reader | R1 | 100 each |
 | `lc-<t>-authz` unwritable during revoke | R3 | 100 |
 | older snapshot plus older keystore backup | E3, V5 | 3 per run |
 | expansion reads latest edges; candidate edges visible at write | V2, V4, V6, A2 | 100 |
@@ -860,13 +899,13 @@ BLOCK. The older-snapshot restore case of E3 runs 3 times per run.
 | stub with one global model concurrency and one shared embedder | T5 | 3 runs per flood kind |
 | subject detection on leaves only | E9 | 3 runs |
 | model-output file store outside the closure | E1 | 3 runs |
-| holder reasons quoting facts; pointer carrying its leaf's gist; title copied from the leaf | A8 | 300 queries |
+| holder reasons quoting facts; pointer carrying its leaf's gist; model-written title copied from the leaf; code-built title keeping digit tokens | A8 | 300 queries |
 | P or head published before refresh (refresh paused by a hook, writes acknowledged) | V2 | 100 |
 | ancestry truncated to retention, across a real expiry | V2, V4 | 20 expiries |
 | rebuild publishes W past a failed node | V7 | 100 cycles |
-| tombstone published before the closure completes; commits not held at the gate; send without the tombstone re-check | E8 | 3 runs, every pause point |
+| tombstone published before the closure completes; commits not held at the gate; send without the tombstone re-check; send that does not hold the tenant's send fence, with 8 concurrent paused senders | E8 | 3 runs, every pause point |
 | restore without closure replay over authz | E3, V5 | 3 per run |
-| revoke waits on fsync; journal fault without closing the tenant; start without shutdown record; compaction without rename; shared journal; shutdown record before the drain | R7 | 20 per fault kind and stop point |
+| revoke waits on fsync; journal fault without closing the tenant; start without shutdown record; compaction in place instead of into the spare; shared journal; shutdown record before the drain; revoke lane open during the clean-stop drain; admission before the start record's fsync; start record without fsync; compaction that exchanges names before the file fsync, skips the directory fsync or drops the start record; shutdown record for a fault-closed tenant; break-glass that reopens every administrator before re-applying the receipts' revokes | R7 | 20 per fault kind, stop point, simulated power-loss point and recovery point |
 | keystore key bytes left in the `-wal` file | BUILD-PLAN Step 4 | 1,000 keys |
 
 ## 10. Staged gates and model-call budget
@@ -912,12 +951,24 @@ formulas below; S1 and S2 replace the per-call assumptions by measurements.
 - Reader sessions 1 to 3 calls; reflection 1 variant call plus 5 to 8 judge
   calls per stream item (NO-AUDIT: 1 plus 1 to 3); reverse audit capped at
   `N_AUDIT = 100` leaves per cycle and `K_CAND = 5` candidate searches per leaf,
-  one judge call per leaf (DESIGN 12); gate per cycle per learning arm: 12
-  generation calls, 30 to 60 judge calls and 80 replayed searches (60 targeted,
-  20 general) at 2 to 8 routing calls each (gate replays run as the class's
-  service principal, so the product cache, scoped to that principal, re-uses
-  every unchanged node's routing for the same query; only nodes whose version
-  changed are asked again).
+  one judge call per leaf (DESIGN 12).
+- Gate, per candidate (one candidate per cycle per learning arm; review 3,
+  F15): 12 generation calls, 30 to 60 judge calls and 80 replayed searches
+  (60 targeted, 20 general), whose candidate traversal costs 2 to 8 routing
+  calls each, because gate replays run as the class's service principal and
+  the product cache, scoped to that principal (DESIGN 5.8), re-uses the
+  current generation's routing of the same query for every unchanged node;
+  only nodes whose version changed are asked again: 202 to 712 calls per
+  candidate. That re-use needs the current generation's routing of the query
+  first. A gate-only synthetic query (topping up the targeted set) is new,
+  and a held-out search, in the targeted set or in the general guard (the 20
+  most recent held-out searches, DESIGN 13.3), was routed under its reader's
+  principal, whose cache entries the service principal cannot use, so every
+  replay query first pays one cold traversal of the current generation at the
+  stage's per-recall routing figure above. Cold queries per candidate
+  (ASSUMPTION): all 80, in the LOW and the HIGH figure; a cache hit can only
+  lower this. That is 2,000 to 4,800 calls per candidate on development pools,
+  2,800 to 5,600 on E2b pools and 4,000 to 6,160 on the whole pool.
 - Build: one call per node; a level-1 build call reads its new children's full
   text. Edge typing: 20 pairs per call over titles, gists and facts.
 
@@ -937,10 +988,16 @@ formulas below; S1 and S2 replace the per-call assumptions by measurements.
 
 ### 10.3 Calls, tokens and wall time per stage
 
-Printed by `evalkit/budget.py` (plain Python, run with `python3 -I`); review
-2, F10 removed the evaluation cache, so only the LOW figures of the
-multi-arm stages S4a, S4b, S7a and S7b changed; the HIGH figures, S2, S3 and
-S6 as a whole are as before.
+Printed by `evalkit/budget.py` (plain Python, run with `python3 -I`), in the
+default order of the stages (below). Review 3, F15 derived the gate from the
+factors of 10.1 (202 to 712 calls per candidate where the previous revision
+allotted 200 to 700), added the cold current-generation routing of replay
+queries, and added DEV-BASE to the total, because S7b runs before S4a in the
+default order. So the figures of S4b, S7b, S4a, S7a and the total changed;
+those of S1 to S6-H2, S5 and DEV-BASE did not. The cold routing is now the
+largest single item of every loop stage, in the low and the high figure (in
+S7a narrowly: 80,000 to 123,200 against 78,300 to 120,582 for the stream
+recalls).
 
 | Stage | Calls low | Calls high | Input tokens, API basis | Input tokens, CLI basis | Wall hours at 9.36 s per call, concurrency 2 |
 |---|---|---|---|---|---|
@@ -950,13 +1007,13 @@ S6 as a whole are as before.
 | S3 | 7,022 | 17,252 | 39M to 141M | 112M to 322M | 9 to 22 |
 | S6-H1 | 23,104 | 35,574 | 129M to 375M | 371M to 749M | 30 to 46 |
 | S6-H2 | 5,129 | 18,632 | 24M to 121M | 78M to 317M | 7 to 24 |
-| S4b | 30,535 | 74,342 | 150M to 559M | 470M to 1,339M | 40 to 97 |
-| S4a | 32,243 | 76,101 | 170M to 647M | 509M to 1,446M | 42 to 99 |
-| S5 (optional) | 1,180 | 1,180 | 3M to 8M | 16M to 20M | 2 |
-| S7a | 107,707 | 185,807 | 448M to 1,444M | 1,579M to 3,395M | 140 to 242 |
-| S7b | 57,314 | 123,533 | 240M to 845M | 842M to 2,142M | 75 to 161 |
-| DEV-BASE alone (only when S4a has not run and S7b or S7a needs it) | 3,383 | 8,001 | 41M to 148M | 76M to 232M | 4 to 10 |
-| Total S1 to S7b (without DEV-BASE) | 266,645 | 537,900 | 1,215M to 4,184M | 4,015M to 9,832M | 347 to 699 |
+| S4b | 70,575 | 170,582 | 246M to 925M | 987M to 2,716M | 92 to 222 |
+| DEV-BASE alone (S7b runs before S4a in the default order, so it builds DEV-BASE) | 3,383 | 8,001 | 41M to 148M | 76M to 232M | 4 to 10 |
+| S7b | 141,374 | 291,893 | 442M to 1,485M | 1,927M to 4,550M | 184 to 379 |
+| S4a | 68,279 | 162,717 | 257M to 976M | 974M to 2,685M | 89 to 212 |
+| S7a | 187,747 | 309,247 | 640M to 1,913M | 2,611M to 5,160M | 244 to 402 |
+| Total, default order (every row above, DEV-BASE included) | 509,024 | 1,019,377 | 1,829M to 6,128M | 7,174M to 16,831M | 662 to 1,325 |
+| S5 (optional, not in the default order or the total) | 1,180 | 1,180 | 3M to 8M | 16M to 20M | 2 |
 
 Breakdown (formulas, so they can be recomputed; k arms cost k times one arm):
 
@@ -977,27 +1034,33 @@ Breakdown (formulas, so they can be recomputed; k arms cost k times one arm):
   arms (16,650 to 39,960); readers LOOP and FROZEN 444 to 1,332; reflection
   LOOP 1,332 to 1,998; QUERY-MEMO shadow reflection 1,332 to 1,998; audit 9
   cycles x 100 (450 to 900); re-summaries 300 to 1,200; gate 2 arms x 9
-  cycles (3,600 to 12,600); incremental build 1,966 to 3,276 per arm x 3
+  cycles, 18 x (202 to 712) = 3,636 to 12,816, plus cold routing 18 x (80 x 25
+  to 80 x 60) = 36,000 to 86,400; incremental build 1,966 to 3,276 per arm x 3
   (5,898 to 9,828); edges 1,417 to 4,725; recurring generation 120 to 360;
   proxy judge 500 to 1,000; behavioural 200.
 - S4b: base build 480 to 740 and edges 443 to 1,475; recalls (120 in stream +
   54 probe 2 = 174) x (25 to 60) x 4 arms (17,400 to 41,760); readers 360 to
   1,080; reflection LOOP and NO-AUDIT 960 to 1,560; audit 300 to 600;
-  re-summaries 300 to 1,200; gate 3 arms x 6 cycles (3,600 to 12,600); gate
-  positive controls 400 to 1,400; stream build 1,090 to 1,680 per arm x 4
+  re-summaries 300 to 1,200; gate 3 arms x 6 cycles, 18 x (202 to 712) =
+  3,636 to 12,816, plus cold routing 18 x (80 x 25 to 80 x 60) = 36,000 to
+  86,400; gate positive controls, 2 candidates, 404 to 1,424 plus cold routing
+  4,000 to 9,600; stream build 1,090 to 1,680 per arm x 4
   (4,360 to 6,720); edges 938 to 3,125; probe generation 94 to 282;
   LOOP+SYNTH proxy 200 to 600; proxy judge 500 to 1,000; behavioural 200.
 - S7a: recalls (312 + about 210 recurring = 522) x (50 to 77) x 3 arms
   (78,300 to 120,582); readers 1,044 to 3,132; reflection LOOP 3,132 to 4,698;
   QUERY-MEMO shadow reflection 3,132 to 4,698; audit 500 to 1,000;
-  re-summaries 1,200 to 4,800; gate 2 arms x 10 cycles (4,000 to 14,000);
+  re-summaries 1,200 to 4,800; gate 2 arms x 10 cycles, 20 x (202 to 712) =
+  4,040 to 14,240, plus cold routing 20 x (80 x 50 to 80 x 77) = 80,000 to
+  123,200;
   incremental build 4,000 to 6,700 per arm x 3 (12,000 to 20,100); edges
   2,900 to 9,700; recurring generation 299 to 897; proxy judge 1,000 to
   2,000; behavioural 200.
 - S7b: recalls (200 in stream + 80 probe 2 = 280) x (35 to 70) x 4 arms
   (39,200 to 78,400); readers 600 to 1,800; reflection LOOP and NO-AUDIT 1,600
   to 2,600; audit 500 to 1,000; re-summaries 600 to 2,400; gate 3 arms x 10
-  cycles (6,000 to 21,000); stream build 1,650 to 2,550 per arm x 4 (6,600 to
+  cycles, 30 x (202 to 712) = 6,060 to 21,360, plus cold routing 30 x (80 x 35
+  to 80 x 70) = 84,000 to 168,000; stream build 1,650 to 2,550 per arm x 4 (6,600 to
   10,200); edges 1,174 to 3,913; probe generation 140 to 420; LOOP+SYNTH proxy
   200 to 600; proxy judge 500 to 1,000; behavioural 200.
 
@@ -1015,8 +1078,8 @@ SHUFFLED-SUMMARIES). Printed sub-budget of this H1-first path (S1, S2, S3,
 S6-H1): 32,537 to 58,305 calls; 179M to 559M API input tokens; 521M to
 1,172M CLI input tokens; 42 to 76 wall hours. H2, H3, H4 and the comparison
 arms stay registered and follow in later phases: S6-H2 (H2, H1b, C; 5,129 to
-18,632 calls), then S4b and S7b (H4; 91,232 to 205,876 calls including
-DEV-BASE), then S4a and S7a (H3; 139,950 to 261,908 calls); S4b before S4a
+18,632 calls), then S4b and S7b (H4; 215,332 to 470,476 calls including
+DEV-BASE), then S4a and S7a (H3; 256,026 to 471,964 calls); S4b before S4a
 because S4b's gate positive controls cover E2a (7.3). This is an order, not a
 reduction of what is tested: every stage still needs its own approval, and
 any reduction or stop rule is the owner's decision (section 12, X4 and X6).
@@ -1025,7 +1088,8 @@ S6-H1 if H1 reads HARM, or DID NOT HOLD on both (a) and (b).
 
 Other ways to cut the budget without changing the method, each the owner's
 decision (section 12): shorter streams (cost scales about linearly with stream
-length); drop S3 if S2 is clear; typed-edge candidates 3 instead of 5; the
+length); fewer learning cycles per stream (each cycle costs every learning
+arm 2,000 to 6,160 calls of cold gate routing, 10.1); drop S3 if S2 is clear; typed-edge candidates 3 instead of 5; the
 direct API instead of the headless CLI (removes the 10.5k fixed overhead per
 call).
 
@@ -1058,7 +1122,7 @@ call).
 | X6 | Order and stop rules for the stages (10.3) | order in force: S0, S1, S2, S3, S6-H1, then S6-H2, then S4b and S7b, then S4a and S7a, every stage still tested and approved one by one; the stop rule after S6-H1 is recommended and not in force until the owner says so |
 | X7 | Direct API instead of the headless CLI for model calls | headless CLI on the subscription |
 | X8 | Confirmatory H1 denominator: drop the 6 DEV-EXPOSED questions (n = 293, 299 as sensitivity), or keep 299 and report the 6 apart | recommended and in force until answered: 293 primary (3.2). Reason: development runs will show those 6 questions' gold to models |
-| X9 | Readings chosen on the owner's behalf, each reversible without changing the method: "never offered" read as `tree_missed` (DESIGN 10); reverse-audit synthetic queries off in LOOP (DESIGN 12); the gate's general-replay count guard (7.3); stream reader limits (3.8); reverse-audit re-filing support `S_MIN` = 2 missed relevant searches (DESIGN 12; review 2, F3) | as written; each alternative is logged or run as a labelled variant where cheap (`any_missed`, LOOP+SYNTH) |
+| X9 | Readings chosen on the owner's behalf, each reversible without changing the method: "never offered" read as `tree_missed` (DESIGN 10); reverse-audit synthetic queries off in LOOP (DESIGN 12); the gate's general-replay count guard (7.3); stream reader limits (3.8); reverse-audit re-filing support `S_MIN` = 2 missed relevant searches (DESIGN 12; review 2, F3); the owner's "pure reference pointers" read together with "a tight summary" as a field contract (no body, gist or fact field in a pointer, code-built titles without digit tokens, bounded reasons), not as semantic non-disclosure, so descriptors may convey an answer and "not opened" is never read as irrelevance (DESIGN INV-7, 20; review 3, F11; ASSUMPTION about the owner's intent; the alternative, non-content descriptors, would leave no tight summary) | as written; each alternative is logged or run as a labelled variant where cheap (`any_missed`, LOOP+SYNTH) |
 
 ## 13. Review responses
 
@@ -1073,8 +1137,8 @@ it found (the proxy world) is now DEVIATION 7 and decides nothing. Rows marked
 | Finding | Response | Where |
 |---|---|---|
 | F1 opened has no producer | fixed: a reader per stream item in every signal-producing arm; opened-share bounds [0.05, 0.60] or the signal is void; opened rate, opens per recall and behavioural share reported (intervals changed by review 2, F14); no gold-dependent opener | 3.8, 10.3; DESIGN 9 |
-| F2 "never offered" undefined; NO-AUDIT not independent | fixed: `tree_missed` per source (DESIGN 10); NO-AUDIT removes exactly pool (c) and the audit; strata by the best direct rank over the source question and probe 1 (changed by review 2, F2: ranks at each search's corpus prefix plus an offer audit), with per-stratum predictions; NO-AUDIT has its own expected failure in its own logs | 3.6, 4, 6 |
-| F3 planting repairs by construction | fixed: donor-sibling metadata, pinning in all arms with survival logged, FROZEN ceiling, probes from question and answer only with a rank filter on probe 2, decoy plants, LOOP+SYNTH apart from the owner's reverse search (synthetic queries off in LOOP), learning frozen at the end checkpoint and probe 2 never stored. Answered in part: the source question and probe 1 are not rank-filtered, because their best direct rank defines the strata; stratum 1 is reported and excluded from the cause test instead, and any plant that a logged offer row shows was offered before its repair is moved to stratum 1 by the offer audit (review 2, F2) | 3.6, 4, 6 |
+| F2 "never offered" undefined; NO-AUDIT not independent | fixed: `tree_missed` per source (DESIGN 10); NO-AUDIT removes exactly pool (c) and the audit; strata by the best direct rank over the source question and probe 1 (changed by review 2, F2: ranks at each search's corpus prefix plus an offer audit; changed by review 3, F2: the strata are fixed before any arm runs and the audit is descriptive), with per-stratum predictions; NO-AUDIT has its own check in its own logs (a switch check since review 3, F2) | 3.6, 4, 6 |
+| F3 planting repairs by construction | fixed: donor-sibling metadata, pinning in all arms with survival logged, FROZEN ceiling, probes from question and answer only with a rank filter on probe 2, decoy plants, LOOP+SYNTH apart from the owner's reverse search (synthetic queries off in LOOP), learning frozen at the end checkpoint and probe 2 never stored. Answered in part: the source question and probe 1 are not rank-filtered, because their best direct rank defines the strata; stratum 1 is reported and excluded from the cause test instead (review 2, F2 also moved any plant a logged offer row showed offered to stratum 1; changed by review 3, F2: no plant is moved, the offer audit is descriptive) | 3.6, 4, 6 |
 | F4 gate has no positive control | fixed: oracle and random candidates in S0 and S4b, which also cover E2a (same frozen gate; S4b must pass before S7a); targeted replay; simulated power; unjudged items judged at replay; general replay as a count guard | 7.3; DESIGN 13.3 |
 | F5 recency is a gold proxy | fixed: lag L = 5 with interleaving; identical exploration in every arm, excluding recent leaves, and removed from metrics; RECENCY-ONLY control; `last_seen` hidden from holders | 3.4, 6; DESIGN 8.2 |
 | F6 gold through non-id fields | fixed, and confirmed real: the records carry a turn-level `has_answer` flag (MEASURED); field whitelist and an all-fields ingest test across all task kinds | 3.1; BUILD-PLAN Step 20 |
@@ -1082,10 +1146,10 @@ it found (the proxy world) is now DEVIATION 7 and decides nothing. Rows marked
 | F8 controls in the non-adopted routing | fixed: proxy world labelled DEVIATION 7; RANDOM-FEEDBACK and NO-AUDIT agent-routed on E2b decide; proxy is supporting only | 4.2, 6; DESIGN 22 |
 | F9 H2 merge rule undefined | fixed: three-list RRF k = 60, cut 50, pre-registered now; linked list's own recall reported | 5.1 |
 | F10 H1 from fusion or length | fixed: A0+LEN arm in the decision; tree-only contribution condition; per-source shares | 2.2, 4 |
-| F11 agent-side method never exercised; reasons leak | fixed: AGENTIC vs AGENT-A0 as H1b (secondary, to avoid a fifth decided claim); reasons at most 12 words with a 5-gram leak check; A8 probe and Step 10 broken variant (extended by review 2, F11: no gist in returned pointers, titles and outline labels checked) | 1, 4, 9.2; DESIGN 8.2 |
+| F11 agent-side method never exercised; reasons leak | fixed: AGENTIC vs AGENT-A0 as H1b (secondary, to avoid a fifth decided claim); reasons at most 12 words with a 5-gram leak check; A8 probe and Step 10 broken variant (extended by review 2, F11: no gist in returned pointers, titles and outline labels checked; changed by review 3, F11: a field contract with code-built titles) | 1, 4, 9.2; DESIGN 8.2 |
 | F12 statistics do not fit | fixed: outcome words incl. NOT ESTABLISHED; discordance-based power with amendments at S3, S4a, S4b; one gate method (changed by review 2, F12: an exact cluster sign-flip test replaces the betting confidence sequence); SHUFFLED-SUMMARIES lower bound; Tango and Newcombe intervals; HARM for every hypothesis | 2, 6, 7 |
-| F13 budget unrealistic | fixed: per-kind tokens with build at real size; audit caps; gate cost; rate limits measured at S2; staged order with stop rules as an owner decision. Changed by review 2, F10: the evaluation cache that lowered the low figure is withdrawn; the total is now 266,645 to 537,900 calls (10.3) | 10 |
-| F14 revocation blockable and racy | fixed in DESIGN 4.4: authoritative in-memory epochs with a local journal (changed by review 2, F9: bounded, durability reported separately, fail closed), send fence with no peer I/O inside it, break-glass revoke, two-administrator rule, no self-grant, class-grant removal bumps the epoch, tenant key owner for rotation (P15); probes R1 to R6 | 9.3 |
+| F13 budget unrealistic | fixed: per-kind tokens with build at real size; audit caps; gate cost; rate limits measured at S2; staged order with stop rules as an owner decision. Changed by review 2, F10: the evaluation cache that lowered the low figure is withdrawn; changed by review 3, F15: gate cost derived from its factors, cold routing of replay queries and DEV-BASE added to the default-order total, now 509,024 to 1,019,377 calls (10.3) | 10 |
+| F14 revocation blockable and racy | fixed in DESIGN 4.4: authoritative in-memory epochs with a local journal (changed by review 2, F9: bounded, durability reported separately, fail closed; review 3, F9: durable start record), send fence with no peer I/O inside it (one per tenant since review 3, F7), break-glass revoke, two-administrator rule, no self-grant, class-grant removal bumps the epoch, tenant key owner for rotation (P15); probes R1 to R6 | 9.3 |
 | F15 shared authz index | fixed: per-tenant `lc-<t>-authz`, global registry without principals, HMAC principal tokens, authz inside the erasure closure and T1 | DESIGN 5.10 |
 | F16 older snapshot resurrects | fixed: tombstone journal outside the snapshot timeline, applied to every restore, keystore restores destroy keys named by newer tombstones; E3 and V5 cases (extended by review 2, F8: closure replay over every restored index and verifier residue checks before the tenant is enabled) | DESIGN 14.6 |
 | F17 query-shaped artefacts survive | fixed: subject detection on query text; subject tokens carried into every query-shaped artefact; closure reverts them; E9 | DESIGN 14.2 |
@@ -1110,16 +1174,16 @@ needs. The owner's method is unchanged.
 | Finding | Change | Where |
 |---|---|---|
 | F1 H3 "beyond memo" excluded the memo treatment | LOOP vs QUERY-MEMO is decided on fused final-list recall@10 at the same 10-session output budget, so both treatments count; tree-only recall stays the decided measure for "history helps" (LOOP vs FROZEN) and is reported for LOOP vs QUERY-MEMO as structural only; a failing-first check with a perfect memo list catches a regression to tree-only scoring | 1, 2.2, 5.2; BUILD-PLAN Step 20 |
-| F2 end-pool strata miss earlier offers | strata from A0 ranks against the corpus prefix at each scheduled search, a selection device only; an offer audit over the logged offer rows (DESIGN 9) moves any plant offered by any source before its repair to stratum 1, with counts and failed row writes reported; decoys not reclassified | 3.6, 6 (NO-AUDIT), 7.2, 13.1 (F3 row) |
+| F2 end-pool strata miss earlier offers | strata from A0 ranks against the corpus prefix at each scheduled search, a selection device only; an offer audit over the logged offer rows (DESIGN 9) moves any plant offered by any source before its repair to stratum 1, with counts and failed row writes reported; decoys not reclassified (changed by review 3, F2: the move is withdrawn; the audit is descriptive and repair has one definition) | 3.6, 6 (NO-AUDIT), 7.2, 13.1 (F3 row) |
 | F3 support of 5 made H4 repair impossible | re-filing support `S_MIN = 2` missed relevant searches (ASSUMPTION), evidence accumulated across cycles; eligibility reported apart from repair | 3.6, 12 (X9); DESIGN 12 |
 | F4 P and heads published before searchable | searchable-publication barrier: P and heads move only after an explicit refresh of the touched member, edge and node indices returns (for a cancelled write-path job, after its deletes); V2 with refresh paused independently of acknowledgement | 9.5 V2, 9.6; DESIGN 5.6, 7.6, 13.2; BUILD-PLAN Step 0 (P5), Step 13 |
 | F5 ancestry truncation | ancestry ids kept for the life of the class; retention removes content only; V2 and V4 across a real retention expiry, including a retired edge | 9.5 V2, V4; DESIGN 5.6, 13.2; BUILD-PLAN Step 13 |
 | F6 W advanced past a failed node | a failed build of a required node aborts publication of that generation; members stay pending; V7 tests tree-only reachability under a partial rebuild failure; a persistently failing node is a stated limit | 9.5 V7; DESIGN 7.6, 17, 20; BUILD-PLAN Step 13 |
-| F7 erasure promised before the closure existed | one publication boundary: closure under the tenant's write gate, then tombstone and complete redact set published together; "erased" promised from the boundary, which follows the request within `B_ERASE` (measured); the 15-minute lease wait is removed; a response read before the boundary is aborted at its next send hand-off (only bytes already handed to the kernel, at most 64 KiB, may arrive, as for revocation); E8 pauses before and after the boundary and between a read and its send | 9.4 E7, E8; DESIGN INV-9, 2A, 14.1, 14.3, 14.5, 14.6; BUILD-PLAN Step 14 |
+| F7 erasure promised before the closure existed | one publication boundary: closure under the tenant's write gate, then tombstone and complete redact set published together; "erased" promised from the boundary, which follows the request within `B_ERASE` (measured); the 15-minute lease wait is removed; a response read before the boundary is aborted at its next send hand-off (only bytes already handed to the kernel, at most 64 KiB, may arrive, as for revocation; changed by review 3, F7: one per-tenant send fence makes check and write atomic with the boundary, and the bound is per connection, on bytes the kernel still holds at the boundary, measured at the gateway); E8 pauses before and after the boundary and between a read and its send | 9.4 E7, E8; DESIGN INV-9, 2A, 14.1, 14.3, 14.5, 14.6; BUILD-PLAN Step 14 |
 | F8 restore left authz residue | after any restore: journal applied, closure replayed over every restored index (authz and control included), verifier residue checks with direct reads, then the tenant is enabled | 9.4 E3, 9.5 V5; DESIGN 14.4, 14.6; BUILD-PLAN Step 14 |
-| F9 revocation tied to an unbounded journal | bounded preallocated per-tenant journal with compaction; `revoke` returns once memory denies and reports durability separately; journal fault or incomplete journal at start closes the tenant; the shutdown record follows the drain of pending appends; no fence across I/O; R7 (no space, delayed fsync, stop at every persistence boundary, clean stop with an append pending) | 9.3 R7, 9.6; DESIGN 2A, 3, 4.4, 17, 20; BUILD-PLAN Step 15 |
+| F9 revocation tied to an unbounded journal | bounded preallocated per-tenant journal with compaction; `revoke` returns once memory denies and reports durability separately; journal fault or incomplete journal at start closes the tenant; the shutdown record follows the drain of pending appends; no fence across I/O; R7 (no space, delayed fsync, stop at every persistence boundary, clean stop with an append pending; extended by review 3, F9: durable start record, compaction ordering, simulated power loss) | 9.3 R7, 9.6; DESIGN 2A, 3, 4.4, 17, 20; BUILD-PLAN Step 15 |
 | F10 evaluation cache escaped erasure | removed; budgets recomputed without sharing by `evalkit/budget.py`; E1 also greps every file the gateway, workers and model port write outside Elasticsearch's data directory, with the removed cache as a broken variant, so a model-output store outside the closure cannot come back unnoticed | 9.4 E1, 9.6, 10.1, 10.3; DESIGN 18.1, 19; BUILD-PLAN Steps 14, 20 |
-| F11 gist returned leaf content without lookup | returned pointers carry pointer, title, size, path, reason and confidence only; titles at most 12 words and 5-gram checked at every level, and a leaf's stored title is the code-built title set at store; outline labels checked; short-leaf limit stated; three A8 broken variants in every document | 3.8, 5.2, 9.2 A8, 9.6; DESIGN INV-7, 5.2, 7.4, 7.6, 8.2 to 8.4, 8.7, 18.2, 20; BUILD-PLAN Steps 6, 10 |
+| F11 gist returned leaf content without lookup | returned pointers carry pointer, title, size, path, reason and confidence only; as of review 2 (history, no longer current): titles at most 12 words and 5-gram checked at every level, and a leaf's stored title the code-built title set at store; outline labels checked; short-leaf limit stated; three A8 broken variants in every document. Current state since review 3, F11 (13.3): every title code-built without digit tokens, no title 5-gram check; INV-7 read as a field contract, not semantic non-disclosure | 3.8, 5.2, 9.2 A8, 9.6; DESIGN INV-7, 5.2, 7.4, 7.6, 8.2 to 8.4, 8.7, 18.2, 20; BUILD-PLAN Steps 6, 10 |
 | F12 gate statistics did not fit the sampling | exact one-sided cluster sign-flip test, fixed horizon, once per candidate, K >= 8, formula written; simulation with correlated paraphrases, power, repeated candidates and an asymmetric null in both directions (`evalkit/gate_power.py`); the anti-conservative direction (rare large losses: 0.17 at K = 8) is a stated limit | 7.3; DESIGN 13.3, 20, 22; BUILD-PLAN Step 19 |
 | F13 S0 exceeded its wall budget | S0 split into resumable checkpoints S0-core and S0-load; S0 passes only when both pass, and the S0 report has a failing-first check that refuses a partial set; wall time per checkpoint stated; build steps run the T5 floods only in a short smoke form, never reported as a T5 pass | 10, 11; BUILD-PLAN 0, Steps 5, 22 |
 | F14 Wilson on count metrics | bootstrap over recalls for opens per recall, mean opened share and `ask` share; Wilson only for the binary behavioural-use share; the interval code refuses Wilson on a measure not declared binary (failing-first) | 3.8, 7.1; BUILD-PLAN Step 20 |
@@ -1127,7 +1191,35 @@ needs. The owner's method is unchanged.
 | Also: stage order | S0, S1, S2, S3, then S6-H1 first, with its printed sub-budget; H2, H3, H4 and the comparisons follow, still registered; reductions stay the owner's decision. Each development choice is frozen before the first confirmatory stage that uses it; C1 and C2 rows and the development ablations are computed after S6-H1, the ablations under their own approval and cap | 3.7, 4, 10, 10.3, 12 (X6) |
 | Also: build order | security lifecycle from the first steps; edges, reflection, reverse audit and reorganiser first as minimal real producers with stub models; refinements and comparison arms after H1; Step 21 not needed for H1 | BUILD-PLAN 3, Steps 12, 17 to 22 |
 
-Nothing in this revision was run except the dataset measurements marked
+### 13.3 Review 3 responses
+
+The third review returned BLOCK. It closed ten of the second review's
+fourteen findings (F12 only with a limited reading: the gate is an
+inspectable heuristic; F13 at the planning stage), left F2, F7, F9 and F11
+open, and added F15. F7, F9 and F11 had to be fixed before the stub stage
+(S0); F2 and F15 before their later stages. Review ended here, by the stated
+cap of one independent review plus one delta: the fixes below were not
+independently re-reviewed. Checks of the first fix revision against the
+review found further gaps, also fixed below and also not re-reviewed: a
+clean stop could write its shutdown record while a revoke was still
+arriving, break-glass recovery reopened every administrator before
+re-applying revokes that never became durable, compaction freed journal
+space another tenant could take (F9); the 64 KiB residual was stated at the
+peer instead of at the gateway, and no connection cap bounded the aggregate
+(F7); INV-7 claimed that dates and codes never reach a title, which holds
+only for their digit forms (F11); the low cold-routing figure assumed the
+guard searches were already routed by the service principal (F15).
+
+| Finding | Fix | Where |
+|---|---|---|
+| F7 erasure publication and the final send used different synchronization (before S0) | one per-tenant send fence in gateway memory serves both revocation and erasure publication, replacing the per-principal fence; every final send check (epoch and tombstone sequence) and its non-blocking socket write hold its shared side; revoke's epoch flip and the in-memory publication step hold its exclusive side; no journal, disk or Elasticsearch I/O under either side; it is the innermost lock (taken under the write gate, never the reverse), so no lock-order inversion; the wording that let a hand-off whose check preceded the boundary write after it is removed; residual: only bytes handed to the kernel before the boundary can still reach the peer; those the kernel still holds at the boundary are at most 64 KiB per connection (the gateway sets each connection's send buffer and checks its effective size, ASSUMPTION) and the tenant's open-connection cap (DESIGN 15) times 64 KiB in aggregate, measured at the gateway, since bytes already in the peer's receive buffer are outside it (a tightening of the decided wording); E8 (d) pauses 8 concurrent senders after their final check, with a broken variant whose send does not hold the fence; the broken variant "socket write inside the fence" became "blocking socket write inside the fence", since the design now writes inside it, non-blocking | 9.3 R1, 9.4 E8, 9.6; DESIGN INV-9, 2A, 4.4, 5.9, 14.3, 14.5, 17, 19, 22; BUILD-PLAN Steps 14, 15 |
+| F9 an undurable start record could hide an unclean run (before S0) | a start record made durable (fsync of the journal file, then of its directory) before any of the tenant's requests is admitted; compaction in the order write new file, fsync, rename, fsync directory, the new file carrying the start record, where the rename is an atomic exchange with the preallocated spare so no journal space is freed (the closest sound variant of the decided order; ASSUMPTION: the filesystem supports an atomic name exchange, tested at provisioning); no shutdown record is ever written for a closed tenant, so a persistence fault stays closed across restarts until explicit break-glass recovery; a clean stop closes admission and the revoke lane before the drain; break-glass recovery first journals the revokes from receipts without `durable_at`, then reopens grant calls only to administrators the operator names (a lost receipt is a stated limit); R7 adds simulated power loss before the start record's fsync, between a denial and its fsync after a previous clean shutdown, at every compaction step and during recovery, plus a revoke arriving during a clean stop, each with a broken variant, and checks durable revokes on the journal-rebuilt table itself; the simulation lets data and name changes not yet fsynced each survive or be lost, in every combination, so an exchange before the file fsync goes red | 9.3 R7, 9.6; DESIGN 4.4, 15, 17, 19, 20, 22; BUILD-PLAN Steps 5, 15, 22 |
+| F11 the 5-gram rule cannot enforce INV-7 (before S0) | INV-7 is an enforceable field contract: no body, gist or fact field in a pointer or the digest; every title code-built (top 4 tf-idf terms) with no token containing a digit, so model-written titles and their 5-gram check are gone (digit-free forms such as a month name still reach a title, and reasons have no digit rule: stated in the limit); reasons and outline labels bounded (12 words, 5-gram filter); stated as a limit that descriptors can convey an answer, so "not opened" never means "not used" and is never evidence of irrelevance by itself; A8 tests the field contract and the digit rule only; the reading is an ASSUMPTION about the owner's intent (12, X9); the counterfactual sample of `used_behavioural` draws from unopened offered rows too, and edge decay without descriptor-only confirmations is disclosed | 3.6, 3.8, 4.1, 5.2, 9.2 A8, 9.6, 12 (X9); DESIGN INV-7, 5.2, 7.6, 8.2 to 8.4, 8.7, 9 to 12, 16.4, 17, 18.2, 20, 22; BUILD-PLAN Steps 6, 10, 13 |
+| F2 the offer audit conditioned the cause comparison on exposure (before S4b and S7b) | the confirmatory cause comparison (LOOP vs NO-AUDIT, and existence vs FROZEN) runs on the prefix-selected strata, fixed before any arm runs and identical in every arm; the offer audit is descriptive mechanism evidence and never moves or removes a plant; repair has one definition, held-back tree retrieval at probe 2, and no metadata or membership change ends a window; NO-AUDIT keeps a switch check, and its repair in strata 2 and 3 is reported, not a void condition; Step 20's reclassification tests are replaced by a test that the confirmatory population is identical across arms | 2.2, 3.6, 6, 7.2, 13.1, 13.2; BUILD-PLAN Step 20 |
+| F15 the budget undercounted the gate (later stage) | `evalkit/budget.py` derives each candidate's gate cost from the stated factors (202 to 712 calls), adds the cold current-generation routing of replay queries without cached routing (every one of the 80 replay queries per candidate, at the stage's per-recall figure, ASSUMPTION; a check after review 3 found that the earlier low reading of 60 contradicted its own premise, since the 20 guard searches are held-out searches too), and prints the total for the default order with DEV-BASE: 509,024 to 1,019,377 calls; the H1-first path is unchanged at 32,537 to 58,305 | 10.1, 10.3, 13.1 (F13 row) |
+| Also: the gate's meaning | the gate is an inspectable heuristic, not a 5% false-adoption guarantee; its p-value and RANDOM-FEEDBACK are never cited as proof of a bounded false-adoption rate; sign scoring measures how often clusters improve, not by how much, so the outcomes of H3 and H4 rest only on their independent forward and held-back measures | 7.3; DESIGN 13.3, 20 |
+
+Nothing in these revisions was run except the dataset measurements marked
 MEASURED, the gate simulation of 7.3 (`evalkit/gate_power.py`) and the budget
 arithmetic of 10.3 (`evalkit/budget.py`), both plain Python with no model
 calls; their printed numbers are quoted as printed.
