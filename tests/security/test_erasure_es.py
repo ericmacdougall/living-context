@@ -82,7 +82,7 @@ class ErasureOnElasticsearch(unittest.TestCase):
         return Writer(lambda: self.gate.client(T, "ingest"), self.ks, T, self.guard, pause=pause,
                       gate=self.wgate if gated else None)
 
-    def scenario(self):
+    def scenario(self, strip_upper=True):
         w = self.writer()
         recs, self.erased_ids = [], []
         for i in range(30):
@@ -102,18 +102,24 @@ class ErasureOnElasticsearch(unittest.TestCase):
         self.assertEqual(self.tree.levels, 2)
         Publisher(lambda: self.gate.client(T, "structure"), T, "base").publish(self.tree, watermark=30)
         self.admin.request("POST", f"/lc-{T}-*/_refresh")
-        # DESIGN 14.2: an upper node carries only `lin_nodes` and is reached by the upward walk. The build also copies the
-        # subject tokens upward (so a subject query alone would find it); strip them so only the walk can reach it.
-        st, r = self.admin.request("POST", f"/lc-{T}-base-node/_update_by_query?refresh=true&conflicts=proceed", {
-            "query": {"term": {"level": 2}}, "script": {"source": "ctx._source.lin_subjects = []", "lang": "painless"}})
-        self.assertEqual(st, 200, r)
-        self.assertGreaterEqual(r["updated"], 1, "the scenario has no upper node")
+        # DESIGN 14.2 and 5.4: an upper node carries `lin_nodes` and is reached by the upward walk, and its subjects only
+        # through copied facts. The build copies the subject tokens of all descendants upward (the safer reading: a
+        # subject query alone finds it). strip_upper=True removes them so only the walk can reach the node; False keeps
+        # them so the subject path reaches it. Both paths must erase the node.
+        if strip_upper:
+            st, r = self.admin.request("POST", f"/lc-{T}-base-node/_update_by_query?refresh=true&conflicts=proceed", {
+                "query": {"term": {"level": 2}}, "script": {"source": "ctx._source.lin_subjects = []", "lang": "painless"}})
+            self.assertEqual(st, 200, r)
+            self.assertGreaterEqual(r["updated"], 1, "the scenario has no upper node")
+        else:
+            up = [d for d in self.node_docs().values() if d["level"] == 2]
+            self.assertTrue(any(self.subject in d["lin_subjects"] for d in up), "subjects not copied upward")
         return recs
 
     def executor(self, **kw):
         er = lambda: self.gate.client(T, "erase")
         return Executor(er, lambda: self.gate.client(T, "structure"), T, self.ks, self.journal, self.wgate, self.fence,
-                        self.state, purge_deadline_s=kw.pop("purge_deadline_s", 90), **kw)
+                        self.state, purge_deadline_s=kw.pop("purge_deadline_s", 90), es_log=lambda: self.gate.client(T, "log"), **kw)
 
     def guard_fn(self):
         return lambda: self.guard.erase_identifier(self.email)
@@ -219,6 +225,54 @@ class ErasureOnElasticsearch(unittest.TestCase):
         with self.assertRaises(AssertionError) as cm:
             self.run_gate_case(gated=False)
         self.assertIn("landed between the closure and the boundary", str(cm.exception))
+
+    def test_erasure_when_subjects_are_copied_to_upper_nodes(self):
+        self.scenario(strip_upper=False)
+        nodes_before = self.node_docs()
+        rc = self.executor().erase_subject(self.subject, apply_guard=self.guard_fn())
+        self.check_erasure(rc, nodes_before)
+        for d in self.node_docs().values():
+            self.assertNotIn(MARK, str(d))
+
+
+    # ---- protocol-log rows (DESIGN 14.3 step 5) ------------------------------------------------------------------
+    def log_scenario(self):
+        from living_context.feedback.log import Offer, ProtocolLog
+        from living_context.policy import ClassLattice
+        self.scenario()
+        plog = ProtocolLog(lambda: self.gate.client(T, "log"), T, ClassLattice(["base"], []), self.guard, gate=self.wgate)
+        other = self.ks.subject_token("other@example.com")
+        leaf = self.erased_ids[0]
+        offer = Offer(leaf, 1, "base", ("tree",), 0, subjects=(self.subject,))
+        self.assertEqual(plog.record_digest("s-other", other, "m1", ["base"], "what about the orchard", [offer]), 1)
+        self.assertEqual(plog.record_digest("s-self", self.subject, "m1", ["base"], "my own query", [offer]), 1)
+        self.admin.request("POST", f"/lc-{T}-*/_refresh")
+        return other, leaf
+
+    def log_rows(self):
+        self.admin.request("POST", f"/lc-{T}-*/_refresh")
+        st, r = self.admin.request("POST", f"/lc-{T}-base-log/_search", {"size": 50, "query": {"match_all": {}}})
+        return {h["_source"]["search_id"]: h["_source"] for h in r["hits"]["hits"]}
+
+    def test_another_actors_log_row_is_stripped_not_deleted(self):
+        other, leaf = self.log_scenario()
+        rc = self.executor().erase_subject(self.subject, apply_guard=self.guard_fn())
+        rows = self.log_rows()
+        self.assertNotIn("s-self", rows, "the subject's own row survived")
+        self.assertIn("s-other", rows, "another actor's history was deleted")
+        row = rows["s-other"]
+        self.assertEqual((row["pointer"], row["lin_leaf_ids"], row["item_subjects"]), ({}, [], []))
+        self.assertNotIn(self.subject, row["lin_subjects"])
+        self.assertEqual(row["lin_subjects"], [other])
+        self.assertEqual(rc.stripped, 1)
+        self.assertEqual(rc.recount, 0)
+
+    def test_broken_deleting_every_row_that_offered_an_erased_item_is_red(self):
+        self.log_scenario()
+        self.executor(broken_delete_foreign_log_rows=True).erase_subject(self.subject, apply_guard=self.guard_fn())
+        with self.assertRaises(AssertionError) as cm:
+            self.assertIn("s-other", self.log_rows(), "another actor's history was deleted")
+        self.assertIn("history was deleted", str(cm.exception))
 
 
 if __name__ == "__main__":

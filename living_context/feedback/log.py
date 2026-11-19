@@ -106,7 +106,7 @@ class ProtocolLog:
                     row = self._base("log", cls, lin_leaf_ids=[o.leaf_id], lin_subjects=subjects, search_id=search_id,
                                      ts=_now(), actor=actor, actor_model=actor_model, query_class=query_class,
                                      prompt_hash=digest, pins=pins or {}, pointer={"leaf_id": o.leaf_id, "lv": o.lv},
-                                     sources=sorted(o.sources), offered_by_tree="tree" in o.sources, rank=o.rank,
+                                     sources=sorted(o.sources), offered_by_tree="tree" in o.sources, rank=o.rank, item_subjects=sorted(o.subjects),
                                      offer_set_size=len(offers), propensity=o.propensity, exploration=o.exploration,
                                      holder_confidence=o.confidence, fallback=o.fallback, opened=False, asked=False,
                                      used_cited=False, used_behavioural=None, item_cls=o.item_cls)

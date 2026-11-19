@@ -144,6 +144,18 @@ class Behaviour(unittest.TestCase):
         with self.assertRaises(KeystoreError):
             ks.destroy(subject_token="s2", leaf_id="d" * 32)
 
+    def test_destroy_of_a_leaf_set_vacuums_once_and_not_at_all_when_nothing_matches(self):
+        from unittest import mock
+        ks = self.ks
+        for c in "efgh":
+            ks.encrypt(c * 32, 1, b"x", [])
+        with mock.patch.object(ks, "_after_destroy", wraps=ks._after_destroy) as av:
+            self.assertEqual(len(ks.destroy(leaf_ids=["e" * 32, "f" * 32, "g" * 32])), 3)
+            self.assertEqual(av.call_count, 1)
+            self.assertEqual(ks.destroy(leaf_ids=["e" * 32, "z" * 32]), [])
+            self.assertEqual(av.call_count, 1, "a destroy that found no key still rewrote the file")
+        self.assertEqual(ks.count_keys(), 1)
+
     def test_pragmas_are_set_explicitly_and_file_is_private(self):
         self.assertEqual(self.ks._db.execute("PRAGMA secure_delete").fetchone()[0], 1)
         self.assertEqual(self.ks._db.execute("PRAGMA journal_mode").fetchone()[0], "wal")

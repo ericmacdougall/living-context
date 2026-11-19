@@ -55,6 +55,7 @@ class Receipt:
     keys_destroyed: int = 0
     deleted: int = 0
     rewritten: int = 0
+    stripped: int = 0
     purge_s: dict = field(default_factory=dict)
     purge_left: dict = field(default_factory=dict)
     purge_ok: bool = True
@@ -65,12 +66,15 @@ class Executor:
     def __init__(self, es_erase: Callable[[], EsClient], es_struct: Callable[[], EsClient], tenant: str, keystore: Keystore,
                  journal: TombstoneJournal, gate: WriteGate, fence: SendFence, state: State, *,
                  pause: Optional[Callable[[str], None]] = None, transitive: bool = True, destroy_only_keys: bool = False,
-                 purge_deadline_s: float = purge.DEFAULT_DEADLINE_S, purge_interval_s: float = 3.0):
+                 purge_deadline_s: float = purge.DEFAULT_DEADLINE_S, purge_interval_s: float = 3.0,
+                 broken_delete_foreign_log_rows: bool = False, es_log: Optional[Callable[[], EsClient]] = None):
         self._er, self._st, self.tenant, self._ks = es_erase, es_struct, tenant, keystore
         self._j, self._gate, self._fence, self.state = journal, gate, fence, state
         self._pause = pause or (lambda s: None)
         self._transitive, self._keys_only = transitive, destroy_only_keys
         self._pd, self._pi = purge_deadline_s, purge_interval_s
+        self._lg = es_log or es_struct   # the rewrite of a log row needs write on the log indices (the erase key has delete only)
+        self._del_foreign = broken_delete_foreign_log_rows  # BROKEN variant: another actor's history is deleted too
 
     # ---- closure ---------------------------------------------------------------------------------------------
     def closure(self, subject: str) -> tuple[dict, set]:
@@ -119,14 +123,16 @@ class Executor:
         for h in hits.values():
             rc.closure[h.kind] = rc.closure.get(h.kind, 0) + 1
         rc.keys_destroyed = len(self._ks.destroy(subject_token=subject))
-        for lid in leaves:
-            rc.keys_destroyed += len(self._ks.destroy(leaf_id=lid))
+        rc.keys_destroyed += len(self._ks.destroy(leaf_ids=leaves))
         if self._keys_only:  # BROKEN variant: the keys are gone, the plaintext projections stay
             rc.recount = len(scan.find(er, self.tenant, subjects=[subject]))
             return rc
         touched: set[str] = set()
         for h in list(hits.values()):
-            if h.kind in DELETE_KINDS:
+            if h.kind == "log" and not self._del_foreign:
+                if self._strip_or_delete_log_row(h, leaves, subject, seq, rc):
+                    touched.add(h.index)
+            elif h.kind in DELETE_KINDS:
                 rc.deleted += scan.delete(er, [h])
                 touched.add(h.index)
             elif h.kind in REWRITE_KINDS:
@@ -164,3 +170,25 @@ class Executor:
             s["lin_nodes"] = ["erased"]
         code, _ = st.request("PUT", f"/{h.index}/_doc/{h.id}?if_seq_no={doc['_seq_no']}&if_primary_term={doc['_primary_term']}", s)
         return 1 if code in (200, 201) else 0
+
+    def _strip_or_delete_log_row(self, h: scan.Hit, leaves: set, subject: str, seq: int, rc: Receipt) -> bool:
+        """DESIGN 14.3 step 5: a row whose actor is the subject, or whose query text mentions the subject, is the subject's
+        own and is deleted. A row of another actor whose only link to the scope is an offered erased item is that actor's
+        history: its pointer and the item's subject tokens are stripped by an in-place rewrite (`erasure_rewrite = seq`,
+        DEVIATION 6). The document id still holds the offered leaf id (an id, no content; a stated limit)."""
+        st = self._lg()
+        code, doc = st.request("GET", f"/{h.index}/_doc/{h.id}")
+        if code != 200:
+            raise scan.ScanError(f"log row read failed ({code})")
+        s = doc["_source"]
+        item_subjects = set(s.get("item_subjects", []))
+        own = (set(s.get("lin_subjects", [])) - item_subjects) | {s.get("actor", "")}
+        if subject in own:
+            rc.deleted += scan.delete(self._er(), [h])
+            return True
+        s.update(pointer={}, lin_leaf_ids=[], item_subjects=[], lin_subjects=sorted(own - {""}), erasure_rewrite=seq)
+        code, _ = st.request("PUT", f"/{h.index}/_doc/{h.id}?if_seq_no={doc['_seq_no']}&if_primary_term={doc['_primary_term']}", s)
+        if code not in (200, 201):
+            raise scan.ScanError(f"log row rewrite failed ({code})")
+        rc.stripped += 1
+        return True

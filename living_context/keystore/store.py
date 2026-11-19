@@ -168,11 +168,13 @@ class Keystore:
             raise KeystoreError("ciphertext does not match this leaf version") from e
 
     # --- destroy ------------------------------------------------------------------
-    def destroy(self, *, subject_token: str | None = None, leaf_id: str | None = None) -> list[str]:
-        """Destroy every data key named by a subject token, or every version of a leaf.
-        Returns the destroyed key references (ids only), after the checkpoint."""
-        if (subject_token is None) == (leaf_id is None):
-            raise KeystoreError("name exactly one of subject_token, leaf_id")
+    def destroy(self, *, subject_token: str | None = None, leaf_id: str | None = None,
+                leaf_ids: Iterable[str] | None = None) -> list[str]:
+        """Destroy every data key named by a subject token, by a leaf, or by a set of leaves (one VACUUM for the whole call,
+        none when no key was found). Returns the destroyed key references (ids only), after the checkpoint.
+        Cost limit: the VACUUM rewrites the whole file, measured 3 ms at 1,000 keys and 170 to 185 ms at 100,000 keys."""
+        if sum(x is not None for x in (subject_token, leaf_id, leaf_ids)) != 1:
+            raise KeystoreError("name exactly one of subject_token, leaf_id, leaf_ids")
         db = self._db
         db.execute("BEGIN IMMEDIATE")
         try:
@@ -181,8 +183,9 @@ class Keystore:
                     "SELECT k.leaf_id, k.lv, k.key_ref FROM leaf_keys k JOIN leaf_subjects s "
                     "ON s.leaf_id=k.leaf_id AND s.lv=k.lv WHERE s.token=?", (subject_token,)).fetchall()
             else:
-                rows = db.execute("SELECT leaf_id, lv, key_ref FROM leaf_keys WHERE leaf_id=?",
-                                  (leaf_id,)).fetchall()
+                rows = []
+                for lid in ([leaf_id] if leaf_id is not None else sorted(set(leaf_ids))):
+                    rows += db.execute("SELECT leaf_id, lv, key_ref FROM leaf_keys WHERE leaf_id=?", (lid,)).fetchall()
             for lid, lv, _ in rows:
                 db.execute("DELETE FROM leaf_keys WHERE leaf_id=? AND lv=?", (lid, lv))
                 db.execute("DELETE FROM leaf_subjects WHERE leaf_id=? AND lv=?", (lid, lv))
@@ -190,7 +193,8 @@ class Keystore:
         except Exception:
             db.execute("ROLLBACK")
             raise
-        self._after_destroy(db)
+        if rows:
+            self._after_destroy(db)
         return [r[2] for r in rows]
 
     def count_keys(self) -> int:
