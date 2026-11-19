@@ -16,6 +16,9 @@ from living_context.gateway.handler import EsGate, Gateway, REFUSED, UNAVAILABLE
 from living_context.gateway.provision import provision_tenant
 from living_context.gateway.sessions import EpochTable, Sessions
 from living_context.gateway.fence import SendFence
+from living_context.ingest.subjects import Guard, TokenSource
+from living_context.ingest.writer import Writer
+from living_context.keystore import Keystore
 from living_context.policy import ClassLattice, Principal, Role
 
 URL, CA, PW = (os.environ.get(k) for k in ("LC_TEST_ES_URL", "LC_TEST_CA", "LC_TEST_PW"))
@@ -72,15 +75,17 @@ class IsolationOnElasticsearch(unittest.TestCase):
                                                  frozenset(["base", "restricted"]), frozenset(["base", "restricted"]))
         cls.sessions = Sessions({t: Adapter() for t in TENANTS}, cls.epochs, lambda t, who: {"user": "tok-user", "usersuper": "tok-super"}[who],
                                 lambda t, p: grants.get((t, p)))
-        cls.gw = Gateway(cls.es, cls.sessions, {t: LAT for t in TENANTS})
+        cls.stores = {t: Keystore(root / "ks" / f"{t}.db", t) for t in TENANTS}
+        cls.writers = {t: Writer(lambda t=t: cls.es.client(t, "ingest"), cls.stores[t], t,
+                                 Guard(TokenSource(cls.stores[t]))) for t in TENANTS}
+        cls.gw = Gateway(cls.es, cls.sessions, {t: LAT for t in TENANTS}, writers=lambda t: cls.writers[t])
         cls.tok = {t: cls.sessions.mint(t, b"user") for t in TENANTS}
         cls.sup = {t: cls.sessions.mint(t, b"usersuper") for t in TENANTS}
         cls.ptr = {}
         for t in TENANTS:
             for c, tk in (("base", cls.tok[t]), ("restricted", cls.sup[t])):
                 r = cls.gw.handle(tk, {"op": "write", "cls": c, "doc": {
-                    "text": f"{MARK[t]} {c} document about gardens", "title": f"{MARK[t]} {c}", "size_tokens": 7,
-                    "lin_subjects": ["tokenx"]}})
+                    "text": f"{MARK[t]} {c} document about gardens"}})
                 assert r["ok"], r
                 cls.ptr[(t, c)] = r["pointer"]
         for t in TENANTS:
@@ -117,7 +122,7 @@ class IsolationOnElasticsearch(unittest.TestCase):
         r = self.gw.handle(tk, {"op": "search", "cls": "base", "text": "gardens"})
         self.assertTrue(r["ok"])
         self.assertEqual(len(r["hits"]), 1)
-        self.assertEqual(r["hits"][0]["title"], f"{MARK['tena']} base")
+        self.assertIn(MARK["tena"], r["hits"][0]["title"])  # the title is code-built from the text
         # another tenant's marker is not found; a class outside the grant is typed unavailable
         self.assertEqual(self.gw.handle(tk, {"op": "search", "cls": "base", "text": MARK["tenb"]})["hits"], [])
         self.assertEqual(self.gw.handle(tk, {"op": "search", "cls": "restricted", "text": "gardens"}), UNAVAILABLE)
@@ -138,7 +143,7 @@ class IsolationOnElasticsearch(unittest.TestCase):
             req = {"op": rng.choice(allowed_ops), "cls": rng.choice(CLASSES + ["nothere"]),
                    "text": rng.choice(list(MARK.values()) + ["gardens"]),
                    "pointer": rng.choice(list(self.ptr.values()) + ["zz"]),
-                   "doc": {"text": rng.choice(list(MARK.values())), "lin_subjects": ["t"]}}
+                   "doc": {"text": rng.choice(["fuzzwrite", MARK["tena"]]), "lin_subjects": ["t"]}}  # own text only: a write stores it
             if rng.random() < 0.5:
                 req[rng.choice(fields)] = rng.choice(["tenb", "tenbx", ["restricted"], {"x": 1}])
             r = self.gw.handle(tk, req)
@@ -169,10 +174,10 @@ class IsolationOnElasticsearch(unittest.TestCase):
 
     def test_t2_writes_are_refused_without_grant_or_with_forged_tenant(self):
         tk = self.tok["tena"]
-        doc = {"text": "x", "title": "x", "lin_subjects": ["t"]}
+        doc = {"text": "x"}
         self.assertEqual(self.gw.handle(tk, {"op": "write", "cls": "restricted", "doc": doc}), REFUSED)
         self.assertEqual(self.gw.handle(tk, {"op": "write", "cls": "base", "tenant": "tenb", "doc": doc}), REFUSED)
-        self.assertEqual(self.gw.handle(tk, {"op": "write", "cls": "base", "doc": {"text": "x"}}), REFUSED)  # no lin_subjects
+        self.assertEqual(self.gw.handle(tk, {"op": "write", "cls": "base", "doc": {"title": "t"}}), REFUSED)  # no text
 
     def test_t3_forbidden_and_missing_answers_do_not_depend_on_the_other_tenants_data(self):
         tk = self.tok["tena"]
@@ -181,13 +186,13 @@ class IsolationOnElasticsearch(unittest.TestCase):
         reqs += [{"op": "search", "cls": "base", "text": MARK["tenb"]}, {"op": "search", "cls": "nothere", "text": "x"}]
         before = [json.dumps(self.gw.handle(tk, r), sort_keys=True) for r in reqs]
         for i in range(200):  # tenb grows from 1 to 201 leaves
-            self.gw.handle(self.tok["tenb"], {"op": "write", "cls": "base", "doc": {"text": f"filler {i} bravomarker", "title": "f", "lin_subjects": ["t"]}})
+            self.gw.handle(self.tok["tenb"], {"op": "write", "cls": "base", "doc": {"text": f"filler {i} bravomarker"}})
         self.admin.request("POST", "/lc-tenb-*/_refresh")
         after = [json.dumps(self.gw.handle(tk, r), sort_keys=True) for r in reqs]
         self.assertEqual(before, after)
 
     def test_t3_broken_gateway_that_forwards_a_sub_response_is_caught(self):
-        bad = Forwarding(self.es, self.sessions, {t: LAT for t in TENANTS})
+        bad = Forwarding(self.es, self.sessions, {t: LAT for t in TENANTS}, writers=lambda t: self.writers[t])
         for ix in ("lc-tenb-base-leaf", "lc-tenb-base-alias"):
             r = bad.handle(self.tok["tena"], {"op": "lookup", "index": ix})
             self.assertIn("lc-tenb", json.dumps(r), ix)  # the leak the clean checks must see

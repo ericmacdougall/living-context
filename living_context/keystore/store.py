@@ -76,7 +76,7 @@ class Keystore:
             CREATE TABLE IF NOT EXISTS identities(
                 token TEXT NOT NULL, exact TEXT NOT NULL, PRIMARY KEY(token, exact));
             """)
-        for name in ("subject", "principal"):
+        for name in ("subject", "principal", "idem", "content"):
             self._db.execute("INSERT OR IGNORE INTO tenant_keys(name, key) VALUES (?, ?)",
                              (name, os.urandom(32)))
 
@@ -96,6 +96,14 @@ class Keystore:
     def subject_token(self, identifier: str, *, confusables: bool = True) -> str:
         msg = canonicalise(identifier, confusables=confusables).encode()
         return hmac.new(self._hmac_key("subject"), msg, hashlib.sha256).digest()[:TOKEN_BYTES].hex()
+
+    def digest(self, purpose: str, data: bytes) -> str:
+        """Keyed digest of `data` (idempotency bodies, content hashes): an HMAC under a per-tenant
+        key, so a stored digest is no oracle for guessing content."""
+        return hmac.new(self._hmac_key(purpose), data, hashlib.sha256).hexdigest()
+
+    def has_key(self, leaf_id: str, lv: int) -> bool:
+        return self._db.execute("SELECT 1 FROM leaf_keys WHERE leaf_id=? AND lv=?", (leaf_id, lv)).fetchone() is not None
 
     def principal_token(self, identifier: str) -> str:
         msg = canonicalise(identifier).encode()

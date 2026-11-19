@@ -16,9 +16,8 @@ import json
 import os
 from typing import Any, Callable, Mapping, Optional
 
-from ..ids import IdError, KIND_LEAF, Pointer, decode_pointer, encode_pointer, new_leaf_id
+from ..ids import IdError, KIND_LEAF, Pointer, decode_pointer, encode_pointer
 from ..policy import ClassLattice, Op, decide
-from . import validator
 from .es import EsClient, EsError
 from .indices import class_index
 from .sessions import Sessions
@@ -26,6 +25,7 @@ from .sessions import Sessions
 FORBIDDEN_BODY_FIELDS = {"tenant", "principal", "principal_token", "session", "roles", "read_set", "write_set"}
 REFUSED = {"ok": False, "error": "refused"}
 UNAVAILABLE = {"ok": False, "error": "unavailable"}
+HELD = {"ok": False, "error": "held"}
 
 
 class EsGate:
@@ -48,8 +48,10 @@ class EsGate:
 
 
 class Gateway:
-    def __init__(self, es: EsGate, sessions: Sessions, lattices: Mapping[str, ClassLattice]):
+    def __init__(self, es: EsGate, sessions: Sessions, lattices: Mapping[str, ClassLattice],
+                 writers: Optional[Callable[[str], Any]] = None):
         self._es, self._sessions, self._lattices = es, sessions, lattices
+        self._writers = writers
 
     # the single shaping point for every successful answer: nothing from Elasticsearch passes through unfiltered
     def _shape_hit(self, tenant: str, cls: str, hit: Mapping[str, Any]) -> Optional[dict]:
@@ -121,22 +123,19 @@ class Gateway:
         return UNAVAILABLE
 
     def _write(self, tenant, p, lattice, req):
+        """Delegate to the tenant's writer: the client names text, optional subjects and an idempotency key;
+        every stored field (title, lineage, vector, ids) is built by code, never taken from the request."""
         cls, doc = req.get("cls"), req.get("doc")
-        if not isinstance(cls, str) or not isinstance(doc, dict):
+        if not isinstance(cls, str) or not isinstance(doc, dict) or self._writers is None:
             return REFUSED
         if not decide(p, Op.REMEMBER, tenant=tenant, lattice=lattice, cls=cls):
             return REFUSED
-        full = {"tenant": tenant, "cls": cls, "kind": "leaf", "lin_leaves": [], "lin_leaf_ids": [], "lin_nodes": [],
-                "lin_queries": [], "derivation": "write", "erasure_rewrite": 0, "schema_v": 1, **{
-                    k: v for k, v in doc.items() if k in ("lin_subjects", "text", "title", "size_tokens", "entities")}}
-        full.setdefault("created_at", "2026-01-01T00:00:00Z")
-        idx = class_index(tenant, cls, "leaf")
-        try:
-            validator.validate(full, session_tenant=tenant, index=idx, index_tenant=tenant, index_cls=cls)
-        except validator.Refused:
+        text, subs, key = doc.get("text"), doc.get("subjects", []), doc.get("key")
+        if not isinstance(text, str) or not isinstance(subs, list) or not (key is None or isinstance(key, str)):
             return REFUSED
-        leaf_id = new_leaf_id()
-        st, _ = self._es.client(tenant, "ingest").request("PUT", f"/{idx}/_doc/{leaf_id}:1?refresh=true", full)
-        if st not in (200, 201):
-            return UNAVAILABLE
-        return {"ok": True, "pointer": encode_pointer(Pointer(KIND_LEAF, 0, leaf_id, 1))}
+        res = self._writers(tenant).remember(p.token, cls, text, subjects_declared=subs, key=key)
+        if res.status == "stored":
+            return {"ok": True, "pointer": encode_pointer(Pointer(KIND_LEAF, 0, res.leaf_id, res.lv))}
+        if res.status == "held":
+            return HELD
+        return REFUSED  # empty, over the cap, erased identifier and key reuse look the same to a writer

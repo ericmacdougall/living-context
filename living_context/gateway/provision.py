@@ -19,7 +19,7 @@ from typing import Any
 from ..config import Constants
 from . import epoch_journal, fsx
 from .es import EsClient
-from .indices import (CLASS_KINDS, REGISTRY, TENANT_KINDS, class_index, class_patterns, check_id,
+from .indices import (CLASS_KINDS, REGISTRY, TENANT_CLS, TENANT_KINDS, class_index, class_patterns, check_id,
                       may_provision, physical_name, role_pattern_is_safe, shards_per_tenant, tenant_index)
 
 SLOWLOG_OFF = {f"index.{k}.slowlog.threshold.{q}.{lvl}": "-1"
@@ -94,6 +94,8 @@ def provision_tenant(admin: EsClient, tenant: str, classes: list[str], *, key_di
         raise ProvisionRefused("class count")
     for cl in classes:
         check_id(cl, "class")
+        if cl == TENANT_CLS:
+            raise ProvisionRefused("reserved class id")
     jdir = data_root / "epochs" / tenant
     data_root.mkdir(parents=True, exist_ok=True)
     (data_root / "epochs").mkdir(exist_ok=True)

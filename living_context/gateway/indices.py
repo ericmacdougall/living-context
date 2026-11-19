@@ -18,6 +18,7 @@ ID = re.compile(r"^[a-z0-9]{4,16}$")
 CLASS_KINDS = ("leaf", "node", "edge", "member", "log", "sq", "note", "cache", "ctl")
 TENANT_KINDS = ("src", "ctl", "authz")
 REGISTRY = "lc-sys-registry"
+TENANT_CLS = "tenantwide"  # the `cls` of tenant-wide documents; no tenant class may use it
 
 
 class NameError_(ValueError):
