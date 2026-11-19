@@ -1,0 +1,10 @@
+# Placeholders only. Copy outside the repository and point LC_CONFIG at it.
+es_url = "https://127.0.0.1:9200"
+es_ca_path = "/path/to/ca.pem"
+key_dir = "/path/to/keys"        # 0600 key files, read by path
+data_root = "/path/to/data"
+dataset_path = "/path/to/dataset.json"
+
+[constants]
+# Any constant of living_context/config.py may be overridden here, for example:
+# f_max = 24
