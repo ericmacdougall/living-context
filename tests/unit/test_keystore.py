@@ -25,6 +25,9 @@ class SecureDeleteOff(WalKeepingKeystore):
         super()._configure(db)
         db.execute("PRAGMA secure_delete=OFF")
 
+    def _after_destroy(self, db):  # the production step also vacuums, which would hide what this variant shows
+        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
 
 class NoCheckpointAfterDestroy(WalKeepingKeystore):
     def _after_destroy(self, db):
