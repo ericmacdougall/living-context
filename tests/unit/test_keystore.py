@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from living_context.keystore import KeyDestroyed, Keystore, KeystoreError, KeystoreSet, canonicalise
+from living_context.keystore import LookalikeRefused, KeyDestroyed, Keystore, KeystoreError, KeystoreSet, canonicalise
 from living_context.keystore.store import _TENANT
 
 N = 1000
@@ -162,6 +162,29 @@ class Behaviour(unittest.TestCase):
             self.assertEqual(len(a), 32)
         finally:
             other.close()
+
+
+class LookalikeFailsClosed(unittest.TestCase):
+    """Canonicalisation over-matches (clark and dark share a token). That is acceptable only
+    because registration fails closed and two existing identities are never conflated."""
+
+    def test_lookalike_registration_is_refused_and_existing_identity_is_untouched(self):
+        with tempfile.TemporaryDirectory() as d:
+            ks = Keystore(Path(d) / "tena.db", "tenaaa")
+            try:
+                self.assertEqual(canonicalise("clark@example.com"), canonicalise("dark@example.com"))
+                t1 = ks.register_identifier("clark@example.com")
+                self.assertEqual(ks.register_identifier("Clark@Example.com"), t1)  # same identity, idempotent
+                with self.assertRaises(LookalikeRefused):
+                    ks.register_identifier("dark@example.com")
+                with self.assertRaises(LookalikeRefused):
+                    ks.register_identifier("\u0441lark@example.com")  # Cyrillic es
+                self.assertEqual(ks._db.execute("SELECT COUNT(*) FROM identities").fetchone()[0], 1)
+                ks.encrypt("a" * 32, 1, b"x", [t1])
+                self.assertEqual(len(ks.destroy(subject_token=t1)), 1)  # erasure reaches only that identity
+                self.assertNotEqual(ks.register_identifier("unrelated@example.org"), t1)
+            finally:
+                ks.close()
 
 
 class Isolation(unittest.TestCase):

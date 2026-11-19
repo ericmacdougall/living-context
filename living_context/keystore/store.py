@@ -33,6 +33,10 @@ class KeystoreError(Exception):
     pass
 
 
+class LookalikeRefused(KeystoreError):
+    """The identifier's canonical token equals that of a different existing identity."""
+
+
 class KeyDestroyed(KeystoreError):
     """The data key of this leaf version no longer exists."""
 
@@ -69,6 +73,8 @@ class Keystore:
                 leaf_id TEXT NOT NULL, lv INTEGER NOT NULL, token TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS leaf_subjects_token ON leaf_subjects(token);
             CREATE TABLE IF NOT EXISTS tenant_keys(name TEXT PRIMARY KEY, key BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS identities(
+                token TEXT NOT NULL, exact TEXT NOT NULL, PRIMARY KEY(token, exact));
             """)
         for name in ("subject", "principal"):
             self._db.execute("INSERT OR IGNORE INTO tenant_keys(name, key) VALUES (?, ?)",
@@ -94,6 +100,32 @@ class Keystore:
     def principal_token(self, identifier: str) -> str:
         msg = canonicalise(identifier).encode()
         return hmac.new(self._hmac_key("principal"), msg, hashlib.sha256).digest()[:TOKEN_BYTES].hex()
+
+    def register_identifier(self, identifier: str) -> str:
+        """Declare an identifier; returns its subject token. Fails closed: an identifier whose
+        canonical token equals that of a DIFFERENT existing identity (a look-alike such as
+        `clark` and `dark`) is refused, so two identities are never conflated. Registering the
+        same identifier again is idempotent. `exact` is an HMAC of the identifier with only NFKC
+        and case folding applied, so look-alikes are told apart without storing the identifier."""
+        import unicodedata
+        token = self.subject_token(identifier)
+        exact_msg = unicodedata.normalize("NFKC", identifier).casefold().strip().encode()
+        exact = hmac.new(self._hmac_key("subject"), b"exact:" + exact_msg, hashlib.sha256).digest()[:TOKEN_BYTES].hex()
+        db = self._db
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            rows = db.execute("SELECT exact FROM identities WHERE token=?", (token,)).fetchall()
+            if any(r[0] != exact for r in rows):
+                db.execute("ROLLBACK")
+                raise LookalikeRefused("look-alike of an existing identity")
+            db.execute("INSERT OR IGNORE INTO identities(token, exact) VALUES (?,?)", (token, exact))
+            db.execute("COMMIT")
+        except LookalikeRefused:
+            raise
+        except Exception:
+            db.execute("ROLLBACK")
+            raise
+        return token
 
     # --- data keys ----------------------------------------------------------------
     def encrypt(self, leaf_id: str, lv: int, plaintext: bytes, subject_tokens: Iterable[str]):
