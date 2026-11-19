@@ -85,6 +85,9 @@ def roles_for(tenant: str, classes: list[str]) -> dict[str, dict]:
     log = sum((kind_patterns(t, k) for k in ("log", "sq", "note", "cache")), [])
     rd["log"] = desc(log, ["read", "write", "view_index_metadata"])
     rd["erase"] = desc([f"lc-{t}-*"], ["read", "delete", "view_index_metadata", "maintenance", "monitor"])
+    # the independent verifier's own key (DESIGN 14.7): reads every index of the tenant, refreshes them (so it never reads stale
+    # data), and can write or delete nothing
+    rd["verify"] = desc([f"lc-{t}-*"], ["read", "view_index_metadata", "maintenance"])
     rd["authz"] = desc([f"lc-{t}-authz", f"lc-{t}-authz-p*"], ["read", "write", "view_index_metadata"])
     return rd
 
