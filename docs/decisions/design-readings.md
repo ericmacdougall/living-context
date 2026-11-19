@@ -57,8 +57,36 @@ Each entry names the passages, the reading the build follows and the test that k
   that version), never overwrites it and never deletes it on discard; a node version is created with create-only semantics.
 - Placement thresholds by depth (0.0, 0.05, 0.10, 0.20) and the summary refresh rule (4 new children or 25% size change) follow 7.5
   and 7.6; a node that does not refresh keeps its summary and is marked `stale`.
-- Not built in Step 13: merge of an under-full node into its sibling, collapse of single-child chains, a pending-new node in a tree
-  taller than one level (the rebuild refuses it), the tombstone check before the flip beyond the `abort_if` hook, and the
-  evaluation-only pinning hook. Step 13 is therefore PARTIAL on those items.
+- Step 13 remainder (second pass, main-accepted reading ASSUMPTION): 7.6 step 3 says "merge a node under F_MIN into its most
+  similar sibling" and "collapse single-child chains" without saying where. The build merges level-1 nodes among the children of
+  a parent the rebuild touches (the top nodes of a one-level tree), only when the union fits F_MAX, and collapses a node left with
+  one child by putting the child in its place (the top list of a tree may then mix levels; placement descends such a frontier and
+  only level-1 nodes take members). The conflict kept safe: a rebuild must not move a leaf the erasure and lineage walks cannot
+  find; every merge writes member documents for the absorbed leaves under the sibling and a forwarding record, and the test
+  checks that every leaf is in exactly one level-1 node and the earlier generation is unchanged.
+- 7.6 step 6 (the tombstone check at the commit) against 14.3 (the gate): the check reads the in-memory published tombstone
+  state under the shared side of the write gate, immediately before the head flip; an erasure published after the plan and before
+  the commit is therefore seen, one that arrives during the commit waits at the gate and rewrites the new generation as a retained
+  one. The attempt aborts (it does not rebase); the next run rebuilds from the inputs that remain.
+- A pending-new level-1 node of a tree taller than one level joins the most similar level-2 node (the next rebuild may split it).
+- The evaluation-only pinning hook (BUILD-PLAN 3.6 via Step 13) is read as "a pinned leaf stays with its donor sibling" (EXPERIMENT
+  3.6, F3: donor-sibling metadata); only a split could move it, so the hook is applied in the split.
+- 16.3 `valid_to` on the older leaf's head: a stated limit in DESIGN 20 (see there).
+- 5.3 ("members of the old nodes get G+1 added to their `gen_to`") against 13.2 / V7 ("placement members written while a candidate is
+  open stay visible"): a member written after the batch's P under a node the batch splits or merges away is in no new node. The
+  test with a split in the cycle showed it vanishing under every pinned task. The build retires only members the batch covered
+  (src_seq at most P, or no src_seq), leaves later members alone, and reads them through the forwarding record: the view shows a
+  pending member under the first successor of its old parent, and the next rebuild groups it under that successor. The earlier
+  generation's pinned tasks still see it under the old node.
 - Node pointers: a retained node document answers `ok`; once retention removed it an `xp:` record (ids only, class) gives `moved`
   with the forwarding ids of the first later generation that replaced it, else `expired`.
+
+## Verifier canary match threshold (DESIGN 14.7, 19; main-accepted reading ASSUMPTION, listed by the Step 14 owner)
+
+- The kNN probe of the independent verifier counts a hit as residue when the index's score is at least `(1 + 0.98) / 2 = 0.99`, that
+  is cosine 0.98 or more. The first draft required cosine 0.999. Measured on the test cluster (int8-quantised HNSW, cosine
+  similarity), a stored copy of the canary vector scored 1.0 in a fresh index and 0.9978 after merges and deletions had run, so
+  the strict threshold missed a leftover copy: a false "clean". Unrelated leaves of similar wording scored 0.50 to 0.57.
+- The threshold is a trade: lower catches more quantisation drift, higher misses fewer copies as clean but never reports an unrelated
+  leaf. The probe is one of six (text, kNN, get by id, lineage, authz, logs); the text, id and lineage probes do not depend on it.
+- Test: `test_a_near_miss_vector_below_the_threshold_is_not_residue_but_a_copy_is` (a vector at cosine 0.90 is not counted, the copy is).
