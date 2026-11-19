@@ -173,18 +173,24 @@ Each step: what, failing-first test, done when.
 
 - `gateway/`: local socket server, admission (bytes before parse, structure
   count, one semaphore around parse and dispatch, idle deadline, per-tenant
-  slots and queues, per-tenant stored-byte caps, a separate revoke lane),
+  slots and queues, a per-tenant open-connection cap (DESIGN 15), per-tenant
+  stored-byte caps, a separate revoke lane),
   sessions minted only by an identity adapter from a proof, session tokens
   carrying the tenant prefix, per-tenant `lc-<t>-authz` with HMAC principal
   tokens, the in-memory epoch table with its bounded per-tenant journal
-  (DESIGN 4.4), `es.py` reading key
+  (DESIGN 4.4; this step builds the table, the journal and its spare file
+  only: the durable start record, compaction, the clean stop and break-glass
+  recovery that DESIGN 4.4 requires are completed in Step 15, before any
+  tenant traffic outside tests), `es.py` reading key
   files by path, `indices.py` naming (including the per-class control index)
   and shard-budget check (DESIGN 6.4 formula), `validator.py` refusing
   documents without tenant, class or lineage; slow logs disabled on every
   index; no body logging.
 - `tools/provision_tenant.py` creates the tenant's indices, aliases, its
   registry row in `lc-sys-registry`, its tenant key owner, and API keys with no
-  cluster privilege (DESIGN 6.3).
+  cluster privilege (DESIGN 6.3), preallocates the tenant's journal file and
+  spare, and refuses the tenant if an atomic name exchange fails on the
+  journal directory (DESIGN 4.4).
 - Failing-first tests (security track begins): SEC-T1 (with the cluster
   APIs), T2, T3 (normalised bodies) on the fixture tenants; T5 flood probes
   including the disk-fill flood against the byte cap, in a short form (one
@@ -200,7 +206,8 @@ Each step: what, failing-first test, done when.
 
 - `ingest/`: segmentation (session and gap cuts, embedding valleys, hard cap
   with recursive split), subjects (identifier declarations), tombstone guard,
-  source append, projection (with the code-built leaf title, DESIGN 5.2),
+  source append, projection (with the code-built leaf title, DESIGN 5.2: the
+  top 4 tf-idf terms, leaving out every token that contains a digit),
   leaf head compare-and-set, dirty queue.
 - `embed/`: hashed stub.
 - Failing-first: the longest session in the dataset shape (a 78,000-character
@@ -209,7 +216,11 @@ Each step: what, failing-first test, done when.
   the same leaf; the same idempotency key with a different body is refused
   (broken: returns the first result); a projection without its source document
   is repaired; a bare-name match of an erased identifier is held, with the same
-  outcome a writer sees for any hold.
+  outcome a writer sees for any hold; a stored leaf whose top tf-idf terms
+  include a numeric date, an amount and an account code written with digits
+  gets a title with none of those tokens (broken: a title builder that keeps
+  tokens containing a digit); digit-free forms such as a month name may
+  remain (DESIGN INV-7, 20).
 
 ### Step 7: direct leaf search
 
@@ -253,20 +264,27 @@ Each step: what, failing-first test, done when.
 - `recall/fanout.py`, `holder.py`, `organise.py`, `digest.py`, `lookup.py`,
   `fusion.py`: all top holders asked in parallel, asynchronous expansion,
   budget, fallback on failure, organise step, digest with sizes and totals,
-  pointers only (pointer, title, size, path, reason, confidence; no gist or
-  fact, DESIGN INV-7), the title and reason schema (at most 12 words) and the
-  5-gram leak check on reasons, titles and outline labels,
+  pointers only (pointer, title, size, path, reason, confidence; no body,
+  gist or fact field, DESIGN INV-7, a field contract since review 3, F11),
+  code-built titles for every leaf and node (top 4 tf-idf terms, no token
+  containing a digit), the reason schema (at most 12 words) and the 5-gram
+  check on reasons and outline labels,
   chunked holder calls above `F_MAX` entries, pending members shown with a
   code-built title, `last_seen` never shown, the three-list RRF merge rule
   (EXPERIMENT 5.1), gateway-logged `opened`, typed resolution answers.
 - Failing-first: on the fixture, stub A1-tree-only recall@10 (no direct-search
   fusion) at least 0.80 and SHUFFLED-SUMMARIES at least 0.30 lower (the stub
-  gate in EXPERIMENT S0); a digest never contains a gist, a fact or leaf
-  text, including for a one-sentence leaf (broken: return the gist with the
-  pointer, which hands over the whole one-sentence leaf; SEC-A8 red); no
-  reason, title or outline label shares a 5-gram with the leaf text, facts or
-  gists it derives from (broken: reasons quoting child facts; a title copied
-  from the leaf's first sentence; SEC-A8 red); a
+  gate in EXPERIMENT S0); a digest never contains a body, gist or fact
+  field, including for a one-sentence leaf (broken: return the gist with the
+  pointer, which hands over the whole one-sentence leaf; SEC-A8 red); every
+  title in a digest equals the code-built title of its leaf or node (broken:
+  a model-written title copied from the leaf's first sentence; SEC-A8 red);
+  a leaf whose top tf-idf terms include a date, an amount and an account
+  code written with digits gets a digest title with none of those tokens
+  (digit-free forms such as a month name may remain, DESIGN INV-7, 20;
+  broken: a title that keeps tokens containing a digit; SEC-A8 red); no reason or outline label shares a
+  5-gram with the leaf text, facts or gists in its call's input (broken:
+  reasons quoting child facts; SEC-A8 red); a
   holder prompt never contains `last_seen` (assertion on the captured
   prompt); a node with 3 x `F_MAX` entries is asked in 3 chunks; a holder
   failure produces a flagged fallback, not an empty branch; an id not
@@ -345,7 +363,8 @@ Each step: what, failing-first test, done when.
   the advanced W with the failed node at its old version; the pending leaf
   drops out of tree-only recall); a leaf written during a rebuild is found by
   direct search immediately, by the tree as a pending member once P covers it,
-  and with a title (and, for holders, a gist) after the next batch.
+  with its code-built title from the start, and, for holders, with a gist
+  after the next batch.
 
 ### Step 14: erasure
 
@@ -357,9 +376,17 @@ Each step: what, failing-first test, done when.
   tagged with the new sequence; the boundary: tombstone appended to the
   per-tenant tombstone journal (`gateway/journal.py`: hash chain, fsync,
   replication to the second location), recorded in `ctl`, refreshed, and made
-  effective with its redact set in one in-memory step; the send hand-off's
-  tombstone re-check that aborts a response read before the boundary (DESIGN
-  4.4; the per-principal fence around the hand-off comes in Step 15); then
+  effective with its redact set in one in-memory step; the per-tenant send
+  fence (DESIGN 4.4; review 3, F7), built here because erasure needs it first:
+  every final send check (tombstone sequence and epoch) and its non-blocking
+  socket write under the shared side, each accepted connection's send buffer
+  set and its effective size checked at accept (64 KiB, ASSUMPTION), the publication step under the
+  exclusive side, no journal, disk or Elasticsearch I/O under either side,
+  the fence as the innermost lock (taken under the write gate, never the
+  reverse), the in-memory scopes and redact-set ids that the check compares
+  against, and the test hook that pauses a sender between its final check
+  and its socket write (Step 15 adds revoke's use of the exclusive side); a
+  response read before the boundary is aborted at its next hand-off; then
   key destruction,
   deletes, the log-row strip, rewrites and member and edge removal in every
   retained generation, purge (default and copy-and-swap), receipts with a
@@ -376,7 +403,9 @@ Each step: what, failing-first test, done when.
   by pausing the closure walk before an upper node reached only through
   transitive lineage; commits not held at the gate during the closure; a send
   hand-off without the tombstone re-check (a lookup read before the boundary
-  sent in full after it); a model-port wrapper keeping outputs in a file
+  sent in full after it); a send hand-off that does not hold the send fence,
+  with 8 concurrent senders paused after their final check (E8 (d): a paused
+  sender writes covered bytes after the boundary); a model-port wrapper keeping outputs in a file
   outside the indices (E1's data-root grep must find it); current
   generation only; key-only; raw-file grep of segments as verifier;
   string-search closure; closure without authz; reseal-before-quarantine; no
@@ -394,31 +423,53 @@ Each step: what, failing-first test, done when.
 - Revoke call on the gateway's in-memory epoch table (DESIGN 4.4, review 2,
   F9): denial in memory under the fence with no I/O inside it, return of
   `denied`, then the append and fsync to the tenant's bounded, preallocated
-  journal with `durable_at` reported separately, compaction by snapshot and
-  atomic rename, start and shutdown records, the fail-closed rule (journal
-  fault, `D_FSYNC` exceeded, or an incomplete journal at start closes the
-  tenant until its administrators re-establish grants through the
-  break-glass-opened administration path), and best-effort persistence to
+  journal with `durable_at` reported separately; a durable start record
+  before any of the tenant's requests is admitted (fsync of the journal file
+  and of its directory; review 3, F9); compaction in the order write the
+  spare file, fsync, exchange the two names atomically (tested at
+  provisioning, Step 5), fsync directory, with the new file carrying the
+  current start record and the old one left as the next spare; the clean
+  stop (admission and the revoke lane closed first, then the drain, then the
+  shutdown record, never written for a closed tenant); the fail-closed rule
+  (journal fault, `D_FSYNC` exceeded, or an incomplete journal at start
+  closes the tenant, across restarts, until explicit break-glass recovery:
+  the operator's call carries the principals of every revoke receipt without
+  `durable_at` and the administrators to reopen; the gateway journals and
+  fsyncs those revokes first, then admits grant calls only from the named
+  administrators, who re-grant, and writes a recovery record and a new
+  durable start record); the journal's I/O behind a thin layer that a
+  test can replace by the power-loss simulation of EXPERIMENT R7; and
+  best-effort persistence to
   `lc-<t>-authz`; revoke lane; epoch checks at admission
-  and at each fan-out wave; the per-principal send fence (non-blocking socket
-  writes under the shared side, writer-preferring exclusive side for revoke,
-  discard of unsent buffers); a test hook that injects a delay between the
-  final check and the hand-off; the two-administrator rule; no self-grant; the
+  and at each fan-out wave; revoke on the per-tenant send fence of Step 14
+  (its writer-preferring exclusive side for the epoch flip and the discard of
+  unsent buffers; one fence for revocation and erasure publication, DESIGN
+  4.4); Step 14's pause hook between the final check and the hand-off; the
+  two-administrator rule; no self-grant; the
   operator's break-glass revoke; class-grant removal as an epoch bump; tenant
   key owner rotation and invalidation (P15) and the gateway dropping its clients
   for a revoked tenant.
 - Failing-first: SEC-R1 to R7 and T7 with their broken controls, including: no
-  send fence with the injected delay (must fail deterministically); a socket
-  write inside the fence with a slow-reading client; revoke that requires the
+  send fence with the injected delay (must fail deterministically); a
+  blocking socket write inside the fence with a slow-reading client; revoke that requires the
   Elasticsearch write (with `lc-ta-authz` blocked, P14); revoke that waits for
   the journal fsync (over the bound with the fsync delayed); a journal error
   that does not close the tenant; a start that accepts a journal without a
-  shutdown record; compaction without the atomic rename; one journal shared by
-  all tenants; a shutdown record written before pending appends drain;
+  shutdown record; compaction in place instead of into the spare; one
+  journal shared by all tenants; a shutdown record written before pending
+  appends drain; a revoke lane left open during the clean-stop drain;
+  admission before the start record's fsync returns; a start record without
+  fsync (re-admission after a simulated power loss that follows a previous
+  clean shutdown); compaction that exchanges names before the file fsync,
+  skips the directory fsync, or drops the start record (the first two go red
+  only through R7's check of the journal-rebuilt table); a shutdown record
+  written for a fault-closed tenant; break-glass recovery that reopens every
+  administrator before re-applying the receipts' revokes;
   single-administrator revoke of a revoker; self-grant; class
   removal without an epoch bump; rotation that needs the bootstrap credential.
-  R7 runs on a small scratch filesystem for the out-of-space case and stops the
-  gateway abruptly at each persistence boundary.
+  R7 runs on a small scratch filesystem for the out-of-space case, stops the
+  gateway abruptly at each persistence boundary, and replays each simulated
+  power-loss point through the test I/O layer.
 
 ### Step 16: access-class non-interference suite
 
@@ -484,8 +535,9 @@ Each step: what, failing-first test, done when.
   candidate is adopted and the random-moves candidate rejected (the gate
   positive controls; broken: a gate that rejects everything must fail the
   oracle check); on the fixture stream,
-  LOOP repairs planted items in strata 2 and 3 and NO-AUDIT does not
-  (difference at least 0.25); decoys are repaired less than plants;
+  LOOP repairs planted items in strata 2 and 3 at least 0.25 more often
+  than NO-AUDIT (a fixture prediction; NO-AUDIT may still repair plants it
+  saw through pool (b) or an open, EXPERIMENT 6); decoys are repaired less than plants;
   RANDOM-FEEDBACK and SHUFFLED-LOG candidates are rejected; rollback restores
   the previous tree and edges exactly; a gate-only synthetic query never
   appears in the stored-query index.
@@ -502,8 +554,9 @@ Each step: what, failing-first test, done when.
   bounds, recurring workload and probe generation from question and answer
   only with the rank filter, the exposed flag, planting with donor-sibling
   metadata and the pinning hook, decoys, strata from A0 ranks at each
-  scheduled search's corpus prefix and their quotas, the offer audit and the
-  eligibility report (EXPERIMENT 3.6), fused final-list and tree-only recall,
+  scheduled search's corpus prefix and their quotas, fixed before any arm
+  runs, the descriptive offer audit and the eligibility report (EXPERIMENT
+  3.6), fused final-list and tree-only recall,
   bootstrap over recalls for the reader's count measures (EXPERIMENT 3.8),
   QUERY-MEMO, AGENTIC and AGENT-A0, `budget.py` (already written and run; it
   prints EXPERIMENT 10.3), result-file schema with the required fields. No
@@ -527,12 +580,14 @@ Each step: what, failing-first test, done when.
   can fail) and passes with lag; a stub opener that opens every pointer
   violates the opened-share bound; a plant ranked fourth at its source
   question's prefix and beyond 20 in the end pool lands in stratum 1 (broken:
-  end-pool ranks put it in stratum 2); a plant offered only through an
-  exploration slot before its repair is reclassified by the offer audit
-  (broken: audit over scheduled searches only); a plant at direct rank 30 of
-  its source question that only feeds the fused ranking and is never opened
-  is not reclassified (broken: an audit over every logged pointer empties
-  stratum 2); a result file missing a
+  end-pool ranks put it in stratum 2); the confirmatory H4 population (each
+  plant and its stratum) is identical in LOOP, FROZEN and NO-AUDIT and equals
+  the prefix selection written before any arm ran, also when one arm's logs
+  show a plant offered through an exploration slot or the direct section
+  (review 3, F2; broken: a population builder that reads arm logs and drops
+  exposed plants from one arm's population); the descriptive offer audit
+  reports a plant offered only through an exploration slot (broken: audit
+  over scheduled searches only); a result file missing a
   required field is refused; on the fixture, with a perfect memo list (the
   gold session first) while the tree, direct and linked lists all miss the
   gold and share no item with each other (so no item outranks the memo's
@@ -573,7 +628,8 @@ structures; the proxy world is needed only by S4a and S4b.
     about 190 erasures with purge (E1 to E4 and E9, 3 runs each, plus E8),
     each waiting 22 to 30 s for retention leases (LAB), about 1.5 hours; the
     E7 scale test (a 1,000,000-document tenant with stub embeddings), about 1
-    to 2 hours; R1 to R7 with their trials and restarts, about 1 hour; the rest
+    to 2 hours; R1 to R7 with their trials, restarts and simulated power
+    losses, about 1 to 1.5 hours; the rest
     (T1 to T4, T6, T7, A1 to A8, V1 to V7, the stub loop gates) about 1 to 2
     hours. Resumable per probe: a probe that has passed on this commit is not
     re-run after an interruption.

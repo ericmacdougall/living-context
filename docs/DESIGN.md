@@ -1,11 +1,14 @@
 # living-context: design
 
-Status: design of record for the first build, revised twice after
+Status: design of record for the first build, revised three times after
 adversarial reviews (first review: findings F1 to F21, M1 to M5, cited as
 "review F<n>"; second review: findings F1 to F14, cited as "review 2, F<n>";
-EXPERIMENT.md section 13 maps each to its fix). The second revision removed
-mechanism where it could (the evaluation cache, the betting confidence
-sequence, gists in returned pointers). Nothing below has been run.
+third review: open findings F2, F7, F9, F11, F15, cited as "review 3,
+F<n>"; EXPERIMENT.md section 13 maps each to its fix). The second revision
+removed mechanism where it could (the evaluation cache, the betting
+confidence sequence, gists in returned pointers); the third replaced the
+per-principal send fence by one per-tenant fence and model-written titles
+by code-built ones. Nothing below has been run.
 Every claim about behaviour is a target until the experiment in
 [EXPERIMENT.md](EXPERIMENT.md) or a probe in [BUILD-PLAN.md](BUILD-PLAN.md)
 records it.
@@ -130,23 +133,40 @@ https://arxiv.org/html/2410.14052v3), is also COMPARISON only (arm C2).
 - INV-6 Immutable versions. Leaf versions, node versions, edge versions and
   manifests are never edited, with one sanctioned exception: an erasure
   rewrite (section 14.4), which is recorded.
-- INV-7 Pointers only. A returned pointer carries the pointer, a title, the
-  size, the holder path, a reason and a confidence, nothing else: no gist, no
-  fact, no leaf text (review 2, F11). Titles and reasons are at most 12 words,
-  and every title, reason and organise outline label shares no 5-gram with the
-  leaf text, facts or gists it derives from (8.2, 8.3). Gists and facts stay
-  inside holders, which see their children's entries. Content is reached only
-  by a logged lookup. Remaining limit: a very short leaf (a few words) can be
-  guessed from its title (20).
+- INV-7 Pointers carry no content field (review 2, F11; review 3, F11). A
+  returned pointer, and every entry of the digest, carries the pointer, a
+  title, the size, the holder path, a reason and a confidence, nothing else:
+  no body (leaf text), gist or fact field is ever copied into it. Every title
+  is code-built (5.2, 8.2): the top 4 tf-idf terms of the leaf's text, or of
+  a node's summary, leaving out every token that contains a digit
+  (ASSUMPTION; so numeric dates, amounts, identifiers and codes never reach a
+  title, while digit-free forms, such as a month name, a spelled-out number
+  or an alphabetic code, can, 20).
+  Reasons and organise outline labels are bounded: at most 12 words, sharing
+  no 5-gram with the leaf text, facts or gists in the call's input (8.2,
+  8.3). Gists and facts stay inside holders, which see their children's
+  entries. Leaf text is served only by a logged `lookup` or `ask`. This is a
+  field contract, enforced by code and tested by SEC-A8; it is not a promise
+  of semantic non-disclosure: titles, reasons and labels are descriptors
+  derived from content, and a descriptor can convey an answer (20). So
+  `opened` records lookups, not use: an item that was not opened may still
+  have been used, and "not opened" is never counted as evidence of
+  irrelevance by itself (9). Reading the owner's "pure reference pointers"
+  together with "a tight summary" this way is an ASSUMPTION about the
+  owner's intent (EXPERIMENT 12, X9).
 - INV-8 Tombstones are honoured by every path that can write, rebuild,
   replay, restore or re-ingest, through one shared guard (LAB-R4). Tombstones
   live in a journal outside the snapshot timeline as well as in the store, so
   no restore can predate them (14.6).
 - INV-9 No principal's request is cancelled, blocked or terminated because of
-  another principal's request, with two exceptions: revoking a principal
-  discards that principal's own unsent output; and an erasure's publication
-  step holds its own tenant's write gate, which delays (never refuses) that
-  tenant's commits for at most `B_ERASE` (14.3; never another tenant's).
+  another principal's request, with three exceptions: revoking a principal
+  discards that principal's own unsent output; an erasure's closure and
+  publication hold its own tenant's write gate, which delays (never refuses)
+  that tenant's commits for at most `B_ERASE` (14.3; never another tenant's);
+  and a revoke or an erasure's publication step holds the exclusive side of
+  its own tenant's send fence for one in-memory step, which delays (never
+  refuses) that tenant's send hand-offs by the gateway's own code time
+  (target under 1 ms; 4.4).
   Revocation never waits on, and
   never depends on, any action of the revoked party; it is one fixed statement
   on a table the gateway owns (4.4; LAB-R2, LAB-R3).
@@ -205,7 +225,8 @@ These are woven through the data model (5), both paths (7, 8) and the loop
   memory denies; durability in a bounded per-tenant local journal is reported
   separately, and a journal failure closes that tenant; persisted to
   Elasticsearch best-effort), checked at every request, every
-  fan-out wave and under a send fence before every hand-off to the socket, on a
+  fan-out wave and under the tenant's send fence (shared with erasure
+  publication) before every hand-off to the socket, on a
   reserved admission lane; an operator break-glass revoke; two administrators to
   revoke an administrator or revoker; no self-grant; class-grant removal bumps
   the epoch; tenant keys invalidated by a tenant key owner for tenant-wide
@@ -220,7 +241,8 @@ These are woven through the data model (5), both paths (7, 8) and the loop
   the artefact itself, written atomically with it (INV-4, 5).
 - Erasing a subject or item: under the tenant's write gate, compute the full
   closure, then publish the tombstone and the complete redact set together in
-  one step (the erasure boundary, within `B_ERASE` of the request); then key
+  one in-memory step under the tenant's send fence, so no send check can
+  straddle it (the erasure boundary, within `B_ERASE` of the request); then key
   destruction, deletion, in-code rewrite of every affected node in every
   retained generation, purge, verification with a positive control, receipt
   (14). "Erased" is promised from the boundary, not from the request. It
@@ -370,7 +392,7 @@ atomic with the send.
 
 - The epoch table is the gateway's own. Each (tenant, principal) has an
   authority epoch held in gateway memory. `revoke` is one gateway call that,
-  under the exclusive side of that principal's send fence, increments the epoch,
+  under the exclusive side of the tenant's send fence (below), increments the epoch,
   sets status revoked and discards the principal's gateway-owned unsent
   buffers, all in memory; it then releases the fence and returns `denied`
   (review 2, F9). No revocation or send fence is held across any disk or
@@ -387,50 +409,115 @@ atomic with the send.
   stage.
 - The epoch journal is bounded (review 2, F9). The epoch state is a small map
   (principal token to epoch and status; at most `N_PRINCIPALS = 10,000` per
-  tenant, ASSUMPTION), so each tenant has one preallocated journal file of
-  fixed size (`J_SIZE = 4 MiB`, ASSUMPTION, allocated at provisioning, so
-  another tenant filling the disk cannot take its space): a snapshot of the
-  map followed by checksummed change records. When the records fill half the
-  file, compaction writes a fresh snapshot into a second preallocated file,
-  fsyncs it and renames it over the first; the file never grows. The gateway
-  appends a start record when it opens the journal and, on a clean stop, a
-  shutdown record written only after every pending append and fsync has
-  completed; a stop that cannot drain them within `D_FSYNC` writes no
-  shutdown record, so the tenant is closed on start.
+  tenant, ASSUMPTION), so each tenant has a preallocated journal file of
+  fixed size and a spare of the same size for compaction (`J_SIZE = 4 MiB`
+  each, ASSUMPTION, both allocated at provisioning, so another tenant filling
+  the disk cannot take their space): a snapshot of the map followed by
+  checksummed change records. Start (review 3, F9): before
+  admitting any request of the tenant, the gateway appends a start record and
+  makes it durable, by an fsync of the journal file and then of its
+  directory; no request of that tenant is admitted until both have returned,
+  and a failure is a journal fault. Compaction (review 3, F9): when the
+  records fill half the file, the gateway writes a fresh snapshot of the map,
+  followed by a copy of the current start record, into the tenant's second
+  preallocated file (the spare), fsyncs that file, swaps the two file names
+  by one atomic exchange (`renameat2` with `RENAME_EXCHANGE` on Linux,
+  `renamex_np` with `RENAME_SWAP` on macOS; ASSUMPTION: the journal's
+  filesystem supports it; provisioning tests it on the journal directory and
+  refuses the tenant otherwise), and fsyncs the
+  directory, in that order; appends wait in memory meanwhile and count
+  against `D_FSYNC`; a failure at any step is a journal fault. The exchange
+  leaves the old file in place as the next spare, so after provisioning no
+  journal space is ever freed or allocated (a rename over the first file
+  would free its space, which another tenant's growth could take before a
+  new spare was allocated). The files never grow. Clean stop: the gateway
+  first closes the tenant's admission, the revoke lane included (a revoke
+  arriving after that is refused with a typed retryable failure, never
+  answered `denied`, so its revoker re-issues it after the restart), then
+  drains every pending append and fsync, and only then writes and fsyncs a
+  shutdown record, and only for a tenant that is not closed; a stop that
+  cannot drain within `D_FSYNC` writes no shutdown record, so the tenant is
+  closed on start.
 - Fail closed. A tenant is closed (every principal of the tenant denied) when
   an append or fsync of its journal fails (no space, I/O error) or does not
   complete within `D_FSYNC = 2 s` (ASSUMPTION), or when on start its journal is
   incomplete: a torn or checksum-failing record, a half-written compaction, or
   no shutdown record after the last start record, which is what any crash
-  leaves. So a crash between denial in memory and the append cannot quietly
-  re-admit a revoked principal. A closed tenant stays closed until a tenant
-  administrator re-establishes grants: the operator's break-glass call reopens
-  the closed tenant to its administrators' grant calls only, and they re-grant
-  or confirm every other principal. Other tenants are unaffected (their
-  journals are separate files). The operational cost, every tenant closed
+  leaves. Because the start record is durable before any request is
+  admitted, this holds after a power loss too: a run that admitted anything
+  always leaves a durable start record with no shutdown after it, so a power
+  loss between a denial in memory and its fsync cannot leave the previous
+  run's clean shutdown as the last durable record (review 3, F9). So a crash
+  or power loss between denial in memory and the append leaves the tenant
+  closed instead of quietly re-admitting a revoked principal. A closed tenant
+  stays closed, across any number of restarts, until explicit break-glass
+  recovery: no shutdown record is ever written for a closed tenant, so its
+  journal never ends clean. A revoke that was denied in memory but never
+  became durable is known only from its receipt, which the revoking
+  administrator or tool keeps until `durable_at` (above). So the operator's
+  break-glass recovery call carries (a) the principals of every receipt that
+  lacks `durable_at` and (b) the administrators to reopen, none of whom may
+  be in (a) or revoked in the rebuilt table. The gateway rebuilds the table
+  from the durable journal and `lc-<t>-authz` (higher epoch wins), appends
+  and fsyncs the revokes of (a) before anything else, and only then reopens
+  grant calls, to the administrators of (b) and to no other principal; they
+  re-grant or confirm every other principal; the gateway then appends a
+  recovery record and a new durable start record and admits the tenant's
+  other principals. A power loss at any point of recovery leaves the tenant
+  closed (no shutdown record follows its last start record), and recovery
+  starts again. A revoke whose receipt was lost as well cannot be re-applied:
+  a stated limit (20). Other tenants are unaffected (their journals are
+  separate files). The operational cost, every tenant closed
   after an unclean gateway restart, is a stated limit (20). On a complete
   journal, the gateway rebuilds the table from the journal and from
   `lc-<t>-authz`, taking the higher epoch of the two.
-- Send fence, per principal (review F14b). Every hand-off of response bytes to
-  the kernel takes the shared side of the principal's fence, re-checks the
-  epoch and, for a response that read tenant content, the tenant's published
-  tombstone sequence (if an erasure boundary published after the response's
-  reads covers any item the response carries, 14.3, the response is aborted:
-  its unsent bytes are discarded and the request ends with a typed failure,
+- Send fence, one per tenant, serving both revocation and erasure publication
+  (review F14b; review 3, F7: the previous revision fenced sends per principal
+  while erasure published under the write gate, which senders do not hold, so
+  a sender that had checked the tombstone sequence could write after the
+  boundary). The fence is a readers-writer lock in gateway memory. Every
+  hand-off of response bytes to the kernel takes its shared side and, while
+  holding it, re-checks the principal's epoch and, for a response that read
+  tenant content, the tenant's published tombstone sequence: if a boundary
+  published after the response's reads covers any item the response carries
+  (an in-memory comparison of the leaf ids, node versions and subject tokens
+  the response recorded at read time with the scopes and redact-set ids of
+  the tombstones published since; 5.9, 14.3), the response is aborted: its
+  unsent bytes are discarded and the request ends with a typed failure,
   counted, INV-11, which the client may re-issue; a boundary that covers
   nothing in the response, such as one in a class outside the reader's read
-  set, changes nothing), and makes one non-blocking socket write; whatever the kernel does not
-  accept stays in a gateway-owned buffer and is sent by later hand-offs, each
-  with the same check. No blocking I/O happens under the fence, so a slow or
-  stalled reader cannot hold it; its duration is bounded by the gateway's own
-  code (target under 1 ms), not by the peer. `revoke` takes the exclusive side
-  (writer-preferring, so new hand-offs cannot starve it), flips the epoch,
-  discards that principal's gateway-owned unsent buffers, releases the fence
-  and only then closes its connections. Consequence: after the flip, no byte of any response is handed
-  to the kernel for the revoked principal; bytes handed over before the flip
-  (at most the socket send buffer, set to 64 KiB, ASSUMPTION) may still arrive.
-  A test hook injects a delay between the epoch check and the hand-off, so the
-  broken variant without the fence fails deterministically (EXPERIMENT 9.3 R1).
+  set, changes nothing. Still holding the shared side, it makes one
+  non-blocking socket write; whatever the kernel does not accept stays in a
+  gateway-owned buffer and is sent by later hand-offs, each with the same
+  check under the fence. The exclusive side (writer-preferring, so new
+  hand-offs cannot starve it) is taken for two in-memory steps only: `revoke`
+  (flip the epoch, discard that principal's gateway-owned unsent buffers;
+  its connections are closed after the fence is released) and an erasure's
+  publication step (advance the published tombstone sequence, 14.3 step 3).
+  No journal, disk, Elasticsearch or blocking socket I/O is done while either
+  side is held, so a slow or stalled reader cannot hold the fence; its
+  duration is bounded by the gateway's own code (target under 1 ms), not by
+  any peer. Lock order: the fence is the innermost lock. A thread may take it
+  while holding the tenant's write gate (only the erasure publication step
+  does); no thread takes the write gate, or any other lock, while holding the
+  fence. Because one fence serves both uses, there is no second fence to
+  order. Consequence: a hand-off's check and its write are atomic with
+  respect to an epoch flip and to an erasure boundary. After either, no byte
+  of a revoked principal's response or of a covered response is handed to
+  the kernel; only bytes handed to the kernel before it may still reach the
+  peer. Those the kernel still holds for the connection at the flip or
+  boundary (its output queue, which the gateway reads) are at most the
+  connection's send buffer, which the gateway sets on every accepted
+  connection (`SO_SNDBUF`) so that the effective size the kernel reports is
+  at most 64 KiB, and checks at accept (ASSUMPTION), so at most the tenant's
+  open-connection cap (15) times 64 KiB in aggregate. On a TCP connection,
+  bytes already moved into the peer's receive buffer before the flip or
+  boundary are outside this bound and the peer may read them later, so the
+  bound is measured at the gateway (its hand-off trace and each connection's
+  output queue at the flip or boundary), not at the peer. A test hook pauses a
+  sender after its final check and before its socket write, so the broken
+  variant whose hand-off does not hold the fence fails deterministically
+  (EXPERIMENT 9.3 R1, 9.4 E8).
 - Checks: every gateway request at admission, every fan-out wave, and every
   hand-off under the fence read the epoch from the in-memory table.
 - The revoked principal has no write path to the epoch table or to
@@ -525,9 +612,9 @@ later shapes (an artefact whose `lin_queries` or `evidence` names it).
   The cap is never exceeded (section 7.2).
 - `_id = leaf_id:lv`. `leaf_id` is 128 random bits, stable for life, never
   reused. `lv` is an integer version.
-- Fields: plaintext `text` (english analyser), `title` (the code-built title,
-  the leaf's top 4 tf-idf terms, set at store, 7.4; it cannot contain a
-  5-gram of the text, 8.2), `entities` keyword[],
+- Fields: plaintext `text` (english analyser), `title` (the code-built title
+  of INV-7: the leaf's top 4 tf-idf terms, leaving out every token that
+  contains a digit, set at store, 7.4), `entities` keyword[],
   `size_tokens`, `embedding` dense_vector (384 dims, cosine, `index_options`
   pinned to `int8_hnsw`; SOURCE: dense-vector reference says `bbq_disk`
   needs Enterprise, so never rely on the default), `embed_model` (id and
@@ -739,7 +826,8 @@ later shapes (an artefact whose `lin_queries` or `evidence` names it).
   `lc-<t>-ctl` (they hold ids and HMACs, no class and no content), are
   appended to the tenant's tombstone journal at the erasure boundary (14.3,
   14.6), and are held in gateway memory for the guard (loaded from the journal
-  at start).
+  at start), together with the redact-set node ids of each tombstone until
+  they are cleared (14.3 step 7), so the send check of 4.4 needs no I/O.
 
 ### 5.10 Authz indices (`lc-<t>-authz`) and the tenant registry (`lc-sys-registry`)
 
@@ -967,9 +1055,10 @@ with expiry) so one builder runs at a time.
    generation's W is that P (5.6).
 2. For each level-1 node with pending members: one build call over the full
    text of its new children (at most `F_MAX` leaves, about 18k to 37k tokens)
-   returns, for each new child, a title (at most 12 words, checked against
-   the leaf text as in 8.2), a one- or two-line gist, entities and up to three
-   verbatim facts (gists and facts are for holders only, INV-7); the node summary is refreshed when it has 4 or
+   returns, for each new child, a one- or two-line gist, entities and up to
+   three verbatim facts (holder input only, INV-7); the child's title is its
+   code-built leaf title (5.2), never written by the model (review 3, F11);
+   the node summary is refreshed when it has 4 or
    more new children or its size changed by 25% or more (ASSUMPTION; SOURCE
    pattern: update only the ancestor path, HLTM,
    https://arxiv.org/html/2604.26197v1). Otherwise the node gets a new version
@@ -981,7 +1070,7 @@ with expiry) so one builder runs at a time.
    get G+1 added to their `gen_to`; members of the new nodes are written with
    `gen_from` = G+1 (5.3).
 4. Propagate new versions up the ancestor path (path copying), each new
-   node version's title built and checked as in 8.2; apply the
+   node version's title code-built from its summary (INV-7, 8.2); apply the
    index-of-indexes rule at the top.
 5. Write the manifest for G+1 (status building), refresh the indices written
    (searchable publication, 5.6), then compare-and-set the head from G to
@@ -1001,7 +1090,7 @@ later. The members stay pending (their `src_seq` is above the live W), so
 holders still see them as pending entries and tree-only recall still reaches
 them; the direct search finds them as before. Failures are counted (INV-11).
 A node whose build keeps failing therefore holds W back for its class: the
-tree stays complete but its titles and gists stay stale (limit, 20).
+tree stays complete but its gists and summaries stay stale (limit, 20).
 
 ### 7.7 Link creation on write (OWNER "relational cross linking";
 "run background searches ... while doing memory addition/updates")
@@ -1045,21 +1134,20 @@ All three touch only indices of classes in the read set (INV-2).
 - Reasons (review F11): at most 12 words by schema. A reason that shares any
   5-gram (after lowercasing and tokenising) with the facts, gists or leaf text
   in that holder's input is dropped and counted as a typed reason failure; the
-  selection itself stands. Titles get the same check when they are built
-  (7.6): a title is at most 12 words and shares no 5-gram with its leaf's
-  text; a title that fails is replaced by the code-built title (the leaf's
-  top 4 tf-idf terms, which cannot contain a 5-gram) and counted (review 2,
-  F11). This covers every title a node holds for a child, leaf or node, at
-  every level (7.6 steps 2 and 4), checked against the leaf text, facts and
-  gists the child derives from; a leaf's own stored `title` (5.2) is the
-  code-built title. Gists and facts are holder input only; they are never copied into
-  what a holder returns. So leaf sentences cannot travel up the tree without
-  a logged lookup (INV-7).
+  selection itself stands. Titles are never written by a model (review 3,
+  F11): every title in a child entry, a pointer or the digest is code-built
+  (INV-7): for a leaf, its stored `title` (5.2); for a node, the top 4 tf-idf
+  terms of its summary, set when the node version is built (7.6); in both
+  cases every token that contains a digit is left out, so a title has fewer
+  than 4 terms, or none, when the text has fewer such terms (ASSUMPTION).
+  Gists and facts are holder input only; they are never copied into what a
+  holder returns. So no body, gist or fact field travels up the tree; titles
+  and reasons are descriptors, and a descriptor can still convey an answer
+  (INV-7, 20).
 - Pending members (placed since the last batch: `src_seq` above W of the
-  pinned generation and at most the pinned P, so without a title or gist yet;
-  review M1) are shown to holders as entries with a code-built title (the
-  leaf's top 4 tf-idf terms, which cannot contain a 5-gram), its size, and the
-  flag `pending`; no gist and no facts.
+  pinned generation and at most the pinned P, so without a gist yet;
+  review M1) are shown to holders as entries with their stored code-built
+  title (5.2), their size, and the flag `pending`; no gist and no facts.
 - A node with more child entries than fit `H_CTX` (for example many pending
   members between rebuilds, or a node over `F_MAX` awaiting a split) is asked
   in chunks of at most `F_MAX` entries, in parallel; the chunks' answers are
@@ -1086,7 +1174,8 @@ All three touch only indices of classes in the read set (INV-2).
   originating agent can explore them later. This is a safety budget, not a
   change to the method; reaching it is logged. Cost estimates in
   EXPERIMENT.md use 25 to 60 model calls per recall on development pools
-  (about 10 top-level holders) and 50 to 77 on the whole pool (about 29).
+  (about 10 top-level holders), 35 to 70 on the E2b pools and 50 to 77 on
+  the whole pool (about 29) (EXPERIMENT 10.1).
 - Prompt injection inside a child entry can only bias selection among the
   children shown, all of which the reader may already see; the holder has no
   tool and cannot fetch anything.
@@ -1104,10 +1193,12 @@ All three touch only indices of classes in the read set (INV-2).
   a failing label is replaced by the holder path and counted.
   A holder with a single non-empty child passes its result up unchanged
   (ASSUMPTION, to save calls; ablation "organise at every parent").
-- What travels up is pure reference: pointer, title, size, the path of
-  holder ids, reasons (checked as in 8.2) and confidences. No gist, fact or
-  leaf text leaves the holder (review 2, F11: a one-sentence leaf's gist is the
-  whole leaf, so returning gists would hand over content without a lookup).
+- What travels up is the pointer fields of INV-7: pointer, code-built title,
+  size, the path of holder ids, reasons (bounded as in 8.2) and confidences.
+  No body, gist or fact field leaves the holder (review 2, F11: a
+  one-sentence leaf's gist is the whole leaf, so returning gists would hand
+  over content without a lookup). Descriptors can still convey an answer
+  (INV-7, 20).
 - Sizes, totals and counts are computed over what was presented to that
   holder, which is already trimmed to the reader's classes (INV-2). No "N
   hidden items" figure exists anywhere.
@@ -1119,9 +1210,9 @@ pointer list in rank order (each pointer with the fields of INV-7 only:
 pointer, title, size, path, reason, confidence), sizes and the total, node
 pointers for unopened branches (with the node's title from its parent's
 child entry, its size and total), the pinned generations, and a section per
-source (tree, direct search, linked). Pointers from the direct and linked
-sources carry the leaf's stored title, never its text; a leaf that the tree
-also offered shows the tree's child title. Rank order (pre-registered in EXPERIMENT 5.1; review F9):
+source (tree, direct search, linked). Every leaf pointer carries the leaf's
+stored code-built title (INV-7), whichever source offered it, never its
+text. Rank order (pre-registered in EXPERIMENT 5.1; review F9):
 the tree list (holder confidence, then shallower depth, then path order), the
 direct list (8.5) and the linked list (8.6, by edge score) are each cut at 50
 and fused by client-side RRF with k = 60, ties broken by a salted hash of the
@@ -1194,7 +1285,7 @@ the `linked` section, tagged `edge`.
 | Errors | one typed `unavailable` for forbidden, erased, relabelled away and missing |
 | Logs and notes | log rows and notes take the join class (INV-3), so a low-class reorganiser never sees a high-class query |
 | Model cache | entry class = join of prompt and inputs; prompt-bearing entries scoped per principal, so neither content nor cache-hit timing crosses classes or principals (5.8) |
-| Holder reasons, titles, outline labels | no gist or fact is returned; titles and reasons at most 12 words; none shares a 5-gram with the leaf text, facts or gists it derives from (8.2, 8.3); a very short leaf can still be guessed from its title (20) |
+| Holder reasons, titles, outline labels | field contract (INV-7): no body, gist or fact field is returned; titles are code-built (4 tf-idf terms, no token containing a digit); reasons and labels at most 12 words and sharing no 5-gram with the call's input (8.2, 8.3); these are descriptors of the reader's own classes and can still convey an answer about them (20) |
 | Receipts | an erasure requester sees totals over its own read set only (4.3) |
 | Cluster-level APIs | no gateway or tenant key has a cluster privilege (6.3) |
 | Elasticsearch and gateway log files | no request bodies, slow logs off, grepped by the verifier (6.5, 14.7) |
@@ -1227,11 +1318,18 @@ mentions, and the offered item's subjects; 5), lin_leaves`.
   share near 0 leaves the strongest signal empty, and a share near 1 (an actor
   that opens or `ask`s everything) turns `opened` back into the exposure-biased
   co-offer signal of 11.1. EXPERIMENT 3.8 pre-registers bounds of 0.05 to
-  0.60.
+  0.60. `opened` records lookups, not use (review 3, F11): a title or reason
+  can convey an answer (INV-7, 20), so an offered item that was not opened
+  may still have been used, and "not opened" is never counted as evidence
+  of irrelevance by itself; `used_behavioural` is the signal that can see use
+  without a lookup.
 - `used_behavioural` comes from a sampled counterfactual: re-run the answer
   step with the item removed; if the answer or action changes, the item was
   used (SOURCE idea: Auto-Dreamer's masking reward,
-  https://www.alphaxiv.org/abs/2605.20616.md; sampling rate ASSUMPTION).
+  https://www.alphaxiv.org/abs/2605.20616.md; sampling rate ASSUMPTION). The
+  sample is drawn from every offered row of the sampled recalls, opened or
+  not (removing an item removes its pointer and descriptor too), so an item
+  used only through its descriptor can be seen.
 - `propensity` is the probability that the item was shown under the logging
   policy: 1 for deterministic offers, `epsilon / n` for exploration slots
   (SOURCE: IPS needs logged propensities, https://arxiv.org/html/1608.04468).
@@ -1240,8 +1338,9 @@ mentions, and the offered item's subjects; 5), lin_leaves`.
   the ranked list, pre-registered) is filled at random from low-exposure and
   recently reorganised leaves of the reader's classes, excluding leaves
   inserted in the last `L` insert batches (so new leaves are not favoured by
-  being new; review F5), so examination propensity per slot can be measured
-  instead of assumed.
+  being new; review F5), so the offer propensity of every slot is known and
+  how often each slot is opened can be measured instead of assumed (an open
+  is a lookup; it does not measure whether a descriptor was read or used).
 - A row is written for every digest returned, but the digest never waits for
   it: if the write fails, or the gateway stops before it, the digest stands
   and the failure is counted (ASSUMPTION: availability over completeness of
@@ -1271,6 +1370,8 @@ additions.
 3. Output: notes "relevant (label >= 2) and tree_missed" with the reason the
    structure missed it (wrong branch, holder declined, not reached within
    budget), reinforcement for offered-and-opened items, and candidate edges.
+   An offered item that was not opened gets no negative note: its descriptor
+   may have answered the question (INV-7, 9).
    Notes carry lineage (including the query's subject tokens, 9) and the join
    class.
    - "Never offered" is defined per source (review F2): `tree_missed` = judged
@@ -1298,6 +1399,7 @@ The judge is validated before its labels drive anything (EXPERIMENT 8.2).
 | Reverse-audit misses | section 12 | strong |
 | Edge strength | typed weights, refreshed by confirmations | medium |
 | Co-retrieval without opening | log | not used for strengthening (it is the exposure-biased signal; SOURCE note on HeLa-Mem's co-activation) |
+| Offered but not opened | log | never a negative signal by itself: a title or reason can convey an answer, so not opening is not irrelevance (INV-7, 9) |
 | Agent's cited use | `used_cited` | not used alone |
 
 Offer counts are IPS-weighted with clipped propensities (floor 0.05,
@@ -1385,8 +1487,10 @@ The steps per audited leaf:
 Pruning rules (SOURCE: research recommendation; never delete for low usage,
 because low exposure is the bias being repaired): archive a leaf (cold tier,
 still directly searchable and still erasable) only if it was offered at a fair
-rate to queries it was relevant to and was not opened or used, or if it is
-superseded; never archive a leaf with high judged relevance and low offers,
+rate to queries it was relevant to, was not opened, and the counterfactual
+use sample (`used_behavioural`, 9) included it and found it unused, or if it
+is superseded; not being opened alone never archives a leaf, because its
+title or reason may have been what the reader used (INV-7, 20); never archive a leaf with high judged relevance and low offers,
 unique content, or a legal hold. Archiving changes the tree in a new
 generation; it never deletes the source.
 
@@ -1454,8 +1558,8 @@ the method.
    current generation. Clusters, the statistical unit (review 2, F12): one
    cluster per operation of the candidate (a move, an added membership, a
    re-summary, a split or merge, an edge change), holding every replay query
-   generated from a leaf that operation changed (its membership, its title or
-   gist, or the summary of a node on its path) and every held-out search whose
+   generated from a leaf that operation changed (its membership, its child
+   entry, or the summary of a node on its path) and every held-out search whose
    judged-relevant items include such a leaf; operations that share a replay
    query are merged into one cluster, so dependent queries stay together.
    The 60 queries are spread over as many clusters as possible (one query per
@@ -1497,7 +1601,14 @@ the method.
    query by the sign of its difference keeps the exact count small; raw
    fractional differences made one exact evaluation take up to 100 s in a
    trial. Null coverage and power are simulated in EXPERIMENT 7.3
-   (`evalkit/gate_power.py`).
+   (`evalkit/gate_power.py`). What the gate is (review 3): an inspectable
+   heuristic, not a 5% false-adoption guarantee; neither its p-value nor the
+   RANDOM-FEEDBACK control is ever cited as proof of a bounded
+   false-adoption rate. Sign scoring measures how often clusters improve,
+   not by how much, so frequent tiny gains can outweigh rare large losses in
+   the gate while mean recall falls; the experiment's H3 and H4 outcomes
+   therefore rest only on their independent forward and held-back measures
+   (EXPERIMENT 2.2, 7.3), never on the gate's statistics.
 5. Adoption = compare-and-set of the head; rollback = compare-and-set back to
    the previous generation, which is retained; by the visibility rule (13.2) the
    rollback also hides the candidate's members and edges.
@@ -1596,10 +1707,14 @@ from it, not from the request.
    above the published sequence).
 3. Boundary, one publication step: append tombstone s (scope, erased
    identifier HMACs, erased edge versions) to the tenant's tombstone journal
-   (fsync, replicated; 14.6), record it in `lc-<t>-ctl`, refresh, then advance
-   the gateway's in-memory published tombstone sequence to s. That single
-   in-memory step makes the tombstone and its complete redact set effective
-   together; the gate is then released. From the boundary: the shared guard
+   (fsync, replicated; 14.6), record it in `lc-<t>-ctl`, refresh, and load
+   its scope and redact-set node ids into gateway memory (inactive while
+   above the published sequence); then, holding the exclusive side of the
+   tenant's send fence (4.4) for this in-memory step only, advance the
+   gateway's in-memory published tombstone sequence to s. That single step
+   makes the tombstone and its complete redact set effective together, and
+   no send check and its write can straddle it (review 3, F7); the fence and
+   then the gate are released. From the boundary: the shared guard
    refuses re-ingest, lookup, rebuild, restore and replay of the scope (INV-8);
    search results are post-checked against the gateway's in-memory tombstone
    table (a post-check for erasure only; access is still trimmed before
@@ -1689,9 +1804,12 @@ Erasable indices stay live, so:
   `B_ERASE = 60 s` (14.3); from the boundary, erased content is served by no
   read path (guard, in-memory tombstone post-check, redact set), and a
   response whose reads preceded the boundary and that carries an item the
-  boundary covers is aborted at its next hand-off (4.4), so only bytes handed to the kernel by a hand-off whose check
-  preceded the boundary (at most the socket send buffer, 64 KiB) may still
-  arrive; physical purge
+  boundary covers is aborted at its next hand-off (4.4), whose check and
+  write are atomic with the boundary under the tenant's send fence, so only
+  bytes handed to the kernel before the boundary may still reach the peer;
+  those the kernel still holds for a connection at the boundary are at most
+  64 KiB per connection, and the tenant's open-connection cap
+  times 64 KiB in aggregate, measured at the gateway (4.4); physical purge
   within `P_PURGE = 1 hour` of the boundary (ASSUMPTION); keystore backup copies of destroyed keys age out
   within `R_KEYS = 35 days` (ASSUMPTION), stated in every receipt.
 
@@ -1772,9 +1890,11 @@ ciphertext and its keys with no tombstone to re-apply.
 
 ## 15. Availability isolation
 
-- Gateway admission caps per tenant: concurrent requests, bytes in flight,
-  queue length, idle deadline, model-call concurrency and a model-call budget
-  per tenant per hour (ASSUMPTION values in config).
+- Gateway admission caps per tenant: open connections (which also bounds the
+  aggregate of 4.4's per-connection send-buffer residual), concurrent
+  requests, bytes in flight, queue length, idle deadline, model-call
+  concurrency and a model-call budget per tenant per hour (ASSUMPTION values
+  in config).
 - Background jobs run in per-tenant slots; one tenant's rebuild cannot take
   another tenant's slot.
 - Shared ports (review F20c): the model port has one global concurrency (2 on
@@ -1840,7 +1960,11 @@ edges is converted to `contradicts` and flagged.
 - Weight update on confirmation: `w = min(1, w + 0.1)`; decay:
   `w x 0.5^(days since last confirmation / half_life)`, half-life 30 days
   (ASSUMPTION); floor 0.05, below which the edge is retired in the next
-  generation (never for supersedes, contradicts, continues).
+  generation (never for supersedes, contradicts, continues). A confirmation
+  is an open judged relevant or a `used_behavioural` use (11.1), so an edge
+  whose use comes only through descriptors, never opened and not in the
+  behavioural sample, gets no refresh and decays to retirement: absence of a
+  positive signal, not "not opened" counted against it (9; INV-7, 20).
 - Specificity: score is divided by `log2(2 + degree)` of the target within the
   reader's visible edge indices (SOURCE idea: HippoRAG node specificity).
 - Degree cap 50 per type per leaf (ASSUMPTION): overflow edges are replaced by
@@ -1910,7 +2034,8 @@ edges is converted to `contradicts` and flagged.
 | Time zones | UTC stored plus original offset; day buckets in the tenant's declared zone | unit |
 | Clock skew | order by source sequence, not wall clock | unit |
 | Legal hold during erasure | hold wins; queued; delay in receipt | erasure probe (g) |
-| Erasure during rebuild or reflection | tombstone fence aborts the job's commit | erasure probe (g) |
+| Erasure during rebuild or reflection | the job's commit waits at the tenant's write gate and, checked against the published tombstones when it commits (the commit-time tombstone check of the shared guard), aborts (7.6 step 6, 14.3) | E4 |
+| Erasure boundary while several senders of the tenant are between their final check and their socket write | the publication step waits on the tenant's send fence until they have written; every later hand-off of a covered response is aborted; only bytes handed to the kernel before the boundary can still reach the peer, and those the kernel still holds at the boundary are at most 64 KiB per connection, measured at the gateway (4.4, 14.3) | E8 (d) |
 | Restore from snapshot after erasure | tombstones re-applied, erasure closure replayed over every restored index (authz included), verifier residue checks pass, then the tenant is enabled (14.6) | E3, V5 |
 | Erased subject mentioned again in new content | erased identifier HMACs refuse it | erasure probe (a) |
 | Erased identifier under a variant spelling (case, width, accents, homoglyphs) | NFKC, case folding and the confusables skeleton before the HMAC (5) | unit with a variant table; E3 |
@@ -1920,9 +2045,11 @@ edges is converted to `contradicts` and flagged.
 | Re-created edge after erasure | version counter starts above the erased versions (5.5) | unit |
 | Restore of a snapshot older than an erasure | newest tombstone journal applied first; keystore rows it names destroyed (14.6) | E3, V5 |
 | Authz index unwritable (disk at flood stage, read-only block) | revoke works from the gateway's own epoch table and journal (4.4) | R3, P14 |
-| Epoch journal write fails (no space, stalled fsync) or a restart finds it incomplete | `revoke` has already denied in memory; that tenant is closed (all its principals denied) until its administrators re-establish grants; other tenants unaffected (4.4) | R7 |
+| Epoch journal write fails (no space, stalled fsync) or a restart finds it incomplete | `revoke` has already denied in memory; that tenant is closed (all its principals denied), across restarts, until break-glass recovery, which first re-applies every revoke whose receipt lacks `durable_at` and then reopens grant calls only to the administrators the operator names; other tenants unaffected (4.4) | R7 |
+| Power loss before the start record is durable, between a denial and its fsync, or during compaction | no request is admitted before the start record and its directory are fsynced; compaction is write, fsync, atomic exchange of the two file names, directory fsync, carrying the start record; the table rebuilt from the durable journal holds every revoke reported durable, and the tenant comes up closed whenever a run was not stopped cleanly (4.4) | R7 (simulated power loss) |
+| Revoke arriving during a clean stop | admission and the revoke lane close before the drain; a late revoke is refused with a typed retryable failure, never answered `denied`; the shutdown record follows the drain (4.4) | R7 |
 | Retention expiry of a generation named by an adopted edge's `gen_from` or a retired edge's `gen_to` | ancestry ids are kept for the life of the class, so the adopted edge stays visible and the retired one stays hidden (5.6) | SEC-V2, V4 |
-| Very short leaf (a few words) | its title may reveal it; no gist or fact is returned (INV-7); limit (20) | SEC-A8 |
+| Descriptor that conveys an answer (a very short leaf, a decisive term in a title, a reason that paraphrases a fact) | field contract only (INV-7): no body, gist or fact field returned; titles code-built with no token containing a digit; reasons bounded; "not opened" is never counted as irrelevance (9); limit (20) | SEC-A8 (field contract and digit rule) |
 | Edge between incomparable classes | not created unless a dominating class is declared | access probe |
 | Class relabel of a leaf, upward | erasure of the old-class copy, returning at its erasure boundary; old pointers `unavailable`; new version in the new class (14.1) | A6 |
 | Class relabel of a leaf, downward | ordinary new write in the lower class by a principal holding both | access probe |
@@ -1966,12 +2093,13 @@ gate:
 - `route`: scores each presented child by BM25 of the prompt over the child's
   title, gist and entities plus cosine of hashed bag-of-words vectors; returns
   children over a threshold, at most `B_FANOUT`.
-- `build_l1`, `build_upper`: extractive. Title = top 4 tf-idf terms; gist = the
-  highest-scoring sentence; facts = top 3 sentences; summary = concatenated
-  child titles and top terms. Gists and facts go into child entries for
+- `build_l1`, `build_upper`: extractive. No title (titles are code-built,
+  INV-7); gist = the highest-scoring sentence; facts = top 3 sentences;
+  summary = concatenated child titles and top terms. Gists and facts go into child entries for
   holders only; a holder's returned pointer never carries them (INV-7), so a
-  one-sentence leaf, whose gist is the whole leaf, is not returned without a
-  lookup.
+  one-sentence leaf's body field, which equals its gist, is not returned
+  without a lookup. That is the field contract only: a leaf of a few words is
+  nearly its own title, so its content can still reach the reader (20).
 - `organise`: groups pointers by holder path and sorts by score; outline
   labels are holder paths and pass the 5-gram check (8.3).
 - `type_edges`: rules (shared entity: same_entity; negation or number change
@@ -1987,8 +2115,9 @@ gate:
   list.
 - Holder reasons: the stub writes reasons from its own matched terms, at most
   12 words; broken variants for the A8 probe quote child facts in reasons,
-  return the gist with the pointer, and copy a title from the leaf's first
-  sentence.
+  return the gist with the pointer, put a model-written title copied from the
+  leaf's first sentence into the pointer, and build titles that keep tokens
+  containing a digit.
 
 All stub outputs are deterministic given inputs and a seed. A latency-injecting
 wrapper with one global concurrency limit is used for the availability probe
@@ -2013,8 +2142,8 @@ living_context/
   policy/                principals, roles, class lattice, joins, admission decision (pure)
   gateway/
     server.py            local socket server; the only ES client
-    admission.py         byte, structure, concurrency, idle, per-tenant caps and byte caps; revoke lane
-    sessions.py          session resolution, authority-epoch table, bounded epoch journal with compaction and fail-closed start, send fence
+    admission.py         byte, structure, connection, concurrency, idle, per-tenant caps and byte caps; revoke lane
+    sessions.py          session resolution, authority-epoch table, bounded epoch journal with durable start record, compaction and fail-closed start, per-tenant send fence (revocation and erasure publication)
     journal.py           per-tenant tombstone journal (hash chain, replication, restore apply)
     validator.py         refuses documents without tenant, class, lineage (fail closed)
     indices.py           naming, aliases, provisioning checks, shard budget
@@ -2059,10 +2188,10 @@ credentials.
 | Filesystem and SSD remanence of destroyed keys | The keystore overwrites and checkpoints, but freed blocks and flash wear levelling are below the file layer; removing this needs a KMS or HSM, out of scope for the first build |
 | Tokens left in log files and the tombstone journal | Logs hold no content but may hold subject or principal tokens until `R_LOGS`; the journal keeps erased tokens and identifier HMACs for the tenant's life (O-5) |
 | Tombstone journal replica | Its second location is an operator choice; if it is lost together with the primary, the tenant is not served until restored (fail closed) |
-| Unclean gateway restart closes tenants | `revoke` returns before its journal write is durable (4.4), so a crash cannot be told apart from a lost revoke; every tenant whose journal lacks a clean shutdown record is closed until its administrators re-establish grants. Copy-on-write filesystems can still report no space inside a preallocated file; that also closes the tenant |
-| A node whose build keeps failing holds W back | Publishing a W the tree does not represent would hide pending leaves (review 2, F6); the members stay pending and reachable, but titles and gists for that class stop advancing until the call succeeds; failures are counted |
-| The gate's test assumes symmetric cluster means | The exact sign-flip test (13.3) is valid when cluster means are symmetric about 0 under no change; a candidate with frequent small gains and rare large losses can be adopted (simulated 0.17 at K = 8, about 0.07 at K = 60, EXPERIMENT 7.3). A test valid without the symmetry assumption (a Hoeffding bound) would need a mean of at least 0.87 at K = 8 and would almost never adopt; the general replay guard and the RANDOM-FEEDBACK control bound the effect |
-| A very short leaf can be guessed from its title | Titles are at most 12 words and share no 5-gram with the leaf, but a leaf of a few words is nearly its own title; content of longer leaves is reached only by a logged lookup (INV-7) |
+| Unclean gateway restart closes tenants | `revoke` returns before its journal write is durable (4.4), so a crash or power loss cannot be told apart from a lost revoke; every tenant whose journal lacks a clean shutdown record after its durable start record is closed until break-glass recovery and the named administrators' re-grants. Recovery can re-apply only the revokes whose receipts survive: a revoke denied in memory whose receipt was lost with the gateway (a revoking tool that crashed too) is unknown to the operator and is not re-applied, so its principal is re-admitted if an administrator re-grants it. Copy-on-write filesystems can still report no space inside a preallocated file; that also closes the tenant. Compaction needs an atomic exchange of two names (`RENAME_EXCHANGE` or `RENAME_SWAP`, ASSUMPTION); provisioning refuses a tenant whose journal filesystem lacks it. The power-loss cases are tested by simulation of the filesystem's durability rules (EXPERIMENT R7), not by cutting power to a real device |
+| A node whose build keeps failing holds W back | Publishing a W the tree does not represent would hide pending leaves (review 2, F6); the members stay pending and reachable, but gists and summaries for that class stop advancing until the call succeeds; failures are counted |
+| The gate's test assumes symmetric cluster means | The exact sign-flip test (13.3) is valid when cluster means are symmetric about 0 under no change; a candidate with frequent small gains and rare large losses can be adopted (simulated 0.17 at K = 8, about 0.07 at K = 60, EXPERIMENT 7.3). A test valid without the symmetry assumption (a Hoeffding bound) would need a mean of at least 0.87 at K = 8 and would almost never adopt. So the gate is an inspectable heuristic, not a false-adoption guarantee: the general replay guard limits visible losses on recent searches and RANDOM-FEEDBACK shows what random adoptions do to recall, but neither, nor the p-value, bounds the false-adoption rate; sign scoring sees how often clusters improve, not by how much. H3 and H4 are decided only on their independent forward and held-back measures (review 3) |
+| Descriptors can convey an answer without a lookup (review 3, F11) | INV-7 is a field contract: no body, gist or fact field reaches a pointer or the digest, titles are code-built without digit tokens, reasons and labels are bounded. It is not semantic non-disclosure: a 4-term title or a 12-word reason can still name a decisive fact (a name, a place, a topic; a date as a month name, a spelled-out amount or an alphabetic code, since the digit rule drops only tokens containing a digit and reasons and outline labels have no digit rule; a leaf of a few words is nearly its own title). So `opened` measures lookups, not use: an unopened pointer may have been used, and "not opened" is never evidence of irrelevance by itself (9, 10, 11, 12); an edge used only through descriptors gets no confirmation and decays (16.4). Non-content descriptors would remove this, but the owner asks for "a tight summary" as well as "pure reference pointers"; the reading is an ASSUMPTION about the owner's intent (EXPERIMENT 12, X9) |
 | Erasure delays the tenant's own writes | The write gate of the erasure boundary delays that tenant's commits for at most `B_ERASE` (14.3, INV-9); other tenants are not affected |
 
 ## 21. Lessons from the earlier lab (LAB-R1 to LAB-R12)
@@ -2130,12 +2259,16 @@ clusters, at most 60 targeted queries in clusters of at most 6, per-query
 sign scoring, one evaluation per candidate, general-replay count guard
 (13.3); reverse audit `N_AUDIT` 100 leaves and `K_CAND` 5 searches per cycle,
 re-filing support `S_MIN` 2 missed relevant searches and miss rate at least
-0.5 (12); titles and reasons at most 12 words with the 5-gram rule, failing
-titles replaced by 4 code-built terms (8.2); retention 5 generations or 14
+0.5 (12); reasons and outline labels at most 12 words with the 5-gram rule;
+titles code-built from 4 tf-idf terms with no token containing a digit
+(8.2); INV-7 read as a field contract, not semantic non-disclosure
+(review 3, F11); retention 5 generations or 14
 days, ancestry ids kept for the class's life (5.6); `P_PURGE` 1 hour;
 `R_KEYS` 35 days; `R_LOGS` 7 days; erasure boundary `B_ERASE` 60 s (14.3);
-write-path deadline `D_WP` 10 minutes (5.6); send buffer 64 KiB; epoch
-journal `J_SIZE` 4 MiB per tenant, `N_PRINCIPALS` 10,000, `D_FSYNC` 2 s
+write-path deadline `D_WP` 10 minutes (5.6); send buffer set to an
+effective 64 KiB per connection and an open-connection cap per tenant, under
+one per-tenant send fence (4.4, 15); epoch journal `J_SIZE` 4 MiB per file,
+two files per tenant (journal and spare), compaction by `RENAME_EXCHANGE`, `N_PRINCIPALS` 10,000, `D_FSYNC` 2 s
 (4.4); final-list fusion by RRF of the tree, direct and linked lists
 (k = 60, cut 50); reading of "never offered" as `tree_missed` (10);
 reverse-audit synthetic queries off by default (12).

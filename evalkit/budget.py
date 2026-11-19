@@ -2,8 +2,22 @@
 
 low = small figure in every factor; high = large figure in every factor. Every arm is its own tenant and nothing
 is shared between arms (the evaluation cache of the earlier draft is withdrawn), so k agent-routed arms cost k
-times one arm in both figures. Inside one arm, gate replays re-use the product cache of the class's service
-principal (DESIGN 5.8), which is already in the gate's per-cycle routing figures.
+times one arm in both figures.
+
+Gate cost per candidate (one candidate per learning cycle per learning arm; EXPERIMENT 10.1) is derived from the
+same factors the prose states: GATE_GEN generation calls, GATE_JUDGE judge calls, and GATE_REPLAYS replayed
+searches whose candidate traversal costs GATE_INCR routing calls each (only nodes whose version changed are asked
+again; unchanged nodes re-use the current generation's routing of the same query, product cache of the class's
+service principal, DESIGN 5.8). That re-use needs the current generation's routing first: a replay query with no
+cached routing for the service principal pays one cold traversal of the current generation at the stage's
+per-recall routing figure. GATE_COLD is the number of such cold queries per candidate (ASSUMPTION): every replay,
+in the low and the high figure. The gate-only synthetic queries that top up the targeted set are new, and every
+held-out search, in the targeted set or in the general guard (the 20 most recent held-out searches, DESIGN 13.3),
+was routed under its reader's principal, whose cache entries the service principal cannot use. A cache hit can
+only lower this figure.
+
+The default order (EXPERIMENT 10.3) runs S7b before S4a, so S7b needs the standalone DEV-BASE build; the total
+below is for that order, DEV-BASE included, optional S5 excluded.
 
 Plain Python 3, standard library only, deterministic. Run: python3 -I budget.py"""
 TOK = {  # API input tokens per call (low, high); CLI basis adds 10,500 fixed overhead per call (LAB measured)
@@ -17,6 +31,14 @@ def recall(n, per, arms):  # routing calls: 80% route, 20% organise
 def build(lo, hi, arms=1):
     lo2 = lo * arms; hi2 = hi * arms
     return {"build_l1": (0.93 * lo2, 0.93 * hi2), "build_upper": (0.07 * lo2, 0.07 * hi2)}
+GATE_GEN, GATE_JUDGE, GATE_REPLAYS, GATE_INCR = 12, (30, 60), 80, (2, 8)  # per candidate (EXPERIMENT 10.1)
+GATE_COLD = (80, 80)  # ASSUMPTION: replay queries per candidate with no cached current-generation routing (all)
+def gate(cands):  # generation, judge and incremental candidate routing: 202 to 712 calls per candidate
+    return {"gen": (GATE_GEN * cands, GATE_GEN * cands), "judge": (GATE_JUDGE[0] * cands, GATE_JUDGE[1] * cands),
+            "route": (GATE_REPLAYS * GATE_INCR[0] * cands, GATE_REPLAYS * GATE_INCR[1] * cands)}
+def gate_cold(cands, per):  # cold current-generation routing at the stage's per-recall figure, 80% route 20% organise
+    lo = GATE_COLD[0] * cands * per[0]; hi = GATE_COLD[1] * cands * per[1]
+    return {"route": (0.8 * lo, 0.8 * hi), "organise": (0.2 * lo, 0.2 * hi)}
 def add(acc, part, label):
     for k, (a, b) in part.items():
         x = acc.setdefault(k, [0, 0]); x[0] += a; x[1] += b
@@ -40,7 +62,8 @@ stage("S4a", [("stream recalls, 3 agent-routed arms x 222", recall(222, DEV, 3))
   ("reader per item, LOOP and FROZEN", {"reader": (444, 1332)}), ("reflection, LOOP", {"gen": (222, 222), "judge": (1110, 1776)}),
   ("QUERY-MEMO shadow reflection on FROZEN's searches", {"gen": (222, 222), "judge": (1110, 1776)}),
   ("reverse audit, 9 cycles x 100 leaves", {"judge": (450, 900)}), ("re-summaries, LOOP and RANDOM-FEEDBACK", {"build_upper": (300, 1200)}),
-  ("gate, 2 arms x 9 cycles", {"gen": (216, 216), "judge": (540, 1080), "route": (2844, 11304)}),
+  ("gate, 2 arms x 9 cycles: generation, judge, candidate routing", gate(18)),
+  ("gate, 2 arms x 9 cycles: cold current-generation routing", gate_cold(18, DEV)),
   ("incremental build", build(1966, 3276, 3)), ("edge typing", {"type_edges": (1417, 4725)}),
   ("recurring-query generation", {"gen": (120, 360)}), ("proxy supporting arms, judge", {"judge": (500, 1000)}),
   ("behavioural-use sample", {"reader": (200, 200)})])
@@ -49,8 +72,10 @@ stage("S4b", [("base build (43 non-target dev blocks)", build(480, 740)), ("base
   ("reader per item, LOOP FROZEN NO-AUDIT", {"reader": (360, 1080)}),
   ("reflection, LOOP and NO-AUDIT", {"gen": (240, 240), "judge": (720, 1320)}),
   ("reverse audit, 6 cycles x 100 leaves", {"judge": (300, 600)}), ("re-summaries, 3 learning arms", {"build_upper": (300, 1200)}),
-  ("gate, 3 arms x 6 cycles", {"gen": (216, 216), "judge": (540, 1080), "route": (2844, 11304)}),
-  ("gate positive controls (oracle and random candidates)", {"gen": (24, 24), "judge": (60, 120), "route": (316, 1256)}),
+  ("gate, 3 arms x 6 cycles: generation, judge, candidate routing", gate(18)),
+  ("gate, 3 arms x 6 cycles: cold current-generation routing", gate_cold(18, DEV)),
+  ("gate positive controls (oracle and random): generation, judge, candidate routing", gate(2)),
+  ("gate positive controls: cold current-generation routing", gate_cold(2, DEV)),
   ("stream build", build(1090, 1680, 4)), ("stream edge typing", {"type_edges": (938, 3125)}),
   ("probe generation with rank filter", {"gen": (94, 282)}), ("LOOP+SYNTH variant (proxy)", {"gen": (40, 120), "judge": (160, 480)}),
   ("proxy supporting arms, judge", {"judge": (500, 1000)}), ("behavioural-use sample", {"reader": (200, 200)})])
@@ -64,7 +89,8 @@ stage("S7a", [("stream recalls, 3 agent-routed arms x 522", recall(522, WHOLE, 3
   ("reader per item, LOOP and FROZEN", {"reader": (1044, 3132)}), ("reflection, LOOP", {"gen": (522, 522), "judge": (2610, 4176)}),
   ("QUERY-MEMO shadow reflection on FROZEN's searches", {"gen": (522, 522), "judge": (2610, 4176)}),
   ("reverse audit, 10 cycles x 100 leaves", {"judge": (500, 1000)}), ("re-summaries, LOOP and RANDOM-FEEDBACK", {"build_upper": (1200, 4800)}),
-  ("gate, 2 arms x 10 cycles", {"gen": (240, 240), "judge": (600, 1200), "route": (3160, 12560)}),
+  ("gate, 2 arms x 10 cycles: generation, judge, candidate routing", gate(20)),
+  ("gate, 2 arms x 10 cycles: cold current-generation routing", gate_cold(20, WHOLE)),
   ("incremental build", build(4000, 6700, 3)), ("edge typing", {"type_edges": (2900, 9700)}),
   ("recurring-query generation", {"gen": (299, 897)}), ("proxy supporting arms, judge", {"judge": (1000, 2000)}),
   ("behavioural-use sample", {"reader": (200, 200)})])
@@ -72,7 +98,8 @@ stage("S7b", [("stream recalls, 4 agent-routed arms x 280", recall(280, H4P, 4))
   ("reader per item, LOOP FROZEN NO-AUDIT", {"reader": (600, 1800)}),
   ("reflection, LOOP and NO-AUDIT", {"gen": (400, 400), "judge": (1200, 2200)}),
   ("reverse audit, 10 cycles x 100 leaves", {"judge": (500, 1000)}), ("re-summaries, 3 learning arms", {"build_upper": (600, 2400)}),
-  ("gate, 3 arms x 10 cycles", {"gen": (360, 360), "judge": (900, 1800), "route": (4740, 18840)}),
+  ("gate, 3 arms x 10 cycles: generation, judge, candidate routing", gate(30)),
+  ("gate, 3 arms x 10 cycles: cold current-generation routing", gate_cold(30, H4P)),
   ("stream build", build(1650, 2550, 4)), ("stream edge typing", {"type_edges": (1174, 3913)}),
   ("probe generation with rank filter", {"gen": (140, 420)}), ("LOOP+SYNTH variant (proxy)", {"gen": (40, 120), "judge": (160, 480)}),
   ("proxy supporting arms, judge", {"judge": (500, 1000)}), ("behavioural-use sample", {"reader": (200, 200)})])
@@ -85,15 +112,18 @@ def summ(name):
     return calls, api, cli
 tot = {"calls": [0, 0], "api": [0, 0], "cli": [0, 0]}
 fmt = lambda x: "{:,}".format(int(round(x)))
-ORDER = ["S1", "S2", "S3", "S6-H1", "S6-H2", "S4b", "S4a", "S5", "S7a", "S7b", "DEVBASE"]
+ORDER = ["S1", "S2", "S3", "S6-H1", "S6-H2", "S4b", "DEVBASE", "S7b", "S4a", "S7a", "S5"]  # default order; S5 optional
 for name in ORDER:
     c, a, l = summ(name)
     print("%-8s calls %s to %s | API Mtok %.0f to %.0f | CLI Mtok %.0f to %.0f | hours %.0f to %.0f" % (
         name, fmt(c[0]), fmt(c[1]), a[0] / 1e6, a[1] / 1e6, l[0] / 1e6, l[1] / 1e6, c[0] / RATE, c[1] / RATE))
-    for label, lo, hi in stages[name][1]: print("    %-55s %s to %s" % (label, fmt(lo), fmt(hi)))
-    if name != "DEVBASE":
+    for label, lo, hi in stages[name][1]: print("    %-80s %s to %s" % (label, fmt(lo), fmt(hi)))
+    if name != "S5":
         for k, v in (("calls", c), ("api", a), ("cli", l)): tot[k][0] += v[0]; tot[k][1] += v[1]
-print("TOTAL full plan (S1 to S7b, no DEVBASE): calls %s to %s; API Mtok %.0f to %.0f; CLI Mtok %.0f to %.0f; hours %.0f to %.0f" % (
+print("gate per candidate: generation, judge, candidate routing %d to %d calls; plus cold routing %s to %s (DEV), %s to %s (H4P), %s to %s (WHOLE)" % (
+    sum(v[0] for v in gate(1).values()), sum(v[1] for v in gate(1).values()),
+    *[fmt(sum(v[i] for v in gate_cold(1, p).values())) for p in (DEV, H4P, WHOLE) for i in (0, 1)]))
+print("TOTAL default order (S1, S2, S3, S6-H1, S6-H2, S4b, DEV-BASE, S7b, S4a, S7a; optional S5 not included): calls %s to %s; API Mtok %.0f to %.0f; CLI Mtok %.0f to %.0f; hours %.0f to %.0f" % (
     fmt(tot["calls"][0]), fmt(tot["calls"][1]), tot["api"][0] / 1e6, tot["api"][1] / 1e6, tot["cli"][0] / 1e6, tot["cli"][1] / 1e6,
     tot["calls"][0] / RATE, tot["calls"][1] / RATE))
 def path(names):
