@@ -162,3 +162,43 @@ Each entry names the passages, the reading the build follows and the test that k
   removal of one class, or a re-grant with those roles and sets); a re-grant that takes a role or a class from an administrator or a
   revoker is such an operation, and one that takes something from anyone else ends that principal's sessions (an epoch bump).
 - Removing a class grant is a tenant administrator's call; a revoker has the single revoke call (4.3).
+
+## Holds at every entry point, the revoke lane and the start-up path (DESIGN 14.1, 4.4, 15, 20; ASSUMPTION, listed by the Step 15 owner)
+
+- 14.1 says "legal hold wins" for erasure and names the subject and item scopes; it is silent on the class relabel, which 14.1 itself
+  defines as an erasure of the old-class copy. Reading kept: a hold covers all three scopes. The hold registry is a required argument of
+  the `Executor`, and `erase_subject`, `erase_item` and `relabel_erase` all check it under the write gate before the journal append;
+  there is no argument that skips it. A relabel under a hold raises `Held`, is queued (`request_relabel`) and runs on release; the
+  caller writes the new-class version only after the released relabel returns its receipt. The old copy stays readable to its
+  former readers while the hold lasts (a hold means the content is kept); a restore's replay re-applies a tombstone already
+  published, so a hold does not apply to it.
+- A queued request leaves the queue only after it has run to its receipt (`HoldRegistry.complete`). A crash or failure between the two
+  leaves it queued and it runs again; the repeat finds an empty closure and appends a second tombstone (idempotent).
+- A hold placed while an erasure is between its check and its boundary is not seen by that erasure (the registry is not under the
+  write gate): a stated limit (DESIGN 20).
+- 4.4 and 15 say the revoke lane exists so a flood cannot delay a revoke, and that one tenant cannot starve another. Reading kept:
+  the lane is granted only after the session resolves and the principal's role admits the operation (`admin.lane_allowed`), and it is a
+  semaphore per tenant. A request merely shaped like a revoke goes to the tenant's general lane, where the handler refuses it.
+  An authorised administrator can still fill its own tenant's lane; that bounds the harm to the administrator's own tenant.
+- DESIGN 20 says grants "return from the best-effort authz persistence". The build now has that path: `gateway/boot.py` persists each
+  grant to `lc-<t>-authz` (lineage names the principal token, so erasing the person deletes it) and reads them back at start-up,
+  replays the epoch journal, loads the guard from the tombstone journal and wires the operator's `offboard_tenant` to
+  `EsGate.drop_tenant`. Grants read at start-up are capped at 10,000 per tenant (stated limit). BUILD-PLAN step 5 owns the
+  wire-up of the server process (listen socket, identity adapters, per-tenant directories); `boot.start_tenant` is the part that
+  Step 15's claims need, and the process entry point that calls it for every provisioned tenant is not built.
+
+## Step 16 readings: the multi-class reader, A7 and A8 (DESIGN 8.1, 17; EXPERIMENT 9.2; ASSUMPTION, listed by the Step 15 owner)
+
+- 8.1 says the read path pins a generation per class and family, and 17 says a reader of several classes fans out over several roots;
+  neither says how the digests combine. Reading kept: one digest per class of the read set, each exactly the digest the reader of that
+  class alone gets, merged by reciprocal rank over the per-class pointer rankings (salted like the single-class fusion), the outlines
+  kept per class, the counts summed and the pins reported per class (`pinned.gens`). The merge is independent of the order the classes
+  are read in. A read set that is not down-closed is refused by the policy, so there is no reader of a dominating class alone: the
+  merged digest of `base` and `restricted` is checked against the `base` reader's digest for its base part.
+- A7 is reported and never gates (EXPERIMENT 9.2). The harness is `tools/a7_timing.py` (two-sample KS statistic and relative median
+  difference, interleaved). The ES test runs interleaved C0 and C1 requests for at most 150 s and states the N reached against the
+  registered 2,000; the A4 pair is compared the same way. A result at or above either limit is a disclosed timing channel.
+- A8 runs over the registered 300 queries on a fixture with one-sentence leaves and leaves whose terms are dates, amounts and codes
+  with digits. A title is checked against the code-built title and against the words of the leaf's tokens that contain no digit,
+  so a build that keeps the letters of a token such as `quokka7` is red; the same tests run under the no-content title mode (AC-16).
+  The 5-gram check on reasons and outline labels is run against leaf text, gists and facts of the tree.
