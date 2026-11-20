@@ -10,7 +10,8 @@ checkout, so no source commit exists to record. Source files by sha256 prefix: d
 content.py 150fde11ff0d652b, corpus.py b008689e7ba07aba. Behaviour is unchanged; names and typing were simplified.
 
 The fresh confirmatory set is PENDING RELEASE (EXPERIMENT 3.2, X1): `development_questions` returns only pilot, dev2
-and held_back questions and `confirmatory_questions` refuses.
+and held_back questions and `confirmatory_questions` refuses. `fresh_questions` returns it for stage S6-H1 only, behind a release
+file in the run directory that names the owner's release and the freeze manifest (the release follows the freeze).
 """
 from __future__ import annotations
 
@@ -255,4 +256,99 @@ def development_questions(questions: Sequence[Question], splits: Sequence[str] =
 
 
 def confirmatory_questions(*_a, **_k):
-    raise Unreleased("the fresh confirmatory set is PENDING RELEASE by the owner (EXPERIMENT 3.2, X1)")
+    raise Unreleased("the fresh confirmatory set is PENDING RELEASE by the owner (EXPERIMENT 3.2, X1); stage S6-H1 loads it only through "
+                     "`fresh_questions` with a release file")
+
+
+# ---- the fresh set, released for stage S6-H1 only (EXPERIMENT 3.2, X1) ---------------------------------------------------------------
+RELEASED_STAGE = "S6-H1"
+RELEASE_FILE = "RELEASE.json"
+RELEASE_KEYS = ("stage", "release_ref", "source", "freeze_manifest_sha256")
+# MEASURED counts of EXPERIMENT 3.2: 363 test = 312 fresh + 51 sensitivity-excluded; 312 = 299 with gold + 13 abstention; of the 299,
+# 6 have gold content in a held_back haystack (the DEV-EXPOSED stratum), so the confirmatory H1 denominator is 293
+REGISTERED_FRESH = {"test": 363, "excluded": 51, "fresh": 312, "non_abstention": 299, "abstention": 13, "dev_exposed": 6, "primary": 293}
+
+
+@dataclass(frozen=True)
+class FreshSet:
+    """The released fresh set. `questions` holds all fresh questions (abstention included) in dataset order; the rest are qid tuples.
+    primary: non-abstention, with gold, not DEV-EXPOSED (the H1 denominator); sensitivity: non-abstention with gold (DEV-EXPOSED
+    included); abstention: reported as their own stratum, never in a recall mean (EXPERIMENT 3.1)."""
+    questions: Tuple[Question, ...]
+    primary: Tuple[str, ...]
+    sensitivity: Tuple[str, ...]
+    dev_exposed: Tuple[str, ...]
+    abstention: Tuple[str, ...]
+    excluded_n: int
+
+    def counts(self) -> Dict[str, int]:
+        return {"fresh": len(self.questions), "non_abstention": len(self.questions) - len(self.abstention),
+                "abstention": len(self.abstention), "dev_exposed": len(self.dev_exposed), "primary": len(self.primary),
+                "excluded": self.excluded_n}
+
+
+def read_release(run_dir) -> dict:
+    """The release record the operator writes into the run directory once the owner has released the fresh set for S6-H1 and the
+    freeze manifest exists (its sha256 is part of the record, so a release cannot precede the freeze)."""
+    import os
+    path = os.path.join(str(run_dir), RELEASE_FILE)
+    if not os.path.exists(path):
+        raise Unreleased("no release file %s in the run directory: the fresh set stays unreleased" % RELEASE_FILE)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            rec = json.load(fh)
+    except ValueError:
+        raise Unreleased("the release file is not valid JSON")
+    if not isinstance(rec, dict) or any(not str(rec.get(k) or "").strip() for k in RELEASE_KEYS):
+        raise Unreleased("the release file must name %s" % ", ".join(RELEASE_KEYS))
+    return rec
+
+
+def dev_exposed(questions: Sequence[Question], assignment: Dict[str, str], hashes: Dict[str, str], fresh: Iterable[str]) -> List[str]:
+    """Fresh non-abstention questions with a gold content inside a held_back haystack (EXPERIMENT 3.2, review M2): development runs show
+    that content to models, so these form the DEV-EXPOSED stratum and leave the H1 denominator."""
+    shown = set()
+    for q in questions:
+        if assignment.get(q.qid) == "held_back":
+            shown |= {hashes[s] for s in q.haystack_session_ids}
+    by = {q.qid: q for q in questions}
+    return sorted(qid for qid in fresh if not by[qid].is_abstention and any(hashes.get(s) in shown for s in by[qid].gold_session_ids))
+
+
+def fresh_questions(questions: Sequence[Question], *, stage: str, run_dir, release_ref: str, freeze_sha256: str,
+                    registered: Optional[Dict[str, int]] = None, extra_dev_exposed: Sequence[str] = ()) -> FreshSet:
+    """The fresh set, for stage S6-H1 only and only with a release file in the run directory whose stage, reference and freeze manifest
+    sha256 match the ones the run was started with. Every other stage, and any missing or mismatched release, raises `Unreleased`.
+    The 51-question sensitivity exclusion is applied (`sensitivity_excluded`), abstention questions are kept apart, the DEV-EXPOSED
+    stratum (computed, plus any qids an amendment adds through the freeze manifest) leaves the primary set, and every count must equal
+    the registered one (counts only; nothing of the content is reported)."""
+    if stage != RELEASED_STAGE:
+        raise Unreleased("the fresh set is released for stage %s only, not %s" % (RELEASED_STAGE, stage))
+    rec = read_release(run_dir)
+    if rec["stage"] != RELEASED_STAGE:
+        raise Unreleased("the release file is for stage %r" % rec["stage"])
+    if not (release_ref or "").strip() or rec["release_ref"] != release_ref:
+        raise Unreleased("the release reference differs from the release file")
+    if not (freeze_sha256 or "").strip() or rec["freeze_manifest_sha256"] != freeze_sha256:
+        raise Unreleased("the release file names a different freeze manifest: the release follows the freeze")
+    reg = dict(REGISTERED_FRESH if registered is None else registered)
+    sp = full_split_assignment(questions)
+    hashes = session_hashes(questions)
+    test = [q for q in questions if sp[q.qid] == "test"]
+    excl = set(sensitivity_excluded(questions, sp, hashes))
+    fresh = [q for q in test if q.qid not in excl]
+    abst = tuple(q.qid for q in fresh if q.is_abstention)
+    exposed_calc = dev_exposed(questions, sp, hashes, [q.qid for q in fresh])
+    extra = sorted(set(extra_dev_exposed) - set(exposed_calc))
+    fresh_ids = {q.qid for q in fresh}
+    if any(x not in fresh_ids for x in extra):
+        raise DatasetError("an amended DEV-EXPOSED question is not in the fresh set")
+    exposed = tuple(sorted(set(exposed_calc) | set(extra)))
+    sens = tuple(q.qid for q in fresh if not q.is_abstention and q.gold_session_ids)
+    primary = tuple(x for x in sens if x not in set(exposed))
+    got = {"test": len(test), "excluded": len(excl), "fresh": len(fresh), "non_abstention": len(fresh) - len(abst), "abstention": len(abst),
+           "dev_exposed": len(exposed_calc), "primary": len(primary)}   # an amendment that adds DEV-EXPOSED qids restates `primary`
+    bad = {k: (got[k], reg[k]) for k in reg if got.get(k) != reg[k]}
+    if bad:
+        raise DatasetError("fresh-set counts differ from the registered ones (got, registered): %s" % bad)
+    return FreshSet(tuple(fresh), primary, sens, exposed, abst, len(excl))
