@@ -60,11 +60,11 @@ def generate(k: PoolKnobs) -> PoolWorld:
     pools: List[dict] = []
     for i, pid in enumerate(ids):
         role = "real" if i < k.n_pools else ("decoy" if i < k.n_pools + k.n_decoys else "leak")
-        kn = synth.knobs_at(k.leaves_per_pool, k.seed * 100 + i, k.level, domain=i + 1, n_questions=60 if role == "real" else 0)
+        kn = synth.knobs_at(k.leaves_per_pool, k.seed * 100 + i, k.level, domain=i + 1, n_questions=60 if role == "real" else 0, n_set_questions=0)
         c = synth.generate(kn)
         corpora[pid] = c
         pools.append({"id": pid, "role": role, "granted": role != "leak", "leaves": c.leaves, "card": ""})
-    withheld = synth.generate(synth.knobs_at(k.leaves_per_pool, k.seed * 100 + 99, k.level, domain=39, n_questions=60))
+    withheld = synth.generate(synth.knobs_at(k.leaves_per_pool, k.seed * 100 + 99, k.level, domain=39, n_questions=60, n_set_questions=0))
     vocab = {p["id"]: sorted({w for t in corpora[p["id"]].topics for w in t if w not in synth.COMMON}) or sorted({w for t in corpora[p["id"]].topics for w in t})
              for p in pools}
     real = [p for p in pools if p["role"] == "real"]

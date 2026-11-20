@@ -197,7 +197,9 @@ def score(questions: Sequence[dict], rows: Sequence[QueryRow], doc_ids: Sequence
         rank = min(found) if found else None     # the best-ranked gold leaf; None: no gold leaf in the fused window
         stale_ranks = [pos[doc_ids[s]] for s in q["stale"] if doc_ids[s] in pos]
         top10 = r.fused[:10]
-        out.append({
+        n_gold = len(q["gold"])
+        found10 = sum(1 for g in q["gold"] if doc_ids[g] in set(top10))
+        out.append({"n_gold": n_gold, "found10": found10, "all10": found10 == n_gold,
             "qid": q["qid"], "rank": rank, "hit1": rank == 1, "hit5": rank is not None and rank <= 5,
             "hit10": rank is not None and rank <= 10, "rr": (1.0 / rank) if rank is not None and rank <= 10 else 0.0,
             "bm25_hit10": any(doc_ids[x] in r.bm25[:10] for x in q["gold"]),

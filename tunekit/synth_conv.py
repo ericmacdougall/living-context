@@ -70,8 +70,8 @@ def generate(corpus: synth.Corpus, seed: int, *, n_convs: int = 50, turns: int =
             j = rng.randrange(1, turns)
             old = rng.choice(superseded)
             succ = [L["id"] for L in cur if L["key"] == old["key"]]
-            if succ:
-                out[j]["events"] = out[j]["events"] + ["failed_lookup"]
+            if succ and not out[j]["events"]:
+                out[j]["events"] = ["failed_lookup"]
                 out[j]["offer"] = succ
                 events.append({"i": j, "kind": "failed_lookup"})
         convs.append(Conversation(ci, out, events))

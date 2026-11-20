@@ -55,9 +55,13 @@ def run_cell(env: baseline.Env, name: str, run: Path, *, check_n: int = 20, pass
     for q, r, s in zip(questions, rows, scored):
         f = signals.query_features(r.bm25, r.knn, r.knn_cos, r.fused, session_of)
         per_q.append({"cell": name, "qid": q["qid"], "cluster": f"{name}:{q['topic']}", "kind": q["kind"], "para": q["para"],
-                      "alias": q["alias"], "nw": (len(q["text"].split(" regarding ")[1].rstrip("?").split()) if " regarding " in q["text"] else 0), "hit1": s["hit1"], "hit5": s["hit5"], "hit10": s["hit10"], "rr": s["rr"],
+                      "alias": q["alias"], "nw": (len(q["text"].split(" regarding ")[1].rstrip("?").split()) if " regarding " in q["text"] else 0), "hit1": s["hit1"], "hit5": s["hit5"],
+                      "hit10": (s["all10"] if q["kind"] == "set" else s["hit10"]),    # for a set question: every gold leaf is in the top 10
+                      "n_gold": s["n_gold"], "found10": s["found10"], "rr": s["rr"],
                       "rank": s["rank"], "bm25_hit10": s["bm25_hit10"], "knn_hit10": s["knn_hit10"],
                       "stale_first": s["stale_first"], "has_stale": s["has_stale"], "ms": r.ms, **f})
+    set_rows = [r for r in per_q if r["kind"] == "set"]
+    per_q_all, per_q = per_q, [r for r in per_q if r["kind"] != "set"]
     n = len(per_q)
     agg = {"cell": name, "knobs": corpus.manifest["knobs"], "stats": corpus.manifest["stats"], "n_questions": n,
            "dropped_ambiguous": corpus.manifest["questions_dropped_ambiguous"], "content_sha256": corpus.manifest["content_sha256"]}
@@ -65,6 +69,15 @@ def run_cell(env: baseline.Env, name: str, run: Path, *, check_n: int = 20, pass
         kk = sum(1 for r in per_q if r[k])
         p, lo, hi = wilson(kk, n)
         agg[k] = {"k": kk, "n": n, "p": round(p, 4), "lo": round(lo, 4), "hi": round(hi, 4)}
+    if set_rows:
+        items, found = sum(r["n_gold"] for r in set_rows), sum(r["found10"] for r in set_rows)
+        p_i, lo_i, hi_i = wilson(found, items)
+        k_all = sum(1 for r in set_rows if r["hit10"])
+        p_a, lo_a, hi_a = wilson(k_all, len(set_rows))
+        agg["set"] = {"n": len(set_rows), "mean_gold": round(items / len(set_rows), 3),
+                      "gold_items": items, "found10": found, "item_recall10": {"p": round(p_i, 4), "lo": round(lo_i, 4), "hi": round(hi_i, 4)},
+                      "all10": {"k": k_all, "n": len(set_rows), "p": round(p_a, 4), "lo": round(lo_a, 4), "hi": round(hi_a, 4)},
+                      "gold_size_hist": {str(m): sum(1 for r in set_rows if r["n_gold"] == m) for m in sorted({r["n_gold"] for r in set_rows})}}
     agg["mrr10"] = round(float(np.mean([r["rr"] for r in per_q])), 4)
     st = [r for r in per_q if r["has_stale"]]
     agg["stale_first"] = {"k": sum(r["stale_first"] for r in st), "n": len(st)}
@@ -90,7 +103,7 @@ def run_cell(env: baseline.Env, name: str, run: Path, *, check_n: int = 20, pass
     agg["finished"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     (run / "rows").mkdir(parents=True, exist_ok=True)
     with gzip.open(run / "rows" / (name + ".jsonl.gz"), "wt") as f:
-        for r in per_q:
+        for r in per_q_all:
             f.write(json.dumps(r) + "\n")
     out_json.parent.mkdir(parents=True, exist_ok=True)
     out_json.write_text(json.dumps(agg, indent=1))

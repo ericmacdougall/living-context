@@ -10,7 +10,7 @@ import sys
 from . import synth
 
 KEYS = ("topic_jaccard", "entity_reuse", "dup_frac", "old_frac", "mean_session_len", "mean_words", "leaves_per_topic", "q_alias_frac",
-        "q_para_frac", "q_mean_topic_words")
+        "q_para_frac", "q_mean_topic_words", "set_mean_gold")
 
 
 def avg(n, level, seeds=(1, 2, 3), **over):

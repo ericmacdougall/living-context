@@ -30,7 +30,7 @@ import random
 from dataclasses import asdict, dataclass, field, replace
 from typing import Dict, List, Optional, Sequence, Tuple
 
-GEN_VERSION = "tk-synth-3"
+GEN_VERSION = "tk-synth-4"
 
 COMMON = ("garden kitchen travel planning pottery journey report design school family health music weather market office repair "
           "delivery contract ferry schedule training survey launch archive server network invoice holiday recipe fitness library "
@@ -93,6 +93,7 @@ class Knobs:
     growth: str = "wide"          # "wide" or "deep"
     fixed_topics: int = 40        # used when growth == "deep"
     n_questions: int = 400
+    n_set_questions: int = 200    # questions whose answer is every current leaf of one entity in one topic (two or more leaves)
     domain: int = 0               # separates the invented vocabulary of different pools (G6); 0 for a single corpus
 
     def validate(self) -> None:
@@ -278,8 +279,12 @@ def generate(k: Knobs) -> Corpus:
                        "form": r["form"], "ent_name": names[r["ent"]]})
 
     questions, dropped = _questions(k, leaves, topics, names, r_q)
+    set_qs, set_dropped = _set_questions(k, leaves, topics, names, _rng(k, "setq"), len(questions))
+    questions = questions + set_qs
     corpus = Corpus(k, leaves, questions, topics)
     corpus.manifest = _manifest(corpus, n_topics, epn, pool, len(sessions), dropped)
+    corpus.manifest["set_questions"] = len(set_qs)
+    corpus.manifest["set_questions_dropped_ambiguous"] = set_dropped
     return corpus
 
 
@@ -345,6 +350,56 @@ def _questions(k: Knobs, leaves: List[dict], topics: List[List[str]], names: Lis
     return out, dropped
 
 
+def _set_questions(k: Knobs, leaves: List[dict], topics: List[List[str]], names: List[str], rng: random.Random, start: int):
+    """Set questions: 'What did <entity> report regarding <w1> <w2>?'; the gold is EVERY current leaf of that entity in that topic
+    (at least two). The words are taken from the gold leaves' own topic words and the (entity, topic) group must be the only one the
+    specification matches under the topic vocabularies; otherwise the candidate is dropped and counted."""
+    groups: Dict[tuple, List[dict]] = {}
+    for L in leaves:
+        if L["kind"] != "old":
+            groups.setdefault((L["entity"], L["topic"]), []).append(L)
+    vocab_sets = [set(v) for v in topics]
+    by_name_part: Dict[str, List[tuple]] = {}
+    for (e, t) in groups:
+        by_name_part.setdefault(names[e], []).append((e, t))
+        for part in names[e].split():
+            by_name_part.setdefault(part, []).append((e, t))
+
+    def unique(alias: str, words: Sequence[str]) -> bool:
+        ws = set(words)
+        return sum(1 for (e, t) in by_name_part.get(alias, ()) if ws <= vocab_sets[t]) == 1
+
+    cands = sorted(g for g, ls in groups.items() if len(ls) >= 2)
+    rng.shuffle(cands)
+    out, dropped = [], 0
+    for (e, t) in cands:
+        if len(out) >= k.n_set_questions:
+            break
+        gold = groups[(e, t)]
+        pool_words = sorted({w for L in gold for w in L["tws"]})
+        full = names[e]
+        k_words = 1 if rng.random() < k.one_word else 2
+        alias, alias_used, words = full, False, None
+        options = []
+        if rng.random() < k.alias_rate:
+            options.append((rng.choice(full.split()), True))
+        options.append((full, False))
+        for al, used in options:
+            for w in _combos(pool_words, k_words, rng):
+                if unique(al, w):
+                    alias, alias_used, words = al, used, w
+                    break
+            if words is not None:
+                break
+        if words is None:
+            dropped += 1
+            continue
+        out.append({"qid": start + len(out), "text": f"What did {alias} report regarding {' '.join(words)}?",
+                    "gold": sorted(L["id"] for L in gold), "gold_value": "", "topic": t, "session": gold[0]["session"], "stale": [],
+                    "dups": [], "kind": "set", "alias": alias_used, "para": False})
+    return out, dropped
+
+
 def _combos(tws: Sequence[str], size: int, rng: random.Random):
     from itertools import combinations
     cs = [tuple(c) for c in combinations(tws, size)]
@@ -373,7 +428,8 @@ def complexity_stats(c: Corpus, *, pairs: int = 3000) -> dict:
     sess_len: Dict[int, int] = {}
     for L in c.leaves:
         sess_len[L["session"]] = sess_len.get(L["session"], 0) + 1
-    qs = c.questions
+    sq = [q for q in c.questions if q["kind"] == "set"]
+    qs = [q for q in c.questions if q["kind"] != "set"]      # statistics describe the point questions; set questions are counted apart
     return {
         "n_leaves": n,
         "n_topics": nt,
@@ -388,6 +444,7 @@ def complexity_stats(c: Corpus, *, pairs: int = 3000) -> dict:
         "q_mean_topic_words": sum(len(q["text"].split(" regarding ")[1].rstrip("?").split()) if " regarding " in q["text"] else 0
                                   for q in qs) / len(qs) if qs else 0.0,
         "q_para_frac": sum(q["para"] for q in qs) / len(qs) if qs else 0.0,
+        "set_mean_gold": sum(len(q["gold"]) for q in sq) / len(sq) if sq else 0.0,
         "q_updated_frac": sum(q["kind"] == "updated" for q in qs) / len(qs) if qs else 0.0,
     }
 

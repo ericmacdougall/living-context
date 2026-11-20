@@ -5,7 +5,7 @@ import unittest
 from tunekit import synth
 
 STAT_KEYS = ("topic_jaccard", "entity_reuse", "dup_frac", "old_frac", "mean_session_len", "mean_words", "leaves_per_topic",
-             "q_alias_frac", "q_para_frac", "q_mean_topic_words")
+             "q_alias_frac", "q_para_frac", "q_mean_topic_words", "set_mean_gold")
 
 
 import re
@@ -117,8 +117,9 @@ class Independence(unittest.TestCase):
 class GroundTruth(unittest.TestCase):
     def check(self, c):
         leaves, topics = c.leaves, c.topics
-        names = {}
         for q in c.questions:
+            if q["kind"] == "set":
+                continue
             g = leaves[q["gold"][0]]
             self.assertNotEqual(g["kind"], "old")
             self.assertIn(g["value"], g["text"])
@@ -156,9 +157,34 @@ class GroundTruth(unittest.TestCase):
             self.assertGreater(len(c.questions), 300)
             self.check(c)
 
+    def test_set_questions_have_every_current_leaf_of_the_entity_in_the_topic(self):
+        c = synth.generate(synth.knobs_at(2000, 5, 0.5))
+        sets = [q for q in c.questions if q["kind"] == "set"]
+        self.assertGreater(len(sets), 100)
+        vocab = [set(v) for v in c.topics]
+        for q in sets:
+            gold = [c.leaves[i] for i in q["gold"]]
+            self.assertGreaterEqual(len(gold), 2)
+            self.assertEqual(len({(L["entity"], L["topic"]) for L in gold}), 1)
+            self.assertTrue(all(L["kind"] != "old" for L in gold))
+            e, t = gold[0]["entity"], gold[0]["topic"]
+            want = sorted(L["id"] for L in c.leaves if L["entity"] == e and L["topic"] == t and L["kind"] != "old")
+            self.assertEqual(q["gold"], want)
+            alias, words = q["text"][len("What did "):].rstrip("?").split(" report regarding ")
+            words = words.split()
+            self.assertTrue(set(words) <= vocab[t])
+            self.assertTrue(set(alias.split()) <= set(gold[0]["ent_name"].split()))
+            # the specification identifies exactly one (entity, topic) group
+            groups = {(L["entity"], L["topic"]) for L in c.leaves if L["kind"] != "old" and set(alias.split()) <= set(L["ent_name"].split())
+                      and set(words) <= vocab[L["topic"]] and (len(alias.split()) == 2 or True)}
+            if len(alias.split()) == 2:
+                groups = {g for g in groups if c.leaves[next(L["id"] for L in c.leaves if (L["entity"], L["topic"]) == g)]["ent_name"] == alias}
+            self.assertEqual(groups, {(e, t)}, q["text"])
+
     def test_a_broken_gold_pointer_is_caught(self):
         c = synth.generate(synth.knobs_at(300, 2, 0.5))
         c.questions[0]["gold"] = [(c.questions[0]["gold"][0] + 1) % len(c.leaves)]
+        self.assertNotEqual(c.questions[0]["kind"], "set")
         with self.assertRaises(AssertionError):
             self.check(c)
 
@@ -177,9 +203,10 @@ class QuestionKnobs(unittest.TestCase):
         a = synth.generate(synth.knobs_at(1000, 6, 0.5, paraphrase=0.0))
         b = synth.generate(synth.knobs_at(1000, 6, 0.5, paraphrase=1.0))
         self.assertEqual([L["text"] for L in a.leaves], [L["text"] for L in b.leaves])     # the corpus is unchanged
+        point = lambda c: [q for q in c.questions if q["kind"] != "set"]
         self.assertEqual(sum(q["para"] for q in a.questions), 0)
-        self.assertEqual(sum(q["para"] for q in b.questions), len(b.questions))
-        for q in b.questions:
+        self.assertEqual(sum(q["para"] for q in point(b)), len(point(b)))
+        for q in point(b):
             g = b.leaves[q["gold"][0]]
             phrase = q["text"].split("What is the ")[1].split(" for ")[0]
             self.assertNotEqual(phrase, synth.ATTRS[g["attr"]][g["form"]])

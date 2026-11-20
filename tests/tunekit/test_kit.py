@@ -108,6 +108,30 @@ class Baseline(unittest.TestCase):
         self.assertEqual(out[1]["rr"], 0.5)
 
 
+class Analyze(unittest.TestCase):
+    def cell(self, n, seed, k10, nq=400):
+        r = lambda k: {"k": k, "n": nq, "p": k / nq}
+        return {"cell": f"wide_c0.5_n{n}_s{seed}", "n_questions": nq, "hit1": r(k10 - 20), "hit5": r(k10), "hit10": r(k10), "bm25_hit10": r(k10),
+                "knn_hit10": r(k10), "mrr10": 0.9, "stale_first": {"k": 1, "n": 10}, "latency_ms": {"p50": 10, "p95": 20},
+                "took_ms": {"p50": 3, "p95": 5}, "knn_exact_check": {"mean_top10_overlap_with_exact": 1.0, "max_abs_cosine_error": 0.0},
+                "question_drop_rate": 0.0, "ingest": {"leaves_per_s": 20, "leaf_index_bytes": 1000 * n}}
+
+    def test_fall_points_follow_the_pre_stated_rule(self):
+        from tunekit import analyze
+        cells = [self.cell(64, s, 398) for s in (1, 2, 3)] + [self.cell(1000, s, 396) for s in (1, 2, 3)] + \
+                [self.cell(4000, s, 340) for s in (1, 2, 3)] + [self.cell(20000, s, 250) for s in (1, 2)]
+        rows = analyze.curve_rows(cells, "t")
+        fp = analyze.fall_points(rows)[0]
+        self.assertEqual(fp["smallest_size"], 64)
+        self.assertEqual(fp["metric"], "hit10")
+        self.assertEqual(fp["first_below_0.95"], 4000)       # 340/400 = 0.85
+        self.assertEqual(fp["first_below_0.90"], 4000)
+        self.assertEqual(fp["separated_fall_at"], 4000)      # 1000: 0.99 is not separated from 0.995 with n = 1200
+        flat = analyze.fall_points(analyze.curve_rows([self.cell(n, s, 396) for n in (64, 1000, 20000) for s in (1, 2)], "t"))[0]
+        self.assertIsNone(flat["separated_fall_at"])
+        self.assertIsNone(flat["first_below_0.95"])
+
+
 class ExactKnn(unittest.TestCase):
     def setUp(self):
         rng = np.random.default_rng(3)
