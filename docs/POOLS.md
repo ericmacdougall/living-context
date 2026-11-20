@@ -844,7 +844,7 @@ tenant, and a pointer of another tenant fails to open (3.6).
 | Injection into model prompts is a convention | The gateway wraps, escapes and labels memory; it cannot stop a model obeying text it was given |
 | A token is a bearer credential for its lifetime | Not bound to a device or connection; short `TOKEN_TTL`, per-token revoke and the scope bound the exposure |
 | Refusals hide pool existence by shape, not by timing | Checks run from memory; a timing difference is a memory lookup, not a store read |
-| A retyped copy has no lineage | Only `pool_copy` records lineage; text an agent reads and saves again is a new memory, reached only by subject erasure; the taint rule still stops write-down |
+| A retyped copy has no lineage | Only `pool_copy` records lineage; text an agent reads and saves again is a new memory, reached only by subject erasure; the taint rule still holds a tainted save for a human reviewer (2.8) |
 | Superseded or retracted text stays in node gists until the next rebuild | The version filter (3.9) removes the leaf from results at once; a node gist written before keeps its wording until that node is rebuilt |
 | An agent with `save` on a shared pool can plant instruction-like text | Provenance, the origin join, labelling, quota, review mode and retraction reduce it; they do not remove it |
 | Taint holds writes for a human | A conversation that chose to read a more restricted or private pool cannot save into another pool without a human approval (2.8); holds queue up in the review interface |
