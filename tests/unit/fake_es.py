@@ -83,4 +83,9 @@ class FakeAuthz:
         if method == "DELETE":
             return (200, {}) if self.docs.pop(did, None) is not None else (404, {})
         kinds = body["query"]["terms"]["kind"]
-        return 200, {"hits": {"hits": [{"_id": i, "_source": d} for i, d in self.docs.items() if d.get("kind") in kinds]}}
+        keys = [i for i, d in self.docs.items() if d.get("kind") in kinds]          # insertion order stands for `_doc`
+        start = (int(body["search_after"][0]) + 1) if body.get("search_after") else 0
+        size = int(body.get("size", 10))
+        self.searches = getattr(self, "searches", 0) + 1
+        page = list(enumerate(keys))[start:start + size]
+        return 200, {"hits": {"hits": [{"_id": i, "_source": self.docs[i], "sort": [n]} for n, i in page]}}

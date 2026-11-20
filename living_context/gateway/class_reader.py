@@ -66,6 +66,8 @@ def _clause_ok(c: Any) -> bool:
     if not isinstance(c, dict) or len(c) != 1:
         return False
     (k, v), = c.items()
+    if k == "terms":   # a list of plain values: never a terms LOOKUP ({"index": ..., "id": ..., "path": ...}), which reads another document
+        return isinstance(v, dict) and all(isinstance(x, list) and all(isinstance(y, (str, int, float, bool)) for y in x) for x in v.values())
     if k in _FILTER_LEAVES:
         return isinstance(v, dict)
     if k == "bool":
@@ -91,6 +93,23 @@ def _has_pool_term(query: Any, pool: str) -> bool:
     return False
 
 
+_AGG_TYPES = {"terms", "cardinality", "value_count", "min", "max", "sum", "avg"}   # an allow-list: `global`, `top_hits`, `filters`, scripts and the rest are refused
+
+
+def _aggs_ok(aggs: Any, depth: int = 0) -> bool:
+    if not isinstance(aggs, dict) or depth > 3:
+        return False
+    for spec in aggs.values():
+        if not isinstance(spec, dict):
+            return False
+        types = [k for k in spec if k != "aggs"]
+        if len(types) != 1 or types[0] not in _AGG_TYPES or not isinstance(spec[types[0]], dict) or "script" in spec[types[0]]:
+            return False
+        if "aggs" in spec and not _aggs_ok(spec["aggs"], depth + 1):
+            return False
+    return True
+
+
 def check_request(body: Any, pool: str) -> None:
     """Refuse a search body that is not a pure filter-context request carrying the pool term."""
     if not isinstance(body, dict) or not set(body) <= _ALLOWED_TOP:
@@ -98,6 +117,8 @@ def check_request(body: Any, pool: str) -> None:
     keys = set(_walk(body))
     if any(k in keys for k in _SCORED_OR_UNSAFE):
         raise ReaderRefused("scored_or_unsafe")
+    if "aggs" in body and not _aggs_ok(body["aggs"]):
+        raise ReaderRefused("aggregation_not_allowed")
     q = body.get("query")
     if q is None or not _clause_ok(q) or not _has_pool_term(q, pool):
         raise ReaderRefused("no_pool_term")

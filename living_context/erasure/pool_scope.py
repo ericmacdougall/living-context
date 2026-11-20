@@ -98,6 +98,13 @@ class PoolEraser:
         st, r = self._er().request("GET", f"/{pool_index(self.tenant, cls, pool, 'leaf')}/_alias")
         return sorted(r) if st == 200 and isinstance(r, dict) else []
 
+    @staticmethod
+    def _del(er, index: str, did: str, rc) -> None:
+        st, _ = er.request("DELETE", f"/{index}/_doc/{did}")
+        if st not in (200, 404):
+            raise PoolEraseError("delete failed")
+        rc.docs_deleted += st == 200
+
     def delete(self, cls: str, pool: str) -> PoolReceipt:
         check_pool_id(pool)
         t0, rc = time.monotonic(), PoolReceipt()
@@ -110,19 +117,24 @@ class PoolEraser:
             rc.boundary_s = time.monotonic() - t0
             self._pause("boundary")
             er = self._er()
-            for index, did in docs:
-                st, _ = er.request("DELETE", f"/{index}/_doc/{did}")
-                if st not in (200, 404):
-                    raise PoolEraseError("delete failed")
-                rc.docs_deleted += st == 200
+            # the pool's own record (`pp:` in authz, `pm:` manifest) goes LAST: until the keys are destroyed and the indices dropped it is
+            # what lets a restarted gateway find the pool in state `deleting` and finish the delete (a crash at any step is resumable)
+            last = [(i, d) for i, d in docs if d.startswith(("pp:", "pm:"))]
+            for index, did in [x for x in docs if x not in last]:
+                self._del(er, index, did, rc)
+            self._pause("docs")
             if not self._b["keys"]:
                 for leaf in sorted(leaves):
                     self._ks.destroy(leaf_id=leaf)
                     rc.keys_destroyed += 1
+            self._pause("keys")
             if not self._b["keep"]:
                 for phys in physical:
                     self._drop(phys)
                     rc.indices_dropped.append(phys)
+            self._pause("indices")
+            for index, did in last:
+                self._del(er, index, did, rc)
         for index in sorted({i for i, _ in docs}):
             try:
                 purge.purge_index(er, index, deadline_s=self._pd, interval_s=self._pi)

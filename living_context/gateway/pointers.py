@@ -35,30 +35,49 @@ class Sealed:
 
 
 class PointerKeys:
+    """Key versions, one `version:hex[:retired]` line each. A retirement is written to the file (fsynced, with its directory) so a restart
+    cannot open a retired version's pointers again or seal new ones under it."""
+
     def __init__(self, path: Path):
         self._path = Path(path)
         self._keys: dict[int, bytes] = {}
         self._retired: set[int] = set()
         if self._path.exists():
             for line in self._path.read_text().split():
-                v, _, h = line.partition(":")
-                self._keys[int(v)] = bytes.fromhex(h)
+                parts = line.split(":")
+                self._keys[int(parts[0])] = bytes.fromhex(parts[1])
+                if len(parts) > 2 and parts[2] == "retired":
+                    self._retired.add(int(parts[0]))
+            if not self._keys:
+                raise ValueError("pointer key file holds no key")   # an empty file is an error, never "no keys, rotate later"
         else:
             self.rotate()
 
-    def rotate(self) -> int:
-        v = max(self._keys, default=0) + 1
-        self._keys[v] = os.urandom(32)
+    def _write(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         tmp = self._path.with_suffix(".tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f:
-            f.write("\n".join(f"{k}:{x.hex()}" for k, x in sorted(self._keys.items())) + "\n")
+            f.write("\n".join(f"{k}:{x.hex()}" + (":retired" if k in self._retired else "") for k, x in sorted(self._keys.items())) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, self._path)
+        dfd = os.open(self._path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+
+    def rotate(self) -> int:
+        v = max(self._keys, default=0) + 1
+        self._keys[v] = os.urandom(32)
+        self._write()
         return v
 
     def retire(self, version: int) -> None:
-        self._retired.add(version)
+        if version in self._keys:
+            self._retired.add(version)
+            self._write()
 
     def current(self) -> tuple[int, bytes]:
         v = max(k for k in self._keys if k not in self._retired)
@@ -73,7 +92,7 @@ def seal(keys: PointerKeys, tenant: str, s: Sealed, *, rand=None) -> str:
     body = _BODY.pack(s.pool.encode(), s.kind, s.gen, bytes.fromhex(s.id), s.version)
     # SIV is nonce-misuse resistant: a nonce derived from the content makes a pointer stable, so the same leaf version is always the
     # same string (replays and comparisons) and nothing about the content is revealed beyond equality
-    nonce = hmac.new(k, b"nonce" + tenant.encode() + b"\x00" + body, "sha256").digest()[:12] if rand is None else rand(12)
+    nonce = hmac.new(hmac.new(k, b"pointer-nonce-subkey", "sha256").digest(), tenant.encode() + b"\x00" + body, "sha256").digest()[:12] if rand is None else rand(12)
     ct = AESGCMSIV(k).encrypt(nonce, body, tenant.encode())
     return base64.b32encode(bytes([FORMAT, v]) + nonce + ct).decode().rstrip("=").lower()
 

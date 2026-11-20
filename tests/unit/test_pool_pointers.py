@@ -41,6 +41,17 @@ class Sealed(unittest.TestCase):
         again = pointers.PointerKeys(Path(self.tmp.name) / "k")
         self.assertEqual(pointers.open_(again, "tenaaa", t), self.s)
 
+    def test_l3_a_retirement_survives_a_restart_and_an_empty_key_file_is_an_error(self):
+        old = pointers.seal(self.keys, "tenaaa", self.s)
+        self.keys.rotate()
+        self.keys.retire(1)
+        again = pointers.PointerKeys(Path(self.tmp.name) / "k")
+        self.assertIsNone(pointers.open_(again, "tenaaa", old))               # a retired version stays retired after a restart
+        self.assertEqual(again.current()[0], 2)                                 # and never seals a new pointer
+        (Path(self.tmp.name) / "empty").write_text("")
+        with self.assertRaises(ValueError):
+            pointers.PointerKeys(Path(self.tmp.name) / "empty")
+
 
 if __name__ == "__main__":
     unittest.main()

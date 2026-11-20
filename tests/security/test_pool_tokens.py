@@ -71,7 +71,7 @@ class World:
         if not apply_journal:
             self.rev.extra_replay = None   # BROKEN variant: the journal is not applied on top of the authz copy
         self.rev.start()
-        self.svc.confirm_against_authz(loaded["persisted"])
+        self.svc.confirm_against_authz(loaded["persisted"], complete=loaded["complete"])
         return loaded
 
     def start(self):

@@ -128,17 +128,19 @@ class Taint(Base):
         hold = self.tt.holds(human, {"pool": b})["holds"]
         self.assertEqual(len(hold), 1)
         hid = hold[0]["hold"]
-        self.assertEqual(self.tt.release(agent, {"pool": b, "hold": hid, "decision": "admit"}), UNAV)    # an agent token of the same principal
-        self.assertEqual(self.tt.release(weak, {"pool": b, "hold": hid, "decision": "admit"}), UNAV)
+        self.assertEqual(self.tt.release(agent, {"pool": b, "hold": hid, "decision": "admit", "content_hash": "x"}), UNAV)    # an agent token of the same principal
+        self.assertEqual(self.tt.release(weak, {"pool": b, "hold": hid, "decision": "admit", "content_hash": "x"}), UNAV)
         n = self.leaves(b)
         qonly = self.mint("carol", {b: {"query", "save"}}, conv="cv-h3", human=True)                      # human, no `review`
-        self.assertEqual(self.tt.release(qonly, {"pool": b, "hold": hid, "decision": "admit"}), UNAV)
+        self.assertEqual(self.tt.release(qonly, {"pool": b, "hold": hid, "decision": "admit", "content_hash": "x"}), UNAV)
         self.assertEqual(self.leaves(b), n)
-        res = self.tt.release(human, {"pool": b, "hold": hid, "decision": "admit"})
+        shown = self.tt.hold_show(human, {"pool": b, "hold": hid})
+        self.assertEqual(self.tt.hold_show(agent, {"pool": b, "hold": hid}), UNAV)               # showing needs the same human checks
+        res = self.tt.release(human, {"pool": b, "hold": hid, "decision": "admit", "content_hash": shown["content_hash"]})
         self.assertTrue(res["ok"], res)
         self.assertEqual(self.leaves(b), n + 1)
         self.assertEqual(self.tt.fetch(human, {"pointer": res["pointer"]})["origin"], "agent")     # a release does not change origin
-        self.assertEqual(self.tt.release(human, {"pool": b, "hold": hid, "decision": "admit"}), UNAV)   # once
+        self.assertEqual(self.tt.release(human, {"pool": b, "hold": hid, "decision": "admit", "content_hash": shown["content_hash"]}), UNAV)   # once
         # discard
         self.assertEqual(self.tt.save(t, {"pool": b, "text": "to be discarded", "key": "r3"})["error"], "held")
         h2 = [x for x in self.tt.holds(human, {"pool": b})["holds"] if x["state"] == "held"][0]["hold"]
@@ -147,7 +149,40 @@ class Taint(Base):
         bad = self.tools_with(self.st, broken_release_by_review_only=True)
         self.assertEqual(self.tt.save(t, {"pool": b, "text": "third held", "key": "r4"})["error"], "held")
         h3 = [x for x in self.tt.holds(human, {"pool": b})["holds"] if x["state"] == "held"][0]["hold"]
-        self.assertTrue(bad.release(agent, {"pool": b, "hold": h3, "decision": "admit"})["ok"])
+        h3hash = bad.hold_show(agent, {"pool": b, "hold": h3})["content_hash"]
+        self.assertTrue(bad.release(agent, {"pool": b, "hold": h3, "decision": "admit", "content_hash": h3hash})["ok"])
+
+    def held(self, b, r, text, key, conv):
+        t = self.mint("carol", {r: {"query", "save"}, b: {"query", "save"}}, conv=conv)
+        self.tt.fetch(t, {"pointer": self.tt.save(t, {"pool": r, "text": "secret plan " + key, "key": "r" + key})["pointer"]})
+        self.assertEqual(self.tt.save(t, {"pool": b, "text": text, "key": key})["error"], "held")
+        human = self.mint("carol", {b: {"query", "save", "review"}}, conv=conv + "h", human=True)
+        hid = [x for x in self.tt.holds(human, {"pool": b})["holds"] if x["state"] == "held"][-1]["hold"]
+        return human, hid
+
+    def test_m8_the_release_binds_the_shown_content_is_logged_and_is_idempotent(self):
+        import threading
+        r, b = self.world()
+        human, hid = self.held(b, r, "release me carefully", "m8a", "cv-m8")
+        shown = self.tt.hold_show(human, {"pool": b, "hold": hid})
+        self.assertIn("release me carefully", shown["text"])
+        self.assertTrue(shown["text"].startswith("<memory "))                                     # model-visible only inside the envelope
+        n = self.leaves(b)
+        for bad_hash in (None, "", "0" * 64, shown["content_hash"][:-1] + ("1" if shown["content_hash"][-1] != "1" else "2")):                  # a release of other content, or of none
+            self.assertEqual(self.tt.release(human, {"pool": b, "hold": hid, "decision": "admit", "content_hash": bad_hash}), UNAV)
+        self.assertEqual(self.leaves(b), n)
+        out = []
+        ts = [threading.Thread(target=lambda: out.append(self.tt.release(human, {"pool": b, "hold": hid, "decision": "admit",
+                                                                                 "content_hash": shown["content_hash"]}))) for _ in range(2)]
+        [x.start() for x in ts]
+        [x.join() for x in ts]
+        self.assertEqual(self.leaves(b), n + 1)                                                   # two concurrent admits write one leaf
+        self.refresh()
+        st, ev = self.admin.request("POST", f"/lc-{T}-restricted-ctl/_search", {"query": {"bool": {"filter": [{"term": {"kind": "event"}}, {"term": {"pool": b}}]}}})
+        names = sorted(h["_source"]["event"] for h in ev["hits"]["hits"])
+        self.assertIn("hold_show", names)
+        self.assertEqual(names.count("hold_admit"), 1)
+        self.assertNotIn("release me carefully", str(ev))                                         # hashes and ids only, never the text
 
 if __name__ == "__main__":
     unittest.main()

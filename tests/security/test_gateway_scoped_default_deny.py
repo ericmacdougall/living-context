@@ -8,7 +8,7 @@ from living_context.gateway.handler import POOL_TOOLS, Gateway
 from living_context.gateway.pool_admin import POOL_OPS
 from tests.security.test_pool_tokens import Base, T, UNAV, World, q
 
-SCOPED_OK = {"pool_save", "pool_update", "pool_query", "pool_fetch", "pool_holds", "pool_release", "pool_retract", "pool_list",
+SCOPED_OK = {"pool_save", "pool_update", "pool_query", "pool_fetch", "pool_holds", "pool_hold_show", "pool_release", "pool_retract", "pool_list",
              "pool_describe", "token_revoke", "ping"}
 
 

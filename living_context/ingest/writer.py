@@ -22,6 +22,7 @@ called after each step and may raise to simulate a crash or block to force an in
 from __future__ import annotations
 
 import base64
+import hmac
 import datetime
 import json
 import threading
@@ -150,6 +151,15 @@ class Writer:
             time.sleep(0.005)
         raise WriterError("sequence counter contended")
 
+    def bind_pools(self, active: Callable[[str], bool]) -> None:
+        """`active(pool)`: whether the pool still accepts writes. Checked inside every pool commit, under the shared side of the write
+        gate, so a pool delete (which takes the gate exclusively after flipping the state) cannot be raced by a write that was authorized
+        earlier (POOLS 9.4)."""
+        self._pool_active = active
+
+    def _pool_ok(self, pool: Optional[str]) -> bool:
+        return pool is None or getattr(self, "_pool_active", None) is None or bool(self._pool_active(pool))
+
     def advance_head(self, cls: str, leaf_id: str, lv: int, pool: Optional[str] = None) -> int:
         """Create or advance the leaf head `lh:<leaf_id>` (`lh:<pool>:<leaf_id>` in a pool) to at least `lv` by compare-and-set;
         return the stored version."""
@@ -174,7 +184,14 @@ class Writer:
 
     def update_head(self, cls: str, pool: str, leaf_id: str, expect_lv: int, **fields) -> bool:
         """Set fields of a pool leaf head by compare-and-set, only while its `current_lv` is still `expect_lv`. False when the head
-        moved on or is gone (the caller reports a version conflict)."""
+        moved on or is gone (the caller reports a version conflict). Taken under the shared side of the write gate, and refused when the
+        pool is no longer active."""
+        with self._gate.shared():
+            if not self._pool_ok(pool):
+                return False
+            return self._update_head(cls, pool, leaf_id, expect_lv, **fields)
+
+    def _update_head(self, cls: str, pool: str, leaf_id: str, expect_lv: int, **fields) -> bool:
         idx, hid = class_index(self.tenant, cls, "ctl"), f"lh:{pool}:{leaf_id}"
         for _ in range(CAS_TRIES):
             cur = self._cget(cls, "ctl", hid, pool)
@@ -206,7 +223,7 @@ class Writer:
                   key: Optional[str] = None, source_ref: Optional[dict] = None, refresh: bool = True,
                   _admitted: bool = False, _version: Optional[tuple] = None, pool: Optional[str] = None,
                   prov: Optional[dict] = None) -> WriteResult:
-        if cls == TENANT_CLS or (pool is not None and self._reader is None):
+        if cls == TENANT_CLS or (pool is not None and self._reader is None) or not self._pool_ok(pool):
             return WriteResult(REFUSED)
         if not isinstance(text, str) or not text.strip():
             return WriteResult(EMPTY)
@@ -270,7 +287,8 @@ class Writer:
         idx = class_index(self.tenant, cls, "ctl")
         self._es.request("POST", f"/{idx}/_refresh")
         st, r = self._es.request("POST", f"/{idx}/_search", {"size": 1000, "_source": ["qid", "created_at", "state"],
-                                                              "query": {"term": {"kind": "quarantine"}}})
+                                                              "query": {"bool": {"filter": [{"term": {"kind": "quarantine"}}],
+                                                                                 "must_not": [{"exists": {"field": "pool"}}]}}})   # not the holds of a pool
         if st != 200:
             raise WriterError("quarantine scan failed")
         return sorted((h["_source"] for h in r["hits"]["hits"]), key=lambda d: d["created_at"])
@@ -297,6 +315,12 @@ class Writer:
         return res if decision == "admit" else WriteResult("rejected")
 
     def record_retraction(self, cls: str, pool: str, leaf_id: str, lv: int, principal: str, actor: str, reason: str, state: str) -> None:
+        with self._gate.shared():   # under the write gate and refused for a pool that is going away (POOLS 9.4)
+            if not self._pool_ok(pool):
+                raise WriterError("pool not active")
+            self._record_retraction(cls, pool, leaf_id, lv, principal, actor, reason, state)
+
+    def _record_retraction(self, cls: str, pool: str, leaf_id: str, lv: int, principal: str, actor: str, reason: str, state: str) -> None:
         """The append-only record of a retraction or of a request for one (POOLS 3.5), in the class control index, inside the erasure
         closure by lineage (`lin_leaf_ids`, the actor in `lin_subjects`)."""
         prefix = "rt" if state == "done" else "rq"
@@ -306,6 +330,12 @@ class Writer:
 
     # ---- held saves of a tainted conversation (POOLS 2.8) -------------------------------------------------------
     def hold_tainted(self, principal: str, taint_cls: str, pool: str, lin_pools: Iterable[str], text: str, prov: dict) -> str:
+        with self._gate.shared():   # under the write gate and refused for a pool that is going away (POOLS 9.4)
+            if not self._pool_ok(pool):
+                raise WriterError("pool not active")
+            return self._hold_tainted(principal, taint_cls, pool, lin_pools, text, prov)
+
+    def _hold_tainted(self, principal: str, taint_cls: str, pool: str, lin_pools: Iterable[str], text: str, prov: dict) -> str:
         """Keep a save that the write floor held: ciphertext under its own data key (named by the subject tokens found in the text and
         the writer), stored at the TAINT class in the class control index with `pool = target` and `lin_pools` = the private set, so
         every erasure and the pool delete reach it. It is never written to the target pool's indices."""
@@ -319,11 +349,34 @@ class Writer:
         self._es.request("POST", f"/{class_index(self.tenant, taint_cls, 'ctl')}/_refresh")
         return hid
 
-    def release_held(self, taint_cls: str, pool: str, pool_cls: str, hid: str, decision: str, release_prov: Optional[dict] = None) -> WriteResult:
-        """`admit` writes the held text into the target pool as an ordinary pool leaf (origin and writer kept from the hold: a release does
-        not change origin) and strips the held ciphertext; `discard` strips it. Either way the key is destroyed."""
+    def held_text(self, taint_cls: str, pool: str, hid: str):
+        """(text, content hash) of a held save that is still held or being released, for the human who is about to approve it; None when
+        there is no such hold. The hash is what a release binds to (POOLS 3.5: show, then hash)."""
         cur = self._cget(taint_cls, "ctl", f"th:{pool}:{hid}", pool)
-        if cur is None or cur["_source"].get("state") != "held" or decision not in ("admit", "discard"):
+        if cur is None or cur["_source"].get("state") not in ("held", "releasing"):
+            return None
+        s = cur["_source"]
+        text = json.loads(self._ks.decrypt(hid, 1, base64.b64decode(s["ct"]), base64.b64decode(s["nonce"])))["text"]
+        return text, self._ks.digest("content", text.encode())
+
+    def record_event(self, cls: str, pool: str, name: str, principal: str, subjects: Iterable[str], **fields) -> None:
+        """A gateway event row (POOLS 2.8, 3.1): an append-only `event` document in the class control index (read only through the class
+        reader), lineage by pool and subjects, no text (hashes and ids only), so the pool delete and every erasure reach it and no signal
+        counts it as a recall."""
+        doc = self._base("event", cls, lin_subjects=sorted(set(subjects) | {principal}), lin_pools=[pool], pool=pool, event=name,
+                         actor_token=principal, **fields)
+        self._put(class_index(self.tenant, cls, "ctl"), f"ev:{pool}:{name}:{new_leaf_id()}", doc, cls=cls, create=True)
+
+    def release_held(self, taint_cls: str, pool: str, pool_cls: str, hid: str, decision: str, release_prov: Optional[dict] = None,
+                     expect_hash: Optional[str] = None) -> WriteResult:
+        """`admit` writes the held text into the target pool as an ordinary pool leaf (origin and writer kept from the hold: a release does
+        not change origin) and strips the held ciphertext; `discard` strips it. Either way the key is destroyed. An admit binds to the
+        content hash the human was shown, claims the hold (`held` to `releasing` by compare-and-set) before writing, and writes the leaf
+        under a key derived from the hold id, so two concurrent admits, a double click and a retry after a crash write one leaf."""
+        idx = class_index(self.tenant, taint_cls, "ctl")
+        cur = self._cget(taint_cls, "ctl", f"th:{pool}:{hid}", pool)
+        state = None if cur is None else cur["_source"].get("state")
+        if state not in ("held", "releasing") or decision not in ("admit", "discard") or (decision == "discard" and state != "held"):
             return WriteResult(REFUSED)
         s = cur["_source"]
         res = WriteResult(REFUSED)
@@ -331,14 +384,26 @@ class Writer:
             held = json.loads(self._ks.decrypt(hid, 1, base64.b64decode(s["ct"]), base64.b64decode(s["nonce"])))
             if s.get("prov", {}).get("mode") not in (None, "save"):
                 return WriteResult(REFUSED)   # only a held save can be released here; a held update is not releasable yet
-            res = self.remember(s["principal"], pool_cls, held["text"], pool=pool, prov=dict(s["prov"], **(release_prov or {})))
+            if expect_hash is None or not hmac.compare_digest(str(expect_hash), self._ks.digest("content", held["text"].encode())):
+                return WriteResult(REFUSED)   # the human approved other content than the one held
+            if state == "held":
+                st, _ = self._put(idx, f"th:{pool}:{hid}", dict(s, state="releasing"), cls=taint_cls, cas=(cur["_seq_no"], cur["_primary_term"]))
+                if st not in (200, 201):
+                    return WriteResult(REFUSED)   # another admit claimed it first
+            res = self.remember(s["principal"], pool_cls, held["text"], pool=pool, key=f"release:{hid}",
+                                prov=dict(s["prov"], **(release_prov or {})))
             if not res.ok:
                 return res
+            cur = self._cget(taint_cls, "ctl", f"th:{pool}:{hid}", pool)
+            if cur is None or cur["_source"].get("state") != "releasing":
+                return res   # a concurrent admit already finished: one leaf, the same answer
+            s = cur["_source"]
         doc = {k: v for k, v in s.items() if k not in ("ct", "nonce", "key_ref")}
         doc["state"] = "released" if decision == "admit" else "discarded"
-        self._put(class_index(self.tenant, taint_cls, "ctl"), f"th:{pool}:{hid}", doc, cls=taint_cls, cas=(cur["_seq_no"], cur["_primary_term"]))
-        self._es.request("POST", f"/{class_index(self.tenant, taint_cls, 'ctl')}/_refresh")
-        self._ks.destroy(leaf_id=hid)
+        st, _ = self._put(idx, f"th:{pool}:{hid}", doc, cls=taint_cls, cas=(cur["_seq_no"], cur["_primary_term"]))
+        if st in (200, 201):
+            self._es.request("POST", f"/{idx}/_refresh")
+            self._ks.destroy(leaf_id=hid)
         return res if decision == "admit" else WriteResult("discarded")
 
     # ---- idempotency ------------------------------------------------------------------------------
@@ -412,7 +477,7 @@ class Writer:
         if have is not None:
             return  # resumed after the append
         if self._ks.has_key(leaf_id, lv):  # a key made before a crash that never reached the append
-            self._ks.destroy(leaf_id=leaf_id)
+            self._ks.destroy_exact_version(leaf_id, lv)   # this version only: the live earlier versions of the leaf keep their keys
         ct, nonce, key_ref = self._ks.encrypt(leaf_id, lv, text.encode(), tokens)
         self._pause("key_made")
         doc = self._base("src", cls, lin_subjects=tokens, lin_leaf_ids=[leaf_id], leaf_id=leaf_id, lv=lv, src_seq=seq,

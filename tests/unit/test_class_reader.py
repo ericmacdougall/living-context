@@ -104,6 +104,21 @@ class ReaderTests(unittest.TestCase):
             with self.assertRaises(ReaderRefused, msg=str(extra)):
                 check_request({**ok, **extra}, A)
 
+    def test_l1_aggregations_are_an_allow_list_and_a_terms_lookup_is_refused(self):
+        from living_context.gateway.class_reader import check_request
+        pool_q = {"bool": {"filter": [{"term": {"pool": A}}]}}
+        for aggs in ({"g": {"global": {}, "aggs": {"t": {"top_hits": {"size": 50}}}}}, {"t": {"top_hits": {"size": 5}}},
+                     {"f": {"filters": {"filters": {"x": {"match_all": {}}}}}}, {"s": {"terms": {"script": "doc['x']"}}},
+                     {"ok": {"terms": {"field": "kind"}, "aggs": {"bad": {"global": {}}}}}, {"two": {"terms": {"field": "k"}, "sum": {"field": "n"}}}):
+            with self.assertRaises(ReaderRefused, msg=str(aggs)):
+                check_request({"query": pool_q, "aggs": aggs, "size": 0}, A)
+        lookup = {"bool": {"filter": [{"term": {"pool": A}}, {"terms": {"kind": {"index": "lc-x-base-ctl", "id": "d", "path": "kind"}}}]}}
+        with self.assertRaises(ReaderRefused):
+            check_request({"query": lookup}, A)
+        for aggs in ({"k": {"terms": {"field": "kind"}}}, {"c": {"cardinality": {"field": "x"}}, "m": {"max": {"field": "n"}}},
+                     {"k": {"terms": {"field": "kind"}, "aggs": {"n": {"value_count": {"field": "x"}}}}}):
+            check_request({"query": pool_q, "aggs": aggs, "size": 0}, A)
+
     def test_unreadable_kind_and_path_injection_are_refused(self):
         r = reader(world())
         with self.assertRaises(ReaderRefused):

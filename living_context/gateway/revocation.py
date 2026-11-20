@@ -97,8 +97,32 @@ class RevocationService:
         if not self._b["nostart"]:
             self._io.fsync_dir(self._dir)
 
+    def _take_lock(self) -> bool:
+        """One process serves a tenant's journal (DESIGN 20): an exclusive non-blocking lock (`lockf`) on a lock file beside it. A second process
+        finds the lock held and refuses to start (the tenant stays closed there) instead of serving stale grants and revocations."""
+        import fcntl
+        import os
+        fd = os.open(self._dir / "epochs.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)   # a POSIX lock: per process, so a restart inside one process is not refused
+        except OSError:
+            os.close(fd)
+            return False
+        self._lock_fd = fd
+        return True
+
+    def _drop_lock(self) -> None:
+        fd, self._lock_fd = getattr(self, "_lock_fd", None), None
+        if fd is not None:
+            import os
+            os.close(fd)   # closing the descriptor releases the flock
+
     def start(self) -> str:
         with self._lock:
+            if getattr(self, "_lock_fd", None) is None and not self._take_lock():
+                self._j = None
+                self._fault("journal in use by another process")
+                return self.state
             j = Journal(self.journal_path, self._io)
             if j.torn:
                 self._j = j
@@ -134,6 +158,7 @@ class RevocationService:
             if self._j:
                 self._j.close()
                 self._j = None
+            self._drop_lock()
 
     def _write_shutdown(self) -> None:
         if self._j is not None and (self.state == OPEN or (self._b["shutdown_faulted"] and self.state == FAULT)):

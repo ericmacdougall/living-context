@@ -188,6 +188,23 @@ class Keystore:
             self._after_destroy(db)
         return [r[2] for r in rows]
 
+    def destroy_exact_version(self, leaf_id: str, lv: int) -> list[str]:
+        """Destroy the data key of exactly one (leaf id, version). A writer that finds a key made for a version whose append never
+        happened uses this, so the live earlier versions of the same leaf keep their keys."""
+        db = self._db
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            rows = db.execute("SELECT key_ref FROM leaf_keys WHERE leaf_id=? AND lv=?", (leaf_id, int(lv))).fetchall()
+            db.execute("DELETE FROM leaf_keys WHERE leaf_id=? AND lv=?", (leaf_id, int(lv)))
+            db.execute("DELETE FROM leaf_subjects WHERE leaf_id=? AND lv=?", (leaf_id, int(lv)))
+            db.execute("COMMIT")
+        except Exception:
+            db.execute("ROLLBACK")
+            raise
+        if rows:
+            self._after_destroy(db)
+        return [r[0] for r in rows]
+
     def destroy(self, *, subject_token: str | None = None, leaf_id: str | None = None,
                 leaf_ids: Iterable[str] | None = None) -> list[str]:
         """Destroy every data key named by a subject token, by a leaf, or by a set of leaves (one VACUUM for the whole call,

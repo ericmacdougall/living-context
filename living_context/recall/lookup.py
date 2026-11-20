@@ -82,7 +82,8 @@ class EsLeafStore:
 
     def _search(self, pattern: str, ids: list, source: list):
         st, r = self._es.request("POST", f"/{pattern}/_search?ignore_unavailable=true", {
-            "size": 1, "_source": source, "query": {"ids": {"values": ids}}})
+            "size": 1, "_source": source, "query": {"bool": {"filter": [{"ids": {"values": ids}}],
+                                                         "must_not": [{"exists": {"field": "pool"}}]}}})   # a pool's documents are read only through the pool tools
         return r["hits"]["hits"][0]["_source"] if st == 200 and r["hits"]["hits"] else None
 
     def leaf(self, leaf_id: str, lv: int) -> Optional[dict]:

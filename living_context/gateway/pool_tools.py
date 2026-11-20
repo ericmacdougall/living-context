@@ -44,6 +44,12 @@ def err(code: str, **extra) -> dict:
     return {"ok": False, "error": code, **extra}
 
 
+def pl_taint(cls: str, private_ids: list, directory, tenant: str):
+    """The taint of having read a hold: its class and the private pools in its set."""
+    from .session_state import Taint
+    return Taint(cls, frozenset(x for x in private_ids if (directory.get(tenant, x) is not None and directory.get(tenant, x).private)))
+
+
 def least_trusted(*origins: str) -> str:
     return min(origins, key=lambda o: ORIGIN_RANK.get(o, 0))
 
@@ -61,6 +67,7 @@ class PoolTools:
         self.tenant, self.dir, self.sessions, self.lattices, self.w, self.reader = tenant, directory, sessions, lattices, writer, reader
         self.es_for, self.keys, self.c, self._clock = es_for, keys, consts or Constants(), clock
         self.states = states
+        self.w.bind_pools(lambda pid: (lambda p: p is not None and p.state == pl.ACTIVE)(self.dir.get(self.tenant, pid)))
         self._model = model   # never called: stage 0 costs no model call (a test passes a port that fails if it is touched)
         self._b = dict(head=broken_no_head_filter, pool_head=broken_pool_from_head, origin=broken_origin_from_editor,
                        key=broken_key_scope_without_conversation, refill=broken_no_refill, raw_title=broken_raw_title,
@@ -77,7 +84,7 @@ class PoolTools:
     def handle(self, op: str, p, rec, req: Mapping[str, Any], *, token: str) -> dict:
         try:
             return {"pool_save": self.save, "pool_update": self.update, "pool_query": self.query, "pool_fetch": self.fetch,
-                    "pool_holds": self.holds, "pool_release": self.release, "pool_retract": self.retract}[op](token, req)
+                    "pool_holds": self.holds, "pool_hold_show": self.hold_show, "pool_release": self.release, "pool_retract": self.retract}[op](token, req)
         except (ReaderRefused, wmod.WriterError, StateError):
             return UNAVAILABLE
 
@@ -332,7 +339,9 @@ class PoolTools:
             result = "retracted"
             if head is not None and head.source.get("status") == "live":
                 cur = int(head.source["current_lv"])
-                leaf = self._leaf(pool.cls, pool.id, x.id, cur) or {}
+                leaf = self._leaf(pool.cls, pool.id, x.id, cur)
+                if leaf is None:
+                    return UNAVAILABLE   # fail closed: an unread leaf is never assumed to be agent-written (a 429, a 503, a missing leaf)
                 if auth.rec.actor == "agent" and leaf.get("origin", "agent") != "agent" and not self._b["ret_human"]:
                     self.w.record_retraction(pool.cls, pool.id, x.id, cur, auth.rec.principal_token, "agent", reason, "requested")
                     result = "held"       # the item stays live until a human with `review` confirms
@@ -358,31 +367,65 @@ class PoolTools:
         return {"ok": True, "holds": [{"hold": d.id.split(":")[2], "state": d.source.get("state"), "at": d.source.get("created_at")}
                                       for _, d in self._holds_of(auth.rec, auth.principal, auth.pools[pid])]}
 
-    def release(self, token: str, req: Mapping[str, Any]) -> dict:
-        """Release (`admit`) or discard a held save. Needs a token of actor `human` that holds `review` and `query` on the target pool and
-        `query` on every pool of the hold's private set, and whose read set covers the taint class. Approval is a human declassification
-        and is logged by the gateway event of the tool call."""
-        pid, hid, decision = req.get("pool"), req.get("hold"), req.get("decision")
-        if not (isinstance(pid, str) and isinstance(hid, str) and decision in ("admit", "discard")):
-            return UNAVAILABLE
+    def _hold_auth(self, token: str, req: Mapping[str, Any]):
+        """The checks of a human reviewing a hold (show and release): a token of actor `human` holding `review` and `query` on the target
+        pool and `query` on every pool of the hold's private set, whose read set covers the taint class. Returns (auth, pool, cls, doc, hid)."""
+        pid, hid = req.get("pool"), req.get("hold")
+        if not (isinstance(pid, str) and isinstance(hid, str)):
+            return None
         need = {pl.REVIEW} if self._b["review_only"] else {pl.REVIEW, pl.QUERY}
         auth = authorize(self.sessions, self.dir, self.lattices, token, {pid: need})
         if auth is None or (auth.rec.actor != "human" and not self._b["review_only"]):
-            return UNAVAILABLE
+            return None
         pool = auth.pools[pid]
         found = [(c, d) for c, d in self._holds_of(auth.rec, auth.principal, pool) if d.id == f"th:{pid}:{hid}"]
         if not found:
-            return UNAVAILABLE
+            return None
         cls, doc = found[0]
         priv = [x for x in doc.source.get("lin_pools", []) if x != pid]
         if priv and not self._b["review_only"] and authorize(self.sessions, self.dir, self.lattices, token, {x: {pl.QUERY} for x in priv}) is None:
-            return UNAVAILABLE
+            return None
         if not self._b["review_only"] and not decide(auth.principal, Op.RECALL, tenant=self.tenant, lattice=self.lattices[self.tenant], cls=cls):
+            return None
+        return auth, pool, cls, doc, hid
+
+    def hold_show(self, token: str, req: Mapping[str, Any]) -> dict:
+        """What the human is about to approve: the held text (inside the data envelope) and its content hash, which `release` must carry.
+        Reading it raises this conversation's taint to the hold's class and private set, durably, before the response goes."""
+        got = self._hold_auth(token, req)
+        if got is None:
             return UNAVAILABLE
-        res = self.w.release_held(cls, pid, pool.cls, hid, decision, {"released_by": auth.rec.principal_token})
+        auth, pool, cls, doc, hid = got
+        shown = self.w.held_text(cls, pool.id, hid)
+        if shown is None:
+            return UNAVAILABLE
+        text, digest = shown
+        if self.states is not None:
+            self.states.raise_to(auth.rec, pl_taint(cls, [x for x in doc.source.get("lin_pools", []) if x != pool.id], self.dir, self.tenant))
+        self.w.record_event(cls, pool.id, "hold_show", auth.rec.principal_token, doc.source.get("lin_subjects", []), hold=hid, content_hash=digest)
+        return {"ok": True, "hold": hid, "text": envelope.wrap(pool.id, pool.label, "agent", "fetch", "held", "held save", text), "content_hash": digest}
+
+    def release(self, token: str, req: Mapping[str, Any]) -> dict:
+        """Release (`admit`) or discard a held save. Same checks as `hold_show`. An admit must carry the content hash that `hold_show`
+        returned (the human approves the content they saw), is claimed before it is written, and is logged as a gateway event (hashes and
+        ids only). A discard needs no hash."""
+        decision = req.get("decision")
+        if decision not in ("admit", "discard"):
+            return UNAVAILABLE
+        got = self._hold_auth(token, req)
+        if got is None:
+            return UNAVAILABLE
+        auth, pool, cls, doc, hid = got
+        pid = pool.id
+        res = self.w.release_held(cls, pid, pool.cls, hid, decision, {"released_by": auth.rec.principal_token},
+                                  expect_hash=req.get("content_hash") if decision == "admit" else None)
+        ok = res.status == "discarded" if decision == "discard" else res.status == wmod.STORED
+        if ok:
+            self.w.record_event(cls, pid, "hold_" + decision, auth.rec.principal_token, doc.source.get("lin_subjects", []), hold=hid,
+                                content_hash=req.get("content_hash", ""))
         if decision == "discard":
-            return {"ok": True, "status": "discarded"} if res.status == "discarded" else UNAVAILABLE
-        return self._answer(res, pid) if res.status == wmod.STORED else UNAVAILABLE
+            return {"ok": True, "status": "discarded"} if ok else UNAVAILABLE
+        return self._answer(res, pid) if ok else UNAVAILABLE
 
     # ---- pool_query ------------------------------------------------------------------------------------------------------
     def query(self, token: str, req: Mapping[str, Any]) -> dict:
@@ -490,6 +533,6 @@ class PoolRouter:
         self.service, self.tools = service, tools
 
     def handle(self, op: str, p, rec, req, *, token: str = ""):
-        if op in ("pool_save", "pool_update", "pool_query", "pool_fetch", "pool_holds", "pool_release", "pool_retract"):
+        if op in ("pool_save", "pool_update", "pool_query", "pool_fetch", "pool_holds", "pool_hold_show", "pool_release", "pool_retract"):
             return self.tools.handle(op, p, rec, req, token=token)
         return self.service.handle(op, p, rec, req)
