@@ -218,7 +218,8 @@ Rules that keep these inside the existing design:
   in the pool's log rows, which carry lineage, so erasure reaches them.
 - The evaluator's state between evaluations is one control document `ad:<pool>`
   in the pool's control index: per trigger a consecutive-evaluation count,
-  `cool_until`, an outcome count `k` (5.6), `leaf_count_at_outcome`, and the
+  `cool_until`, an outcome count `k` (4.4), `leaf_count_at_outcome`, the
+  attempt's spend `attempt_spent` (4.4), and the
   probation counters of 5.3. Scalars only, so it needs no lineage; a schema test
   asserts it. Signal values are recomputed at each evaluation, never stored.
 
@@ -283,9 +284,17 @@ Stage 1 to 2 (propose the learning layer), all of:
 - A move needs its condition at `E_CONSEC` consecutive non-void evaluations spaced
   at least `EVAL_PERIOD` apart; a failing evaluation resets the count.
 - After any adopted move, no further move for `D_DWELL`.
-- Backoff. An outcome is a candidate that failed its structural checks, aborted
-  (5.6), was rolled back at probation (5.3), or an adopted tree demoted within
-  `D_DWELL` of its adoption. Each outcome sets `k = k + 1`,
+- Attempt. An attempt runs from a proposal until its outcome or until its tree is
+  kept past probation. Its model calls are counted in `attempt_spent`, carried
+  across erasure-abort retries and lease-expiry restarts (5.6) and reset only when
+  an outcome is recorded or the tree is kept, so one attempt never spends more than
+  `B_TRANS` however often it restarts.
+- Backoff. An outcome is an attempt whose candidate failed its structural checks,
+  aborted on a failed build call or `budget_exceeded`, was aborted by
+  `E_ABORT_MAX` erasures in a row (5.6), or was rolled back at probation (5.3), or
+  an adopted tree demoted within `D_DWELL` of its adoption. A single erasure abort
+  or a lease expiry is not an outcome: the attempt continues under its remaining
+  budget. Each outcome sets `k = k + 1`,
   `leaf_count_at_outcome = leaf_count`, and `cool_until = now + COOL_BASE x 2^k`
   capped at `COOL_MAX`; the next proposal also needs `leaf_count >= RHO_RETRY x
   leaf_count_at_outcome`. `k` returns to 0 when a tree stays adopted past
@@ -389,7 +398,8 @@ consistent with that choice; it does not establish it.
    state), takes the build lease (5.6), and sets the candidate's `W` to the
    highest committed source sequence of the pool's leaves. (The pool's `wp` is not
    used: stage 0 does not advance it.) The budget counter (DESIGN 18.1) gets
-   `B_TRANS` (5.4).
+   `B_TRANS - attempt_spent`, with `B_TRANS` computed at the attempt's first `W`
+   (5.4, 4.4).
 2. Build: bulk build over every live leaf of the pool with `src_seq <= W`, read
    from the leaf heads (no queue record is needed). Members carry `gen_from =
    G+1`, so they are invisible until the flip. Build calls go through the model
@@ -507,7 +517,9 @@ rebuild at most `min(new leaves x M_MAX, level-1 nodes)` calls plus ancestor pat
 
 Enforcement:
 
-- The counter refuses a call past `B_TRANS`; the candidate aborts with the typed
+- The counter refuses a call that would take the attempt's `attempt_spent` (4.4,
+  carried across retries and restarts, gap rebuild included) past `B_TRANS`; the
+  candidate aborts with the typed
   outcome `budget_exceeded` (counted apart from `no_benefit`, because it means
   the bound or the build is wrong), and the backoff applies.
 - Per-tenant hourly budget and fair queue apply (DESIGN 15). Hitting the hourly
@@ -536,10 +548,10 @@ Enforcement:
 | Structural check fails | delete the candidate; outcome `structure_fail` |
 | `B_TRANS` reached | abort; outcome `budget_exceeded` |
 | Probation rolls back | 1 to 0 down-move (4.4); outcome `no_benefit` |
-| An erasure's boundary publishes mid-transition | the commit takes the shared side of the write gate and checks the published tombstone sequence; an intersecting tombstone aborts the candidate (DESIGN 7.6 step 6). Retry after the erasure's closure finishes; `E_ABORT_MAX` such aborts in a row count as one outcome (a pool under constant erasure may stay at its stage; limit) |
+| An erasure's boundary publishes mid-transition | the commit takes the shared side of the write gate and checks the published tombstone sequence; an intersecting tombstone aborts the candidate (DESIGN 7.6 step 6). Retry after the erasure's closure finishes, in the same attempt and under its remaining budget (4.4); `E_ABORT_MAX` such aborts in a row end the attempt as one outcome (a pool under constant erasure may stay at its stage; limit) |
 | Pool deleted mid-run | the pool-scope tombstone aborts the commit; the candidate's documents are in the pool's closure |
 | Builder paused by the hourly budget | keeps its lease: the lease is renewed by a heartbeat every `LEASE_BEAT` while the builder process lives, paused or not |
-| Builder crash | no heartbeat for `3 x LEASE_BEAT`: the lease expires, the next evaluator deletes the candidate's unshared documents and may re-propose after `cool_until`; a restarted build re-uses cached outputs |
+| Builder crash | no heartbeat for `3 x LEASE_BEAT`: the lease expires, the next evaluator deletes the candidate's unshared documents and restarts the same attempt under its remaining budget (4.4); a restarted build re-uses cached outputs; a crash loop ends `budget_exceeded` |
 | Head compare-and-set lost | another writer changed the head: discard and re-propose; with the lease this cannot happen between two transitions of one pool |
 | Stored-byte cap reached | typed refusal of the candidate's writes (DESIGN 15), abort |
 | Revocation or tenant disable | the job runs as the pool's service principal; a disabled tenant stops its jobs |
@@ -746,7 +758,7 @@ With DESIGN 6.4's 1,000 shards per node, about 20 system shards and provisioning
 80% ceiling, about 780 shards are usable per node. One tenant with two classes uses
 3 + 8 = 11, leaving room for about 190 pools at stage 0 or about 85 at stage 2 per
 data node with no replicas, and half that with one replica. A tenant with 500
-person pools at stage 0 and one replica needs about 4,000 shards, about 5 data
+person pools at stage 0 and one replica needs about 4,000 shards, 6 data (4,000 / 780 = 5.1, rounded up)
 nodes. Provisioning refuses a pool that would take the node above the 80% ceiling,
 with a typed refusal. Many small indices also cost cluster-state size and per-shard
 overhead (SOURCE: the shard-size guidance cited in DESIGN 5.6). This is the price of
@@ -783,13 +795,15 @@ the counter only.
     (broken: one threshold; no dwell; count not reset).
   - Signals: an embedding outage over a window with every gate otherwise met starts
     no transition and resets no count (broken: failures counted as hard); injection
-    and probe rows are absent from every signal (broken: `via` not filtered); one
+    and probe rows are absent from every signal, and a planted probe appears in no
+    stored query and no probation count (broken: `via` not filtered); one
     principal issuing 1,000 recalls moves `hard_rate` by at most `U_PRINC /
     W_UNITS` (broken: no cap); a caller-supplied task id is ignored.
   - Structural checks: a candidate with a leaf in no node, or a node without
     lineage, is not adopted (broken: adopt on build completion).
-  - Probation: with the stub's router replaced by a random router (a known-bad
-    tree), the tree is rolled back at `N_PROB` in at least 95% of seeded runs; with
+  - Probation, with opens scripted as the fixture's gold items opened (as TUNING
+    D7): with the stub's router replaced by a random router (a known-bad tree), the
+    tree is rolled back at `N_PROB` in at least 95% of seeded runs; with
     the normal stub, kept in at least 95% (broken: no probation; probation on
     offers instead of opens). With opens void, the tree is kept and
     `probation_void` is written.
@@ -798,7 +812,9 @@ the counter only.
     build(N, 2)` over all attempts (broken: re-propose at the next evaluation).
   - Budget: with the stub set to the measured profile (one build call per 16
     leaves at level 1, 67 calls per recall), a transition's counter never exceeds
-    `B_TRANS`, and a call past it aborts with `budget_exceeded` (broken: no cap).
+    `B_TRANS`, and a call past it aborts with `budget_exceeded` (broken: no cap); an
+    attempt aborted by `E_ABORT_MAX - 1` erasures and one killed builder still
+    spends at most `B_TRANS` in total (broken: budget reset on retry or restart).
   - Lease: a builder paused by the hourly budget for longer than three heartbeat
     periods keeps its lease and its candidate (broken: wall-clock lease); a killed
     builder's lease expires and its candidate is deleted.
@@ -897,7 +913,7 @@ the tier code.
 | Probation needs opens | With `open_share` outside the DESIGN 9 bounds the tree is kept (`probation_void`) and only the memory-based down-move can remove it |
 | The difficulty features are heuristics | Tuned on development data; a wrong "easy" costs recall, a wrong "hard" costs calls; the sampled escalation measures the error |
 | Implicit supersedes and contradictions are detected only at stage 2 | Detection shares the typing call (DESIGN 7.7); an explicit `pool_update supersede` is honoured at every stage (POOLS 3.9) |
-| A pool under constant erasure may never complete a transition | Each intersecting erasure aborts the candidate (7.6) |
+| A pool under constant erasure may never complete a transition | Each intersecting erasure aborts the candidate (5.6, DESIGN 7.6) |
 | Adaptive state holds scalars derived from the pool | Counts and timestamps only; not content; recomputed from live data |
 | A tree has upkeep costs | After adoption each batch rebuild calls the model per level-1 node with pending members (DESIGN 7.6) |
 | One principal can still help meet the difficulty gate | Its share is capped at `U_PRINC`; the cost it can cause is the transition bound and the backoff |
