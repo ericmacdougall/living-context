@@ -1002,8 +1002,9 @@ independent reviews of this revision from different models or agents.
     leaf in `lin_leaf_ids` without a copy is reported by the verifier (broken:
     closure by pool id only; closure by `lin_leaf_ids` over every index, which
     erases B's copy).
-  - Version filter refill: in a pool where 60 of the top 50 matches are retracted,
-    a recall still returns live matches (broken: no refill).
+  - Version filter refill: in a pool where all of the top 50 matches are
+    retracted and live matches rank below them, a recall still returns live
+    matches (broken: no refill).
   - Loop jobs: reflection for a search over pool A reads no document of pool B
     (request-plan assertion; broken: per-class reflection).
 - Acceptance criteria:
