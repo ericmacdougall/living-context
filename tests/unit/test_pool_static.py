@@ -31,7 +31,7 @@ class Static(unittest.TestCase):
         text = (ROOT / "ingest/writer.py").read_text()
         body = text[text.index("def _cget"):text.index("def _get(self")]
         self.assertIn("self._reader.get(", body)
-        for fn in ("advance_head", "update_head"):
+        for fn in ("advance_head", "_update_head"):
             seg = text[text.index(f"def {fn}"):]
             seg = seg[:seg.index("\n    def ", 10)]
             self.assertIn("_cget(", seg, fn)

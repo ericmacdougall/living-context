@@ -369,5 +369,43 @@ class OldReaders(Base):
         self.assertEqual(self.writer.quarantine_list("base"), [])       # a pool's hold is not in the class's quarantine list
 
 
+class CountingModel:
+    """A model port that counts every touch and fails it (the stage 0 contract: no model call of any kind)."""
+
+    def __init__(self):
+        self.touched = []
+
+    def call(self, task, inputs, *, ctx):
+        self.touched.append(task)
+        raise AssertionError(f"the model port was used ({task})")
+
+
+class StageZero(Base):
+    def tools_at(self, stage, model):
+        return PoolTools(T, self.dir, self.sessions, __import__("tests.security.test_pools_es", fromlist=["x"]).LAT, self.writer, self.reader,
+                         lambda cls: self.cc(f"read-{cls}"), self.keys, consts=self.consts, model=model, stage_of=lambda pid: stage)
+
+    def test_item0b_every_stage_0_operation_runs_with_a_port_that_raises_and_never_touches_it(self):
+        a = self.pool("alpha", ops={"query", "save", "update", "retract"})
+        model = CountingModel()
+        tools = self.tools_at(0, model)                                    # the port is in the object under test
+        tok = self.mint("alice", {a: {"query", "save", "update", "retract"}})
+        s = tools.save(tok, {"pool": a, "text": "stage zero fact about herons", "key": "k1"})
+        self.assertTrue(s["ok"], s)
+        self.refresh()
+        self.assertEqual(len(tools.query(tok, {"query": "herons"})["items"]), 1)
+        self.assertEqual(tools.fetch(tok, {"pointer": s["pointer"]})["status"], "ok")
+        u = tools.update(tok, {"pointer": s["pointer"], "mode": "correct", "text": "stage zero fact about egrets", "key": "u1"})
+        self.assertTrue(u["ok"], u)
+        self.assertTrue(tools.retract(tok, {"pointers": [u["pointer"]], "reason": "wrong", "key": "r1"})["ok"])
+        self.assertEqual(model.touched, [])
+        # control: the same code with the pool at stage 1 DOES reach the port (so the zero above is a result, not an artefact)
+        hot = self.tools_at(1, model)
+        for op in (lambda: hot.query(tok, {"query": "herons"}), lambda: hot.save(tok, {"pool": a, "text": "stage one fact", "key": "k2"})):
+            with self.assertRaises(AssertionError):
+                op()
+        self.assertEqual(sorted(model.touched), ["route", "write"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -63,12 +63,13 @@ class PoolTools:
                  broken_raw_title: bool = False, broken_best_match_pool: bool = False, states: Optional[SessionStates] = None,
                  broken_taint_ignored: bool = False, broken_hold_in_target: bool = False, broken_release_by_review_only: bool = False,
                  broken_default_selection_over_g: bool = False, broken_agent_retracts_human: bool = False,
-                 broken_no_retract_rate: bool = False):
+                 broken_no_retract_rate: bool = False, stage_of: Optional[Callable[[str], int]] = None):
         self.tenant, self.dir, self.sessions, self.lattices, self.w, self.reader = tenant, directory, sessions, lattices, writer, reader
         self.es_for, self.keys, self.c, self._clock = es_for, keys, consts or Constants(), clock
         self.states = states
         self.w.bind_pools(lambda pid: (lambda p: p is not None and p.state == pl.ACTIVE)(self.dir.get(self.tenant, pid)))
-        self._model = model   # never called: stage 0 costs no model call (a test passes a port that fails if it is touched)
+        self._model = model   # reached only through `_stage_hook`, and only for a pool above stage 0
+        self._stage_of = stage_of or (lambda pool_id: 0)
         self._b = dict(head=broken_no_head_filter, pool_head=broken_pool_from_head, origin=broken_origin_from_editor,
                        key=broken_key_scope_without_conversation, refill=broken_no_refill, raw_title=broken_raw_title,
                        best=broken_best_match_pool, taint=broken_taint_ignored, hold_target=broken_hold_in_target,
@@ -89,6 +90,13 @@ class PoolTools:
             return UNAVAILABLE
 
     # ---- helpers ---------------------------------------------------------------------------------------------------------
+    def _stage_hook(self, pool, what: str) -> None:
+        """The one place a pool operation may reach the model port: only a pool above stage 0 consults it (the tree path). A stage 0 pool
+        never does; the tests hand this class a port that raises, so a stage 0 operation that reached it would fail at once, and a stage 1
+        pool shows the port IS reachable from here (the assertion is not vacuous)."""
+        if self._stage_of(pool.id) >= 1:
+            self._model.call(what, {"pool": pool.id}, ctx=None)
+
     def _seal(self, pool: str, leaf_id: str, lv: int) -> str:
         return pointers.seal(self.keys, self.tenant, pointers.Sealed(pool, KIND_LEAF, 0, leaf_id, lv))
 
@@ -154,6 +162,7 @@ class PoolTools:
             return bad or err("invalid")
         if not self._rate_ok(rec):
             return err("rate_limited")
+        self._stage_hook(pool, "write")
         if self._tainted_write(rec, pool):
             return self._hold(rec, pool, req["text"], "save")
         scope_key = key if self._b["key"] else f"{rec.conversation}\x00{key}"   # (tenant, principal, conversation, key)
@@ -458,6 +467,7 @@ class PoolTools:
             raised = self._raise(rec, [G[h] for h in S])
         lists, info = {}, {}
         for pid in S:
+            self._stage_hook(G[pid], "route")
             lists[pid] = self._pool_candidates(G[pid], text, info)
         salt = hashlib.sha256(token.encode() + text.encode()).hexdigest()[:16]
         keyed = {pid: [i for i, _ in rows] for pid, rows in lists.items()}
