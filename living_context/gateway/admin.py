@@ -29,8 +29,18 @@ OK_ANSWER = {"ok": True}
 REFUSED = {"ok": False, "error": "refused"}
 UNAVAILABLE = {"ok": False, "error": "unavailable"}
 PENDING = {"ok": False, "error": "pending"}
-ADMIN_OPS = frozenset({"grant", "revoke", "remove_class", "break_glass_revoke"})
-REVOKE_LANE_OPS = frozenset({"revoke", "remove_class", "break_glass_revoke"})   # their own admission lane (DESIGN 4.4)
+ADMIN_OPS = frozenset({"grant", "revoke", "remove_class", "break_glass_revoke", "offboard_tenant"})
+REVOKE_LANE_OPS = frozenset({"revoke", "remove_class", "break_glass_revoke", "offboard_tenant"})   # their own admission lane (DESIGN 4.4)
+LANE_ROLES = {"revoke": frozenset({Role.TENANT_ADMIN, Role.REVOKER}), "remove_class": frozenset({Role.TENANT_ADMIN}),
+              "break_glass_revoke": frozenset({Role.OPERATOR}), "offboard_tenant": frozenset({Role.OPERATOR})}   # who may use the lane for which call (the policy decides the rest)
+
+
+def lane_allowed(op: Any, p: Principal) -> bool:
+    """The revoke lane is for authenticated principals whose role admits the operation; a request merely shaped like a revoke
+    (a reader's, an unknown role's) goes to the tenant's general lane, where the handler refuses it."""
+    return isinstance(op, str) and op in LANE_ROLES and bool(LANE_ROLES[op] & p.roles)
+
+
 PENDING_S = 900.0   # ASSUMPTION: a first administrator's call waits this long for the second
 
 
@@ -47,6 +57,11 @@ class GrantStore:
     def get(self, tenant: str, token: str) -> Optional[Principal]:
         with self._lock:
             return self._g.get((tenant, token))
+
+    def restore(self, p: Principal) -> None:
+        """A grant read back at start-up: memory only, no persist."""
+        with self._lock:
+            self._g[(p.tenant, p.token)] = p
 
     def put(self, p: Principal) -> None:
         with self._lock:
@@ -65,9 +80,10 @@ class Admin:
                  broken_self_grant: bool = False, broken_single_admin_revokes_privileged: bool = False,
                  broken_removal_without_bump: bool = False, broken_operator_authority_in_tenant: bool = False,
                  broken_ignore_recovery_admins: bool = False,
-                 broken_signature_not_bound_to_action: bool = False):
+                 broken_signature_not_bound_to_action: bool = False,
+                 offboard: Optional[Callable[[str], Any]] = None):
         self._st, self._ep, self._lat, self._rev, self._tok = store, epochs, lattices, revocations, principal_token
-        self._clock, self._pending_s = clock, pending_s
+        self._clock, self._pending_s, self._offboard = clock, pending_s, offboard
         self._pending: dict[tuple[str, str], tuple[str, float]] = {}
         self._lock = threading.Lock()
         self._b = dict(self_grant=broken_self_grant, single=broken_single_admin_revokes_privileged,
@@ -78,6 +94,8 @@ class Admin:
     def handle(self, op: str, tenant: str, p: Principal, req: Mapping[str, Any]) -> dict:
         if op == "break_glass_revoke":
             return self.break_glass(p, req)
+        if op == "offboard_tenant":
+            return self.offboard_tenant(p, req)
         lattice = self._lat.get(tenant)
         who = req.get("who")
         if lattice is None or not isinstance(who, str) or not who:
@@ -192,6 +210,17 @@ class Admin:
         return {"ok": True, "epoch": epoch}
 
     # ---- the operator --------------------------------------------------------------------------------------------
+    def offboard_tenant(self, p: Principal, req: Mapping[str, Any]) -> dict:
+        """The operator's tenant-wide revocation (offboarding, key compromise): the gateway drops every client of the tenant at once
+        and, when the deployment wired a key owner, the cluster keys are invalidated. The operator's own authority only."""
+        tenant = req.get("target_tenant")
+        if not isinstance(tenant, str) or not tenant or self._offboard is None:
+            return REFUSED
+        if not decide(p, Op.BREAK_GLASS_REVOKE, tenant=tenant, lattice=ClassLattice(["none"], [])):
+            return REFUSED
+        self._offboard(tenant)
+        return OK_ANSWER
+
     def break_glass(self, p: Principal, req: Mapping[str, Any]) -> dict:
         tenant, who = req.get("target_tenant"), req.get("who")
         if not isinstance(tenant, str) or not isinstance(who, str) or not who:

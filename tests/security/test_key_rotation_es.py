@@ -5,7 +5,10 @@ The tenant key owner (a native user with `manage_own_api_key` and index privileg
 provisioning, rotates them and invalidates them; the bootstrap credential is used only to create the owner. Broken variants:
   * a rotation that needs the superuser (it reads the users first; the owner is refused);
   * a gateway key with `manage_api_key` (it creates and invalidates keys, so the check that the gateway key cannot goes red);
-  * a tenant-wide drop that forgets the clients and lets the next request build a new one from the old key files."""
+  * a tenant-wide drop that forgets the clients and lets the next request build a new one from the old key files;
+  * T7 (EXPERIMENT 9.1, N=100): every one of 100 invalidated keys fails within 5 s and stays failed, and the gateway's own path
+    refuses at once (broken: a gateway that caches an authenticated client keeps handing it out)."""
+import concurrent.futures as cf
 import os
 import stat
 import tempfile
@@ -170,6 +173,67 @@ class KeyOwner(unittest.TestCase):
         with self.assertRaises(AssertionError) as cm:
             self.check_drop(Lazy(URL, CA, {T: self.keys}))
         self.assertIn("still reaches the tenant", str(cm.exception))
+
+    # ---- T7: invalidation within the fixed bound of 5 s, N = 100 keys (EXPERIMENT 9.1) -------------------------------------------
+    T7_BOUND_S, T7_N = 5.0, 100
+
+    def check_t7(self, gate):
+        """100 keys are created by the tenant's key owner and every one authenticates; the owner invalidates them all, and each key
+        is polled (concurrently) from the moment the invalidation returned: the time to its first 401 must be at most 5 s, and it
+        must still be refused after the bound. The gateway's own path (`drop_tenant`) refuses at once."""
+        paths = []
+        for i in range(self.T7_N):
+            st, body = self.owner.request("POST", "/_security/api_key", {
+                "name": f"lc-{T}-t7-{i}", "expiration": "1h",
+                "role_descriptors": {"r": {"indices": [{"names": [f"lc-{T}-*"], "privileges": ["read"]}]}}})
+            self.assertEqual(st, 200)
+            f = self.root / f"t7-{i}.key"
+            f.write_text(body["encoded"])
+            os.chmod(f, 0o600)
+            paths.append(str(f))
+        clients = [EsClient(URL, CA, f) for f in paths]
+        with cf.ThreadPoolExecutor(16) as ex:
+            self.assertTrue(all(ex.map(lambda c: c.request("GET", "/_security/_authenticate")[0] == 200, clients)),
+                            "premise: every key authenticates before the invalidation")
+        gate.reload(T, self.keys)
+        self.assertEqual(self.search(gate.client(T, "read-base")), 200)
+        self.assertGreaterEqual(len(invalidate_all(self.owner, T)), self.T7_N)
+        t_inv = time.time()
+        gate.drop_tenant(T)
+        try:
+            gate.client(T, "read-base")
+            self.fail("the gateway's own path still hands out a client after the invalidation")
+        except EsError:
+            pass
+        self.assertLess(time.time() - t_inv, 0.5, "the gateway's own path did not refuse at once")
+
+        def time_to_refusal(c):
+            while time.time() - t_inv < self.T7_BOUND_S + 1.0:
+                if c.request("GET", "/_security/_authenticate")[0] == 401:
+                    return time.time() - t_inv
+                time.sleep(0.05)
+            return float("inf")
+
+        with cf.ThreadPoolExecutor(16) as ex:
+            lat = list(ex.map(time_to_refusal, clients))
+        self.t7_max = max(lat)
+        self.assertLessEqual(self.t7_max, self.T7_BOUND_S, f"a key still worked {self.t7_max:.2f} s after its invalidation (bound 5 s)")
+        with cf.ThreadPoolExecutor(16) as ex:
+            late = list(ex.map(lambda c: c.request("GET", "/_security/_authenticate")[0], clients))
+        self.assertEqual([x for x in late if x != 401], [], "a key worked again after the bound")
+
+    def test_t7_every_invalidated_key_fails_within_five_seconds_and_the_gateway_refuses_at_once(self):
+        self.check_t7(self.gate)
+        print(f"T7 N={self.T7_N}: slowest key refused after {self.t7_max:.2f} s", flush=True)
+
+    def test_broken_t7_gateway_that_caches_an_authenticated_client_is_red(self):
+        class Caching(EsGate):
+            def drop_tenant(self, tenant):   # keeps serving the client it already authenticated
+                pass
+
+        with self.assertRaises(AssertionError) as cm:
+            self.check_t7(Caching(URL, CA, {T: self.keys}))
+        self.assertIn("still hands out a client", str(cm.exception))
 
 
 if __name__ == "__main__":

@@ -50,7 +50,8 @@ class RevocationService:
                  broken_exchange_before_fsync: bool = False, broken_skip_dir_fsync: bool = False,
                  broken_compaction_drops_start: bool = False, broken_lane_open_during_drain: bool = False,
                  broken_shutdown_before_drain: bool = False, broken_journal_error_keeps_tenant_open: bool = False,
-                 broken_compaction_in_place: bool = False):
+                 broken_compaction_in_place: bool = False, broken_admit_before_start_fsync: bool = False,
+                 broken_compaction_copies_shutdown: bool = False):
         self.tenant, self._ep, self._dir = tenant, epochs, Path(directory)
         self._io, self._d_fsync, self._persist, self._clock = io or RealIO(), d_fsync_s, persist, clock
         self._b = dict(wait=broken_wait_for_journal, persist=broken_require_persist, nostart=broken_start_without_fsync,
@@ -58,7 +59,8 @@ class RevocationService:
                        shutdown_faulted=broken_shutdown_when_faulted, xchg_first=broken_exchange_before_fsync,
                        skip_dir=broken_skip_dir_fsync, drop_start=broken_compaction_drops_start,
                        lane_open_drain=broken_lane_open_during_drain, shutdown_first=broken_shutdown_before_drain,
-                       keep_open=broken_journal_error_keeps_tenant_open, in_place=broken_compaction_in_place)
+                       keep_open=broken_journal_error_keeps_tenant_open, in_place=broken_compaction_in_place,
+                       admit_first=broken_admit_before_start_fsync, copy_shutdown=broken_compaction_copies_shutdown)
         self._lock = threading.RLock()
         self.state, self.lane_open, self.fault = CLOSED, False, ""
         self.grant_admins: Optional[set] = None
@@ -102,6 +104,8 @@ class RevocationService:
                 return self.state
             self._replay(j)
             self._j = j
+            if self._b["admit_first"]:   # BROKEN variant: admission opens before the start record is durable
+                self.state, self.lane_open = OPEN, True
             self._write_start(j)  # admission only after this returned
             self.state, self.lane_open = OPEN, True
             self.events.append("open")
@@ -223,6 +227,10 @@ class RevocationService:
                     sj.append({"t": "start", "at": self._clock(), "compacted": True}, sync=sync)
                 for principal, epoch, revoked in self._ep.snapshot(self.tenant):
                     sj.append({"t": "revoke" if revoked else "bump", "principal": principal, "epoch": epoch}, sync=sync)
+                if self._b["copy_shutdown"] and any(r.get("t") == "shutdown" for r in self._j.records):
+                    # BROKEN variant: the previous run's shutdown state is carried into the compacted file, so a crash after it
+                    # reads as a clean stop
+                    sj.append({"t": "shutdown", "at": self._clock()}, sync=sync)
             finally:
                 sj.close()                             # every append fsynced the file
             self._io.exchange(str(self.journal_path), str(spare))   # an error here leaves the old journal in place

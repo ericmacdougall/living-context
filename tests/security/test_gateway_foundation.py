@@ -254,6 +254,26 @@ class PerTenantLimits(unittest.TestCase):
         [r() for r in held]
         [w.join() for w in waiters]
 
+    def check_tenant_lanes(self, **kw):
+        adm = admission.Admission(slots=2, queue=2, revoke_slots=2, **kw)
+        held = [adm.acquire("tena", revoke=True, timeout=0.5) for _ in range(2)]   # tenant A's own lane is full
+        t0 = time.time()
+        try:
+            release = adm.acquire("tenb", revoke=True, timeout=0.5)
+        except admission.Refused:
+            self.fail("another tenant's revoke waited behind tenant A's full revoke lane")
+        self.assertLess(time.time() - t0, 0.2)
+        release()
+        [r() for r in held]
+
+    def test_each_tenant_has_its_own_revoke_lane(self):
+        self.check_tenant_lanes()
+
+    def test_broken_revoke_lane_shared_by_all_tenants_is_red(self):
+        with self.assertRaises(AssertionError) as cm:
+            self.check_tenant_lanes(broken_shared_revoke_lane=True)
+        self.assertIn("another tenant's revoke waited", str(cm.exception))
+
     def test_broken_revoke_on_the_general_queue_is_refused_under_flood(self):
         adm = admission.Admission(slots=2, queue=2)
         held, waiters = self.saturate(adm, "tena")

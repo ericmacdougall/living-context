@@ -6,7 +6,8 @@ Pure, thread-safe primitives; the socket server composes them:
   * one semaphore around parse and dispatch;
   * bounded per-tenant slots, queue and open-connection cap, so one tenant's
     flood waits behind its own limits and cannot take another tenant's slots;
-  * a separate lane for revoke (its own semaphore and queue);
+  * a separate lane for revoke, one per tenant (its own semaphore); the server grants it only after the session resolves and
+    the principal's role allows the operation;
   * lock, cache, rate-limit and idempotency keys embed the tenant in a
     collision-free form (length-prefixed, never a short hash; INV-10, T6).
 """
@@ -67,14 +68,18 @@ class Admission:
     """Per-tenant slots, queue and connection caps plus the global parse semaphore."""
 
     def __init__(self, consts: Constants | None = None, *, slots: int = 4, queue: int = 8,
-                 connections: int = 8, revoke_slots: int = 2, parse_slots: int = 1):
+                 connections: int = 8, revoke_slots: int = 2, parse_slots: int = 1,
+                 broken_shared_revoke_lane: bool = False):
         self.consts = consts or Constants()
         self._slots_n, self._queue_n, self._conn_n = slots, queue, connections
         self._lock = threading.Lock()
         self._slots: dict[bytes, threading.Semaphore] = {}
         self._waiting: dict[bytes, int] = {}
         self._conns: dict[bytes, int] = {}
-        self._revoke = threading.Semaphore(revoke_slots)  # its own lane (LAB-R5)
+        # its own lane (LAB-R5), one per tenant (DESIGN 15): one tenant's authorised revoke calls never wait for another's.
+        # BROKEN variant: one semaphore shared by every tenant
+        self._revoke_n, self._revoke_shared = revoke_slots, (threading.Semaphore(revoke_slots) if broken_shared_revoke_lane else None)
+        self._revoke: dict[bytes, threading.Semaphore] = {}
         self.parse_semaphore = threading.Semaphore(parse_slots)
 
     @staticmethod
@@ -98,11 +103,13 @@ class Admission:
     def acquire(self, tenant: str, *, timeout: float = 5.0, revoke: bool = False) -> Callable[[], None]:
         """Take a slot of the tenant's own pool (or the revoke lane). Returns the release function.
         Refuses at once when the tenant's queue is full, and after `timeout` when no slot frees."""
-        if revoke:
-            if not self._revoke.acquire(timeout=timeout):
-                raise Refused("revoke_lane_busy")
-            return self._revoke.release
         k = self._t(tenant)
+        if revoke:
+            with self._lock:
+                lane = self._revoke_shared or self._revoke.setdefault(k, threading.Semaphore(self._revoke_n))
+            if not lane.acquire(timeout=timeout):
+                raise Refused("revoke_lane_busy")
+            return lane.release
         with self._lock:
             sem = self._slots.setdefault(k, threading.Semaphore(self._slots_n))
             if sem.acquire(blocking=False):

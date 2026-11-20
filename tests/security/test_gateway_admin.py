@@ -6,7 +6,9 @@ No Elasticsearch is needed. Each check has a broken variant that must turn it re
   * class-grant removal is an epoch bump (broken: the grants shrink, the old sessions keep the class);
   * the operator's break-glass depends on nothing a tenant role holds (broken: its authority is a grant a tenant administrator revokes);
   * after a break-glass recovery only the named administrators may grant (broken: the recovery list is not consulted);
-  * the revoke has its own admission lane (broken: it waits in the tenant's general queue behind a flood)."""
+  * the revoke has its own admission lane (broken: it waits in the tenant's general queue behind a flood);
+  * the lane is granted only after the session resolves and the role admits the operation (broken: chosen from the request body, so
+    readers sending revoke-shaped requests occupy it)."""
 import json
 import socket
 import tempfile
@@ -352,6 +354,84 @@ class Lane(unittest.TestCase):
         with self.assertRaises(AssertionError) as cm:
             self.check_lane(broken_revoke_in_general_lane=True)
         self.assertIn("did not pass the flood", str(cm.exception))
+
+    # ---- the lane is granted after the role check, not from the body (DESIGN 4.4, 15) --------------------------------------
+    def check_reader_flood(self, **server_kw):
+        w = World(self)
+        release = threading.Event()
+
+        class Handler:
+            def handle(self, token, req):
+                if req.get("hold"):
+                    release.wait(15)
+                    return {"ok": False, "error": "refused"}
+                return w.gw.handle(token, req)
+
+        adm = admission.Admission(slots=2, queue=0, revoke_slots=2)
+        srv = Server(Handler(), w.sessions, w.ep, lambda t: w.fence, adm=adm, idle_s=5.0, **server_kw).start()
+        self.addCleanup(srv.stop)
+        self.addCleanup(release.set)
+
+        def conn(who):
+            c = socket.create_connection(srv.address, timeout=10)
+            self.addCleanup(c.close)
+            return c, c.makefile("rb"), w.login(who)
+
+        def send(cf, **req):
+            c, f, token = cf
+            c.sendall((json.dumps({"token": token, "request": req}) + "\n").encode())
+            return f
+
+        for who in ("r1", "r2"):   # readers flood revoke-shaped requests that hold whatever they were admitted to
+            send(conn(who), op="revoke", who="a3", hold=True)
+        time.sleep(0.5)
+        a = conn("a1")
+        t0 = time.time()
+        line = send(a, op="revoke", who="r1").readline()
+        dt = time.time() - t0
+        self.assertTrue(json.loads(line).get("ok") and dt < 1.0,
+                        f"the administrator's revoke did not meet its bound under a reader's revoke-shaped flood ({dt:.2f} s, {line!r})")
+        self.assertTrue(w.revoked("r1"))
+        release.set()
+
+    def test_readers_flooding_revoke_shaped_requests_do_not_occupy_the_revoke_lane(self):
+        self.check_reader_flood()
+
+    def test_broken_lane_chosen_from_the_body_is_red(self):
+        with self.assertRaises(AssertionError) as cm:
+            self.check_reader_flood(broken_lane_from_body=True)
+        self.assertIn("did not meet its bound", str(cm.exception))
+
+    def test_lane_roles(self):
+        from living_context.gateway.admin import lane_allowed
+        P = lambda *r: Principal(T, "t", frozenset(r), frozenset(), frozenset())
+        self.assertTrue(lane_allowed("revoke", P(Role.REVOKER)))
+        self.assertTrue(lane_allowed("remove_class", P(Role.TENANT_ADMIN)))
+        self.assertTrue(lane_allowed("break_glass_revoke", P(Role.OPERATOR)))
+        for op in ("revoke", "remove_class", "break_glass_revoke", "grant", "ping", None, 5):
+            self.assertFalse(lane_allowed(op, P(Role.READER, Role.WRITER)), op)
+        self.assertFalse(lane_allowed("remove_class", P(Role.REVOKER)), "a revoker has the single revoke call only")
+
+
+class Offboard(unittest.TestCase):
+    """The operator's tenant-wide revocation reaches `EsGate.drop_tenant` through the gateway (composition root, `boot.py`)."""
+
+    def check_offboard(self, wired=True):
+        dropped = []
+        w = World(self, **({"offboard": dropped.append} if wired else {}))
+        self.assertFalse(w.call("a1", op="offboard_tenant", target_tenant=T).get("ok"), "a tenant administrator offboarded the tenant")
+        self.assertFalse(w.call("r1", op="offboard_tenant", target_tenant=T).get("ok"))
+        self.assertEqual(dropped, [])
+        self.assertTrue(w.call("op", "sysop", op="offboard_tenant", target_tenant=T).get("ok"), "the operator's offboarding did not go through")
+        self.assertEqual(dropped, [T], "the tenant's clients were not dropped")
+
+    def test_the_operator_offboards_a_tenant_through_the_gateway(self):
+        self.check_offboard()
+
+    def test_broken_unwired_offboarding_is_red(self):
+        with self.assertRaises(AssertionError) as cm:
+            self.check_offboard(wired=False)
+        self.assertIn("did not go through", str(cm.exception))
 
 
 if __name__ == "__main__":

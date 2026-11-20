@@ -6,7 +6,9 @@ Each check below passes on the build and is turned red by its stated broken vari
     persistence boundary; the third through a restart that must not admit a gateway whose journal lost its start record);
   * one journal shared by all tenants (a second tenant inherits the first tenant's revokes);
   * a revoke lane left open while the clean stop drains;
-  * a shutdown record written before a pending append has drained.
+  * a shutdown record written before a pending append has drained;
+  * admission opened before the start record's fsync returned;
+  * a compaction that carries the previous run's shutdown record into the new file (a crash after it reads as a clean stop).
 The power-loss simulation undoes every byte written and not fsynced, and every name exchange whose directory was not fsynced,
 addressed by inode (a file keeps its identity when the two names are exchanged)."""
 import os
@@ -293,6 +295,52 @@ class CleanStopDrain(Base):
         with self.assertRaises(AssertionError) as cm:
             self.check_shutdown_last(broken_shutdown_before_drain=True)
         self.assertIn("pending append drained", str(cm.exception))
+
+
+class StartAndCompactionState(Base):
+    def check_no_admission_before_the_start_record_is_durable(self, **kw):
+        d = self.fresh()
+        gate = GateIO()
+        s = self.svc(d, io=gate, **kw)
+        gate.arm()
+        t = threading.Thread(target=s.start)
+        t.start()
+        self.assertTrue(gate.entered.wait(10), "the start record never reached its fsync")
+        admitted = s.admit() or s.lane_open
+        gate.release.set()
+        t.join(30)
+        self.assertFalse(admitted, "admission began before the start record's fsync returned")
+        self.assertTrue(s.admit(), "the tenant was not admitted after the start record became durable")
+
+    def test_admission_waits_for_the_durable_start_record(self):
+        self.check_no_admission_before_the_start_record_is_durable()
+
+    def test_broken_admission_before_the_start_fsync_is_red(self):
+        with self.assertRaises(AssertionError) as cm:
+            self.check_no_admission_before_the_start_record_is_durable(broken_admit_before_start_fsync=True)
+        self.assertIn("before the start record's fsync", str(cm.exception))
+
+    def check_compaction_does_not_inherit_the_shutdown_state(self, **kw):
+        d = self.fresh()
+        s1 = self.svc(d)
+        s1.start()
+        s1.revoke("p1")
+        s1.clean_stop()                       # the previous run ended cleanly: its journal holds a shutdown record
+        s2 = self.svc(d, **kw)
+        self.assertEqual(s2.start(), OPEN)
+        s2.revoke("p2")
+        s2.compact()
+        self.close(s2)                        # the process dies: no clean stop, no shutdown record of this run
+        s3 = self.svc(d)
+        self.assertEqual(s3.start(), FAULT, "a crash after a compaction was read as a clean stop (the shutdown state was copied)")
+
+    def test_a_compaction_leaves_the_run_unterminated(self):
+        self.check_compaction_does_not_inherit_the_shutdown_state()
+
+    def test_broken_compaction_copying_the_previous_shutdown_is_red(self):
+        with self.assertRaises(AssertionError) as cm:
+            self.check_compaction_does_not_inherit_the_shutdown_state(broken_compaction_copies_shutdown=True)
+        self.assertIn("read as a clean stop", str(cm.exception))
 
 
 if __name__ == "__main__":

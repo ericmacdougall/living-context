@@ -18,7 +18,7 @@ from typing import Any, Callable
 
 from ..config import Constants
 from . import admission, fence
-from .admin import REVOKE_LANE_OPS
+from .admin import REVOKE_LANE_OPS, lane_allowed
 from .sessions import EpochTable, Sessions
 
 REFUSED_LINE = b'{"error": "refused", "ok": false}\n'
@@ -29,12 +29,14 @@ class Server:
     def __init__(self, handler: Any, sessions: Sessions, epochs: EpochTable,
                  fence_for: Callable[[str], fence.SendFence], adm: admission.Admission | None = None,
                  consts: Constants | None = None, host: str = "127.0.0.1", port: int = 0,
-                 idle_s: float = 2.0, max_unauth: int = 64, broken_revoke_in_general_lane: bool = False):
+                 idle_s: float = 2.0, max_unauth: int = 64, broken_revoke_in_general_lane: bool = False,
+                 broken_lane_from_body: bool = False):
         self.consts = consts or Constants()
         self.handler, self.sessions, self.epochs, self.fence_for = handler, sessions, epochs, fence_for
         self.adm = adm or admission.Admission(self.consts)
         self.idle_s, self.max_unauth = idle_s, max_unauth
         self._general_lane = broken_revoke_in_general_lane   # BROKEN variant: a revoke waits in the tenant's general queue
+        self._lane_from_body = broken_lane_from_body         # BROKEN variant: the lane is chosen from the body, before any role check
         self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._srv.bind((host, port))
@@ -109,7 +111,10 @@ class Server:
                     self._plain(conn, REFUSED_LINE)
                     return
                 try:
-                    lane = (isinstance(req, dict) and req.get("op") in REVOKE_LANE_OPS and not self._general_lane)
+                    op = req.get("op") if isinstance(req, dict) else None
+                    # the lane is granted only to a resolved session whose role admits the operation (DESIGN 4.4, 15)
+                    lane = (not self._general_lane and op in REVOKE_LANE_OPS and
+                            (self._lane_from_body or lane_allowed(op, self.sessions.principal(rec))))
                     release = self.adm.acquire(tenant, timeout=2.0, revoke=lane)
                 except admission.Refused:
                     self._fenced(conn, REFUSED_LINE, rec)
