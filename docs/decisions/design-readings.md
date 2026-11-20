@@ -242,3 +242,9 @@ Each entry names the passages, the reading the build follows and the test that k
   every wave and hand-off, conversation taint and held saves, review mode, retraction, copy, selection by cards, the merge floors, injection,
   and the harness conformance checks (tool list, prompt capture). The pool-scope tombstone is appended to the tombstone journal; restore
   replay of it is not built.
+- Taint (POOLS 2.8): the channel class is the single lowest class of the lattice (none when there is no single lowest class: every pool is then
+  non-neutral until named). The durable copy is read lazily at first use, not at mint (a read failure answers `unavailable`). A held update is stored
+  at the taint class but cannot be released yet; only a held save is releasable. A hint that raises the taint stores it before the search runs.
+- Retraction (POOLS 3.5): built are the direct retraction (agent of an agent-origin leaf, human of any), the held request for an agent retracting a
+  human or import leaf, the append-only records, the rate bounds and the `retracted` resolution for a token that could read the item. Not built: the
+  review queue listing of requests, restore, release to erasure, `RETRACT_POOL_RATE` persistence across restart (counters are in gateway memory).

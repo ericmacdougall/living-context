@@ -296,6 +296,14 @@ class Writer:
         self._ks.destroy(leaf_id=qid)
         return res if decision == "admit" else WriteResult("rejected")
 
+    def record_retraction(self, cls: str, pool: str, leaf_id: str, lv: int, principal: str, actor: str, reason: str, state: str) -> None:
+        """The append-only record of a retraction or of a request for one (POOLS 3.5), in the class control index, inside the erasure
+        closure by lineage (`lin_leaf_ids`, the actor in `lin_subjects`)."""
+        prefix = "rt" if state == "done" else "rq"
+        doc = self._base("retraction", cls, lin_subjects=[principal], lin_leaf_ids=[leaf_id], pool=pool, leaf_id=leaf_id, lv=lv,
+                         actor=actor, reason=reason, state=state)
+        self._put(class_index(self.tenant, cls, "ctl"), f"{prefix}:{pool}:{leaf_id}:{lv}", doc, cls=cls)
+
     # ---- held saves of a tainted conversation (POOLS 2.8) -------------------------------------------------------
     def hold_tainted(self, principal: str, taint_cls: str, pool: str, lin_pools: Iterable[str], text: str, prov: dict) -> str:
         """Keep a save that the write floor held: ciphertext under its own data key (named by the subject tokens found in the text and

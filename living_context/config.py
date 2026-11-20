@@ -80,6 +80,9 @@ class Constants:
     save_rate_per_h: int = 200      # PLACEHOLDER: SAVE_RATE, per conversation, shared by save and update
     k_pool: int = 10                # PLACEHOLDER: K_POOL
     k_total: int = 30               # PLACEHOLDER: K_TOTAL
+    retract_max: int = 20           # PLACEHOLDER: RETRACT_MAX pointers per call
+    retract_rate_per_h: int = 50    # PLACEHOLDER: RETRACT_RATE leaves per principal per hour
+    retract_pool_rate_per_h: int = 200  # PLACEHOLDER: RETRACT_POOL_RATE leaves per pool per hour
     pool_window: int = 50           # POOLS 3.9: each list is cut at 50 before the version filter
 
 

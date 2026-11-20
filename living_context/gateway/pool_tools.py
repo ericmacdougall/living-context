@@ -56,7 +56,8 @@ class PoolTools:
                  broken_key_scope_without_conversation: bool = False, broken_no_refill: bool = False,
                  broken_raw_title: bool = False, broken_best_match_pool: bool = False, states: Optional[SessionStates] = None,
                  broken_taint_ignored: bool = False, broken_hold_in_target: bool = False, broken_release_by_review_only: bool = False,
-                 broken_default_selection_over_g: bool = False):
+                 broken_default_selection_over_g: bool = False, broken_agent_retracts_human: bool = False,
+                 broken_no_retract_rate: bool = False):
         self.tenant, self.dir, self.sessions, self.lattices, self.w, self.reader = tenant, directory, sessions, lattices, writer, reader
         self.es_for, self.keys, self.c, self._clock = es_for, keys, consts or Constants(), clock
         self.states = states
@@ -64,9 +65,10 @@ class PoolTools:
         self._b = dict(head=broken_no_head_filter, pool_head=broken_pool_from_head, origin=broken_origin_from_editor,
                        key=broken_key_scope_without_conversation, refill=broken_no_refill, title=broken_raw_title,
                        best=broken_best_match_pool, taint=broken_taint_ignored, hold_target=broken_hold_in_target,
-                       review_only=broken_release_by_review_only, sel_g=broken_default_selection_over_g)
+                       review_only=broken_release_by_review_only, sel_g=broken_default_selection_over_g, ret_human=broken_agent_retracts_human, ret_rate=broken_no_retract_rate)
         self._lock = threading.Lock()
         self._saves: dict[tuple, list] = {}
+        self._retracts: dict[tuple, list] = {}
         self._update_keys: dict[tuple, tuple] = {}
         self.plan: list[str] = []    # every index an operation named, for the request-plan assertions
 
@@ -74,7 +76,7 @@ class PoolTools:
     def handle(self, op: str, p, rec, req: Mapping[str, Any], *, token: str) -> dict:
         try:
             return {"pool_save": self.save, "pool_update": self.update, "pool_query": self.query, "pool_fetch": self.fetch,
-                    "pool_holds": self.holds, "pool_release": self.release}[op](token, req)
+                    "pool_holds": self.holds, "pool_release": self.release, "pool_retract": self.retract}[op](token, req)
         except (ReaderRefused, wmod.WriterError, StateError):
             return UNAVAILABLE
 
@@ -251,6 +253,8 @@ class PoolTools:
             return {"ok": True, "status": "superseded", "newer": self._seal(pool.id, head.source["superseded_by"], int(nxt.source["current_lv"]))}
         if s.version < cur:
             return {"ok": True, "status": "superseded", "newer": self._seal(pool.id, s.id, cur)}
+        if status == "retracted" and s.version == cur:
+            return {"ok": True, "status": "retracted", "reason": head.source.get("retract_reason", "other")}   # for a token that could read it
         if s.version > cur or status != "live":
             return UNAVAILABLE
         leaf = self._leaf(pool.cls, pool.id, s.id, s.version)
@@ -276,6 +280,57 @@ class PoolTools:
         lat = self.lattices[rec.tenant]
         self.states.raise_to(rec, new)
         return sorted(p.id for p in pools if not (old.cls is not None and lat.dominates(old.cls, p.cls) and (not p.private or p.id in old.private)))
+
+    # ---- pool_retract (POOLS 3.5): hides an item, reversible, never erases ---------------------------------------------------------
+    REASONS = ("wrong", "outdated", "harmful", "private", "other")
+
+    def _retract_rate_ok(self, rec, pool_ids: list) -> bool:
+        if self._b["ret_rate"]:
+            return True
+        now = self._clock()
+        with self._lock:
+            for key, limit in (((rec.tenant, rec.principal_token), self.c.retract_rate_per_h),
+                               *(((rec.tenant, "pool", pid), self.c.retract_pool_rate_per_h) for pid in set(pool_ids))):
+                w = [t for t in self._retracts.get(key, []) if t > now - 3600]
+                need = pool_ids.count(key[2]) if len(key) == 3 else len(pool_ids)
+                if len(w) + need > limit:
+                    return False
+            for key in [(rec.tenant, rec.principal_token)] + [(rec.tenant, "pool", pid) for pid in set(pool_ids)]:
+                w = [t for t in self._retracts.get(key, []) if t > now - 3600]
+                w += [now] * (len(pool_ids) if len(key) == 2 else pool_ids.count(key[2]))
+                self._retracts[key] = w
+        return True
+
+    def retract(self, token: str, req: Mapping[str, Any]) -> dict:
+        ptrs, reason, key = req.get("pointers"), req.get("reason"), req.get("key")
+        if not isinstance(ptrs, list) or not ptrs or len(ptrs) > self.c.retract_max or not all(isinstance(x, str) for x in ptrs):
+            return UNAVAILABLE if not isinstance(ptrs, list) else err("invalid")
+        seals = [pointers.open_(self.keys, self.tenant, x) for x in ptrs]
+        if any(x is None for x in seals):
+            return UNAVAILABLE
+        need = {x.pool: {pl.RETRACT, pl.QUERY} for x in seals}
+        auth = authorize(self.sessions, self.dir, self.lattices, token, need)   # the whole call is unavailable if any pool fails
+        if auth is None:
+            return UNAVAILABLE
+        if reason not in self.REASONS or not isinstance(key, str) or not key:
+            return err("invalid")
+        if not self._retract_rate_ok(auth.rec, [x.pool for x in seals]):
+            return err("rate_limited")
+        out = []
+        for x in seals:
+            pool = auth.pools[x.pool]
+            head = self._head(pool.cls, pool.id, x.id)
+            result = "retracted"
+            if head is not None and head.source.get("status") == "live":
+                cur = int(head.source["current_lv"])
+                leaf = self._leaf(pool.cls, pool.id, x.id, cur) or {}
+                if auth.rec.actor == "agent" and leaf.get("origin", "agent") != "agent" and not self._b["ret_human"]:
+                    self.w.record_retraction(pool.cls, pool.id, x.id, cur, auth.rec.principal_token, "agent", reason, "requested")
+                    result = "held"       # the item stays live until a human with `review` confirms
+                elif self.w.update_head(pool.cls, pool.id, x.id, cur, status="retracted", retract_reason=reason):
+                    self.w.record_retraction(pool.cls, pool.id, x.id, cur, auth.rec.principal_token, auth.rec.actor, reason, "done")
+            out.append(result)     # a leaf already retracted or gone reads the same: no existence signal
+        return {"ok": True, "accepted": True, "results": out}
 
     # ---- held saves: list and release (POOLS 2.8) ----------------------------------------------------------------------------
     def _holds_of(self, rec, p, pool) -> list:
@@ -426,6 +481,6 @@ class PoolRouter:
         self.service, self.tools = service, tools
 
     def handle(self, op: str, p, rec, req, *, token: str = ""):
-        if op in ("pool_save", "pool_update", "pool_query", "pool_fetch", "pool_holds", "pool_release"):
+        if op in ("pool_save", "pool_update", "pool_query", "pool_fetch", "pool_holds", "pool_release", "pool_retract"):
             return self.tools.handle(op, p, rec, req, token=token)
         return self.service.handle(op, p, rec, req)

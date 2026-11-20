@@ -20,7 +20,7 @@ from ..ids import IdError, KIND_LEAF, Pointer, decode_pointer, encode_pointer
 from ..policy import ClassLattice, Op, decide
 from .admin import ADMIN_OPS
 from .pool_admin import POOL_OPS
-POOL_TOOLS = frozenset({"pool_save", "pool_update", "pool_query", "pool_fetch", "pool_holds", "pool_release"})
+POOL_TOOLS = frozenset({"pool_save", "pool_update", "pool_query", "pool_fetch", "pool_holds", "pool_release", "pool_retract"})
 from .es import EsClient, EsError
 from ..recall.direct import DirectSearch
 from .indices import class_index
