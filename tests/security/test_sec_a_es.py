@@ -14,6 +14,7 @@ import os
 import random
 import re
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -39,6 +40,7 @@ from living_context.recall.lookup import EsLeafStore, Resolver
 from living_context.recall.view import EsView
 from living_context.structure import build
 from living_context.structure.publish import Publisher
+from tools import a7_timing
 from tests.unit.test_tree_build import fixture
 
 URL, CA, PW = (os.environ.get(k) for k in ("LC_TEST_ES_URL", "LC_TEST_CA", "LC_TEST_PW"))
@@ -47,6 +49,8 @@ _SPEC = " ".join((Path(__file__).resolve().parents[2] / "docs" / "EXPERIMENT.md"
 N_QUERIES = int(re.search(r"runs the same (\d+) queries", _SPEC).group(1))
 N_RESTRICTED = int(re.search(r"C0 plus (\d+) restricted leaves", _SPEC).group(1))
 NB = 120
+N_TIMING = int(re.search(r"([\d,]+) interleaved requests per corpus", _SPEC).group(1).replace(",", ""))
+TIMING_BUDGET_S = 150.0   # the largest N that fits the time budget is run and stated; the registered N is N_TIMING
 
 
 def counter_ids(start):
@@ -243,6 +247,44 @@ class SecA(unittest.TestCase):
         with self.assertRaises(AssertionError) as cm:
             self.check_a4(check_class=False)
         self.assertIn("A4: a forbidden pointer is distinguishable", str(cm.exception))
+
+    # ---- A7: wall-clock timing, REPORTED and never gating (EXPERIMENT 9.2; a failure is a disclosed timing channel, DESIGN 20) ----
+    def test_a7_timing_of_c0_against_c1_and_of_the_a4_pair_is_reported(self):
+        with tempfile.TemporaryDirectory() as d:
+            port = ModelPort(StubBackend(), Budget(Path(d) / "b", 10**9), LAT, DictStore())
+
+            def one(t):
+                c = self.corpora[t]
+
+                def run(i):
+                    client = lambda cls_: c["gate"].client(t, f"read-{cls_}")
+                    p = Principal(t, "p-base", frozenset([Role.READER]), frozenset(["base"]), frozenset())
+                    recall_digest(p, LAT, self.queries[i % len(self.queries)], direct=DirectSearch(client, t),
+                                  view_for=lambda cls_: EsView(client(cls_), t, cls_, "topic"),
+                                  recall_for=lambda cls_: Recall(port, t, cls_, "p-base"))
+                return run
+
+            t0, ta, tb, n = time.time(), [], [], 0
+            fa, fb = one("secc0"), one("secc1")
+            while n < N_TIMING and time.time() - t0 < TIMING_BUDGET_S:
+                a, b = a7_timing.measure(fa, fb, 1)
+                ta += a
+                tb += b
+                n += 1
+        res = a7_timing.compare(ta, tb)
+        c = self.corpora["secc1"]
+        store = EsLeafStore(c["gate"].client("secc1", "ingest"), "secc1")
+        resolver = Resolver(store, ["base"], lambda leaf_id: False, lambda d: None)
+        ptr = lambda lid: encode_pointer(Pointer(KIND_LEAF, 1, lid, 1))
+        rng = random.Random(13)
+        forb = lambda i: resolver.resolve(ptr(c["restricted_ids"][i % len(c["restricted_ids"])]))
+        miss = lambda i: resolver.resolve(ptr(f"{rng.getrandbits(128):032x}"))
+        pa, pb = a7_timing.measure(forb, miss, min(N_TIMING, 1000))
+        pair = a7_timing.compare(pa, pb)
+        print(f"A7 (reported, not gating): C0 vs C1 {res['n_a']} interleaved requests per corpus of the registered {N_TIMING}: {res}; "
+              f"A4 pair {pair['n_a']} requests: {pair}", flush=True)
+        self.assertGreaterEqual(res["n_a"], 100, "the timing run was too short to report anything")
+        self.assertEqual(res["n_a"], res["n_b"])
 
 
 if __name__ == "__main__":
