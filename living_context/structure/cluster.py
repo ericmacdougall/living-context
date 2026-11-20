@@ -20,6 +20,21 @@ def _sizes(n: int, k: int) -> list[int]:
     return [n // k + (1 if i < n % k else 0) for i in range(k)]
 
 
+_BLOCK_ELEMS = 1 << 21  # float64 elements in one block of the difference tensor (16 MB)
+_PAIR_CHUNK = 1 << 20
+
+
+def _sq_dist(x, c):
+    """Squared distances n x k with the arithmetic of `((x[:, None, :] - c[None, :, :]) ** 2).sum(axis=2)`, over blocks of rows, so
+    the n x k x d difference tensor (tens of GB at 18k leaves) never exists. Each element is the same last-axis reduction."""
+    n, k, d = len(x), len(c), x.shape[1]
+    out = np.empty((n, k), dtype=np.float64)
+    step = max(1, _BLOCK_ELEMS // max(1, k * d))
+    for lo in range(0, n, step):
+        out[lo:lo + step] = ((x[lo:lo + step, None, :] - c[None, :, :]) ** 2).sum(axis=2)
+    return out
+
+
 def balanced_groups(vectors, f_target: int, rounds: int = 3) -> list[list[int]]:
     """Return k lists of indices; sizes are exact quotas. Group order and member order are deterministic."""
     x = np.asarray(vectors, dtype=np.float64)
@@ -37,17 +52,23 @@ def balanced_groups(vectors, f_target: int, rounds: int = 3) -> list[list[int]]:
     c = x[centres].copy()
     groups: list[list[int]] = [[] for _ in range(k)]
     for _ in range(rounds):
-        dist = ((x[:, None, :] - c[None, :, :]) ** 2).sum(axis=2)  # n x k
-        order = np.dstack(np.unravel_index(np.argsort(dist, axis=None, kind="stable"), dist.shape))[0]
+        dist = _sq_dist(x, c)  # n x k, the values of the one-shot expression, computed in row blocks
+        order = np.argsort(dist, axis=None, kind="stable")  # flat C-order positions i * k + g
+        del dist
         groups, left, done, placed = [[] for _ in range(k)], quota[:], np.zeros(n, dtype=bool), 0
-        for i, g in order.tolist():
-            if not done[i] and left[g] > 0:
-                groups[g].append(i)
-                left[g] -= 1
-                done[i] = True
-                placed += 1
-                if placed == n:
-                    break
+        for lo in range(0, order.size, _PAIR_CHUNK):  # sorted pairs in chunks: a full list of Python pairs is gigabytes
+            for pos in order[lo:lo + _PAIR_CHUNK].tolist():
+                i, g = divmod(pos, k)
+                if not done[i] and left[g] > 0:
+                    groups[g].append(i)
+                    left[g] -= 1
+                    done[i] = True
+                    placed += 1
+                    if placed == n:
+                        break
+            if placed == n:
+                break
+        del order
         new_c = np.array([x[g].mean(axis=0) for g in groups])
         if np.allclose(new_c, c):
             break
