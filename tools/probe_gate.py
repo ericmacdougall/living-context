@@ -43,14 +43,19 @@ def pinned_digest(root: Path) -> str | None:
     return m.group(1) if m else None
 
 
+def signer_ok(line: str) -> bool:
+    """A `Decided by:` line must open with the project owner or main. The bare word owner (a task owner) is refused."""
+    return re.match(r"Decided by:\s*(main|(the\s+)?project\s+owner)\b", line.strip(), re.I) is not None
+
+
 def decision_ok(root: Path, pid: str, verdict: str) -> bool:
     """A decision record is a file in docs/decisions naming the probe, the verdict, a mitigation and a `Decided by:` line
-    that names the owner or main. A record with no such line, or one naming anyone else, is refused."""
+    that opens with the project owner or main. A record with no such line, or one naming anyone else, is refused."""
     d = root / "docs" / "decisions"
     for f in sorted(d.glob("*.md")) if d.is_dir() else []:
         t = f.read_text()
         if (re.search(rf"^Probe:\s*{pid}\s*$", t, re.M) and re.search(rf"^Verdict:\s*{verdict}\s*$", t, re.M)
-                and re.search(r"^Mitigation:\s*\S", t, re.M) and re.search(r"^Decided by:.*\b(owner|main)\b", t, re.M | re.I)):
+                and re.search(r"^Mitigation:\s*\S", t, re.M) and any(signer_ok(x) for x in t.splitlines())):
             return True
     return False
 

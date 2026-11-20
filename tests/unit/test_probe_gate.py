@@ -87,6 +87,23 @@ class GateTests(unittest.TestCase):
         write_decision(root, "P2", "LIMITED")  # wrong verdict named
         self.assertTrue(probe_gate.gate(root, 5))
 
+    def test_a_task_owner_cannot_sign_a_decision(self):
+        """The gate means the project owner or main; the word owner alone (a task owner) opens nothing."""
+        root = make_root({"P2": "FAIL"})
+        for who in ("owner (the task owner of the close-out, on the test result)", "the task owner", "owner",
+                    "an owner", "task owner, main to confirm", "the owner of the stream"):
+            write_decision(root, "P2", "FAIL", who=who)
+            self.assertTrue(probe_gate.gate(root, 5), who)
+        for who in ("main (accepted on the test evidence; ASSUMPTION)", "the project owner: accept", "project owner"):
+            write_decision(root, "P2", "FAIL", who=who)
+            self.assertEqual(probe_gate.gate(root, 5), [], who)
+
+    def test_every_recorded_decision_names_the_project_owner_or_main(self):
+        for f in (REPO / "docs" / "decisions").glob("P*.md"):
+            line = [x for x in f.read_text().splitlines() if x.startswith("Decided by:")]
+            self.assertEqual(len(line), 1, f.name)
+            self.assertTrue(probe_gate.signer_ok(line[0]), f.name)
+
     def test_fail_with_no_decision_line_is_refused(self):
         root = make_root({"P2": "FAIL"})
         d = root / "docs" / "decisions"
