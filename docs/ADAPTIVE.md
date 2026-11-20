@@ -214,10 +214,18 @@ Inputs are gateway-derived only:
 - The session of a unit is its (authenticated principal, conversation) (POOLS
   2.3, 2.8), assigned by the gateway; no caller-supplied task id is read, and new
   root tokens do not make new sessions. Each session contributes at most `U_SESS`
-  units to a window and each principal at most `U_PRINC`, unless it is the pool's
-  only grantee with `query`. `U_PRINC / W_UNITS` (0.05 by default) is strictly
-  below every threshold a unit share feeds, the lowest being `RHO_DOWN x H_UP2`
-  (0.075).
+  units to a window and each principal at most `u_cap = max(U_PRINC, ceil(W_UNITS
+  / g))`, where `g` is the number of principals holding `query` on the pool (from
+  authz, which only administrators change); the window is the most recent
+  `W_UNITS` units that count after these caps, so a flood reaches back past
+  itself instead of displacing others. In a pool with 20 or more such principals
+  one principal holds at most `U_PRINC / W_UNITS` (0.05) of a full window, below
+  every threshold a unit share feeds (the lowest is `RHO_DOWN x H_UP2`, 0.075). A
+  share cap cannot stay below the thresholds in a partly filled window (from
+  `R_MIN` units) or with few grantees, so the guarantee does not rest on it: every
+  unit-share signal that decides a move or a probation keep is evaluated
+  leave-one-principal-out (4.3, 4.4, 5.3). With `g = 1` (the pool's only grantee)
+  no per-principal rule applies.
 - Rows of a conversation tainted above the pool's class, or with a private set
   other than this pool, are never units (POOLS 1.2). The pool's stage is shown to
   every grantee of the pool, and it is a function of the signals, so counting such
@@ -263,17 +271,31 @@ Rules that keep these inside the existing design:
   probation counters of 5.3. Scalars only, so it needs no lineage; a schema test
   asserts it. Signal values are recomputed at each evaluation, never stored.
 
-Flood bounds. One principal contributes at most `U_PRINC` of the `W_UNITS` units
-(0.05), below every threshold, and the difficulty gate also needs hard units from
-at least `P_MIN` distinct principals (4.3), so one principal cannot meet it; its
-sessions and entities are capped in the memory gate likewise. Probation needs
-units from `P_MIN` principals, caps each at a quarter, and must hold with any one
-principal's units removed (5.3), and a void probation rolls back; so one
-principal can neither force a tree nor keep one. A principal that is the only
-grantee can do both, at its own cost only. Several colluding principals can still
-spend at most the attempt bound of 5.4, after which the backoff of 4.4 applies.
-Starving (holding a pool flat with easy recalls) lasts at most until `N_BACK`
-(4.3).
+Flood bounds. Leave-one-principal-out: a signal condition that moves a pool, or
+keeps a tree, must hold on the window with any one principal's units removed (and
+each such window must still have `R_MIN` units). So no single principal is ever
+decisive, at any window size and any grantee count `g >= 2`: the difficulty gate
+(4.3), the down-move's `hard_rate` and interleave conditions (4.4) and the
+probation keep (5.3) all use it, and the difficulty gate and probation also need
+`P_EFF = min(P_MIN, g)` distinct principals. Sessions and entities are capped per
+writer principal in the memory gate (`S_PRINC`, `E_PRINC`, each half of the down
+threshold), and the memory gate alone never moves a pool before `N_BACK`. A void
+probation rolls back. So one principal can neither force a tree nor keep one; a
+pool's only grantee can do both, at its own cost only. Several colluding
+principals can still spend at most the attempt bound of 5.4, after which the
+backoff of 4.4 applies. Starving (holding a pool flat with easy recalls) lasts at
+most until `N_BACK` (4.3).
+
+What it takes to adapt by difficulty, per grantee count (defaults `W_UNITS` 200,
+`R_MIN` 50, `U_PRINC` 10, `N_PROB` 50, `P_MIN` 3):
+
+| `g` | `u_cap` | difficulty gate | probation cap per principal `ceil(N_PROB / P_EFF)` |
+|---|---|---|---|
+| 1 | none | the grantee alone | 50 (none) |
+| 2 | 100 | both principals, each with at least 50 units | 25: both principals |
+| 3 | 67 | every pair of principals holds at least 50 units, all 3 among the hard units | 17: all 3 (51 units) |
+| 5 | 40 | the window without any one principal holds at least 50 units, at least 3 principals among the hard units | 17: at least 3 |
+| 20 or more | 10 | at least 6 active principals (5 left after one is removed, at 10 each) | 17: at least 3 |
 
 ### 4.2 When it runs
 
@@ -289,9 +311,10 @@ Stage 0 to 1 (propose a tree), all of:
 1. `leaf_count > N_FLOOR`.
 2. Memory gate: `leaf_count >= N_UP1` or `token_total >= T_UP1` or
    `session_count >= S_UP1` or `entity_count >= E_UP1`.
-3. Difficulty gate: `hard_rate >= H_UP1` (so at least `R_MIN` units exist), with
-   the hard units coming from at least `P_MIN` distinct principals unless the pool
-   has a single grantee with `query`.
+3. Difficulty gate: `hard_rate >= H_UP1` (so at least `R_MIN` units exist), also
+   with any one principal's units removed (4.1), and with the hard units coming
+   from at least `P_EFF = min(P_MIN, g)` distinct principals; with `g = 1` the
+   pool's only grantee meets it alone.
 4. Conditions 1 to 3 hold at `E_CONSEC` consecutive non-void evaluations at least
    `EVAL_PERIOD` apart.
 5. No transition of this pool in flight, `now >= cool_until`, at least `D_DWELL`
@@ -357,7 +380,10 @@ Down-moves. Memory shrinks through erasure, archiving and re-filing. ASSUMPTION
 (design decision): a pool moves down one rung when the memory gate is below its
 down thresholds, `hard_rate < RHO_DOWN x H_UP1` and (opens not void) `il_win -
 il_loss < G_KEEP` over the sampled interleaved units (5.3), all at `E_CONSEC`
-consecutive evaluations, after the dwell. A probation rollback (5.3) uses the
+consecutive evaluations, after the dwell. The two unit-share conditions count as
+met if they hold with some one principal's units removed (4.1), so one principal
+cannot hold a tree that the others do not need; with `g = 1` they are evaluated
+plainly. A probation rollback (5.3) uses the
 same mechanics at once. A down-move costs no model call.
 
 Fence first. Every down-move starts by marking the pool `demoting` in the gateway's
@@ -524,8 +550,10 @@ Probation starts at the flip. It is part of the attempt: its tree recalls count
 in `attempt_spent`, under the attempt bound of 5.4.
 
 - Which recalls consult the tree. Only a recall that will count as a probation
-  unit (4.1: gateway-derived, at most `U_SESS` per session, at most `N_PROB / 4`
-  per principal, no injection or probe rows, no tainted rows, no failed features)
+  unit (4.1: gateway-derived, at most `U_SESS` per session, at most `ceil(N_PROB
+  / P_EFF)` per principal with `P_EFF = min(P_MIN, g)`, so `N_PROB` is reachable
+  with `P_EFF` principals and a pool's only grantee supplies all of them; no
+  injection or probe rows, no tainted rows, no failed features)
   takes the full path; every other recall of the pool during probation takes the
   flat path (logged `tree_consulted = false`, `esc_reason = probation`). So
   probation spends at most `B_PROB = N_PROB x r_max` model calls, and most readers
@@ -543,15 +571,16 @@ in `attempt_spent`, under the attempt bound of 5.4.
 - End. Probation ends at `N_PROB` units, when `B_PROB` is spent, or after `D_PROB`,
   whichever comes first.
 - Decision. The tree is kept only if all hold: at least `N_PROB` units were
-  collected; they come from at least `P_MIN` distinct principals unless the pool
-  has a single grantee with `query`; `open_share` is inside the DESIGN 9 bounds;
-  and `il_win - il_loss >= G_KEEP`, also with any one principal's units removed.
+  collected; they come from at least `P_EFF` distinct principals; `open_share` is
+  inside the DESIGN 9 bounds; and `il_win - il_loss >= G_KEEP`, also with any one
+  principal's units removed when `g >= 2`.
   Otherwise the tree is rolled back: a short, void or principal-dominated
   probation rolls back, never keeps (typed events `probation_short`,
   `probation_void`, `probation_loss`).
-- After a kept probation, a share `EPS_IL` of tree-consulted units is still
-  interleaved, seeded by the search id, so the down-move's benefit test (4.4) has
-  the same measure.
+- After a tree is adopted for good (a kept probation, or adoption by replay under
+  Q7 option b), a share `EPS_IL` of tree-consulted units is still interleaved,
+  seeded by the search id, so the down-move's benefit test (4.4) has the same
+  measure.
 - Rollback is the 1 to 0 down-move of 4.4, at once and with no dwell; it is an
   outcome (4.4), so the backoff applies.
 - 1 to 2 has the same probation, interleaving the stage 2 list against the stage 1
@@ -920,9 +949,11 @@ the counter only.
   - Signals: an embedding outage over a window with every gate otherwise met starts
     no transition and resets no count (broken: failures counted as hard); injection
     and probe rows are absent from every signal, and a planted probe appears in no
-    stored query and no probation count (broken: `via` not filtered); one
-    principal issuing 1,000 recalls moves `hard_rate` by at most `U_PRINC /
-    W_UNITS` (broken: no cap); a caller-supplied task id is ignored.
+    stored query and no probation count (broken: `via` not filtered); in a pool
+    with 20 grantees and a full window, one principal issuing 1,000 recalls holds
+    at most `U_PRINC` counted units, and the window reaches back past its excess
+    (broken: no cap; excess units displace others); a caller-supplied task id is
+    ignored.
   - Structural checks: a candidate with a leaf in no node, or a node without
     lineage, is not adopted (broken: adopt on build completion).
   - Probation, with opens scripted as the fixture's gold items opened (as TUNING
@@ -932,7 +963,7 @@ the counter only.
     rolled back at `N_PROB` in at least 95% of seeded runs; with the normal stub,
     kept in at least 95% (broken: no probation; credit on offers instead of opens;
     losses not observed because the flat list is not interleaved). With opens void,
-    with fewer than `N_PROB` units by `D_PROB`, with units from fewer than `P_MIN`
+    with fewer than `N_PROB` units by `D_PROB`, with units from fewer than `P_EFF`
     principals in a pool with several grantees, or with the keep decided only by
     one principal's units (the leave-one-principal-out check fails), the tree is
     rolled back, never kept (broken: `probation_void` keeps the tree; units
@@ -944,13 +975,19 @@ the counter only.
     at `B_PROB` calls with the tree rolled back if the keep rule is not met by then
     (broken: probation outside the attempt bound; no `B_PROB` cap).
   - Principal bounds: 300 root tokens minted by one principal, each with its own
-    conversation, count as one principal in `session_count`, `U_PRINC`, `P_MIN`
+    conversation, count as one principal in `session_count`, `u_cap`, `P_EFF`
     and the leave-one-principal-out check (broken: counts keyed by root token or
-    conversation); one principal's units are at most `U_PRINC / W_UNITS` of the
-    window and its sessions at most `S_PRINC` (broken: no per-principal cap);
-    tainted rows and rows of a private set feed no signal and no probation unit
-    (broken: `taint` not filtered); the difficulty gate is not met with fewer than
-    `P_MIN` distinct principals among the hard units (broken: no principal count).
+    conversation); its units are at most `u_cap` and its sessions at most
+    `S_PRINC` (broken: no per-principal cap); tainted rows and rows of a private
+    set feed no signal and no probation unit (broken: `taint` not filtered). For
+    `g` = 2, 3, 5 and 20, at a window of exactly `R_MIN` units and at a full
+    window: one principal whose units are all hard never meets the difficulty
+    gate while the others' units are easy, and one principal whose units are all
+    hard never holds off a down-move the others' units call for (broken: share
+    cap only, no leave-one-principal-out; a fixed `N_PROB / 4` probation cap,
+    which makes `N_PROB` unreachable with fewer than 5 principals); with `g` = 2
+    and 3 a pool whose principals all find it hard does move, and its probation
+    can reach `N_PROB` (broken: caps that do not scale with `g`).
   - Backoff: after a rollback the pool is not proposed again until `cool_until` and
     `RHO_RETRY` growth; a scripted adopt-then-demote trace spends at most `9 x
     build(N, 2) + A(N) x 3,600` over all attempts, probation included (broken:
@@ -1079,7 +1116,9 @@ the tier code.
 | A pool under constant erasure may never complete a transition | Each intersecting erasure aborts the candidate (5.6, DESIGN 7.6) |
 | Adaptive state holds scalars derived from the pool | Counts and timestamps only; not content; recomputed from live data |
 | A tree has upkeep costs | After adoption each batch rebuild calls the model per level-1 node with pending members (DESIGN 7.6) |
-| Several colluding principals can still force a transition | One principal cannot (4.1 flood bounds: `U_PRINC`, `S_PRINC`, `E_PRINC`, `P_MIN`, leave-one-principal-out); `P_MIN` colluding principals can, and the cost they cause is the attempt bound of 5.4 and the backoff; a pool's only grantee can do both, at its own cost |
+| Several colluding principals can still force a transition | One principal cannot (4.1 flood bounds: leave-one-principal-out, `P_EFF`, `u_cap`, `S_PRINC`, `E_PRINC`); `P_EFF` colluding principals can, and the cost they cause is the attempt bound of 5.4 and the backoff; a pool's only grantee can do both, at its own cost |
+| A pool with many grantees and few active ones adapts by difficulty late | With `u_cap` = `U_PRINC` (10) at 20 or more grantees, the difficulty gate needs at least 6 principals recalling (4.1 table); a pool granted widely but recalled by fewer stays flat until enough principals recall it, or until `N_BACK` |
+| One principal's need does not keep a tree | Down-move conditions count as met if they hold without some one principal (4.4), so a tree used hard by one principal of several, and not by the others, can be demoted once its memory shrinks below the down thresholds |
 | After a failed attempt and a mass erasure, re-proposal waits for regrowth | The next attempt needs `RHO_RETRY` times the size at the last outcome, and `N_BACK` does not waive it; this keeps the spend bound of 5.4 |
 
 ## 13. Conflicts with DESIGN, and the edit that resolves each
@@ -1187,7 +1226,8 @@ stages and the rung grouping; leaf cut kept at stage 0; stage derived from heads
 every pool dedicated, no shared tier; `ad:<pool>` as a scalar control document; no
 replay gate on transitions; structural adoption with probation; probation units
 only consult the tree, interleaved with the flat list; roll the tree back when
-probation is void, short or decided by one principal; the per-principal caps; the
+probation is void, short or decided by one principal; leave-one-principal-out for
+every move and keep condition; per-principal caps scaled by grantee count; the
 down-move fence; the gap through the write-path tracker; the retirement number;
 down-moves; backoff by outcomes; lower priority for transition calls; per-query
 path and its sampled escalation; lazy creation of kinds; layout 1 with stage 0's
@@ -1196,7 +1236,8 @@ unscored rows in class-level indices.
 PLACEHOLDERS (no measurement): [D2] `N_UP1` 2,000 leaves, `T_UP1` 2.5 million
 tokens, `S_UP1` 300 sessions, `E_UP1` 2,000 entities, `N_BACK` 50,000 leaves
 (absolute, not tuned); [D3] `W_UNITS` 200, `R_MIN` 50, `H_UP1` 0.20, `TAU_RE` 0.85,
-`U_SESS` 5, `U_PRINC` 10 (so `U_PRINC / W_UNITS` = 0.05), `F_FAIL_MAX` 0.10;
+`U_SESS` 5, `U_PRINC` 10 (so `U_PRINC / W_UNITS` = 0.05 at 20 or more
+grantees), `F_FAIL_MAX` 0.10;
 [D2] `S_PRINC` 75 sessions, `E_PRINC` 500 entities; [D4] `A_MIN` 0.4, `G_MIN` 0.1,
 `S_MAX` 6, `EPS_ESC` 0.05; [D5] `E_CONSEC` 3, `EVAL_PERIOD` 1 hour, `A_EVERY` 500
 writes, `D_DWELL` 24 hours, `D_DWELL1` 24 hours, `COOL_BASE` 6 hours, `COOL_MAX` 7
@@ -1205,4 +1246,6 @@ s, `J_WAIT` 60 s; [D6] `R2_MIN` 200, `H_UP2` 0.15, `M_UP2` 0.25; [D7] `N_PROB` 5
 units, `G_KEEP` 0.05, `P_MIN` 3 principals, `D_PROB` 14 days, `EPS_IL` 0.05; [D8]
 `B_SHARD_TARGET` 10 GiB, `AGE_ROLL` 30 days. Derived, not tuned: `N_FLOOR = F_MAX
 x F_TARGET`, `build(N, m)`, `B_PROB = N_PROB x r_max`, `B_TRANS = 3 x build(N,
-M_MAX) + B_PROB`, `A(N) = floor(log_1.5(N / N_FLOOR)) + 1`, `r_max = T + 48`.
+M_MAX) + B_PROB`, `A(N) = floor(log_1.5(N / N_FLOOR)) + 1`, `r_max = T + 48`,
+`u_cap = max(U_PRINC, ceil(W_UNITS / g))`, `P_EFF = min(P_MIN, g)`, the probation
+cap `ceil(N_PROB / P_EFF)`.
