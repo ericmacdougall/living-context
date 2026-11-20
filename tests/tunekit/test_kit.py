@@ -108,6 +108,35 @@ class Baseline(unittest.TestCase):
         self.assertEqual(out[1]["rr"], 0.5)
 
 
+class ExactKnn(unittest.TestCase):
+    def setUp(self):
+        rng = np.random.default_rng(3)
+        P = rng.normal(size=(60, 8))
+        self.P = P / np.linalg.norm(P, axis=1, keepdims=True)
+        q = rng.normal(size=(2, 8))
+        self.Q = q / np.linalg.norm(q, axis=1, keepdims=True)
+        self.ids = [f"d{i}" for i in range(60)]
+
+    def rows(self, shuffle=False, bias=0.0):
+        out = []
+        for i in range(2):
+            cos = self.P @ self.Q[i]
+            order = list(np.argsort(-cos)[:10])
+            if shuffle:
+                order = list(np.argsort(-cos)[20:30])
+            out.append(baseline.QueryRow(i, [], [], [self.ids[j] for j in order], [float(cos[j]) + bias for j in order], [], 1.0))
+        return out
+
+    def test_exact_agreement_is_detected_and_a_broken_index_is_not_hidden(self):
+        ok = baseline.exact_knn_check(None, self.P, self.ids, self.Q, self.rows(), n=2)
+        self.assertEqual(ok["mean_top10_overlap_with_exact"], 1.0)
+        self.assertLess(ok["max_abs_cosine_error"], 1e-9)
+        bad = baseline.exact_knn_check(None, self.P, self.ids, self.Q, self.rows(shuffle=True), n=2)
+        self.assertLess(bad["mean_top10_overlap_with_exact"], 0.2)
+        off = baseline.exact_knn_check(None, self.P, self.ids, self.Q, self.rows(bias=0.05), n=2)
+        self.assertAlmostEqual(off["max_abs_cosine_error"], 0.05, places=6)
+
+
 class Stages(unittest.TestCase):
     def test_every_stage_is_listed_with_a_status(self):
         self.assertEqual([s.id for s in stages.STAGES], ["Z1", "Z2", "Z3", "Z4", "Z5", "Z6"])

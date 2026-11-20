@@ -87,6 +87,10 @@ def predictive_power(rows: Sequence[dict], *, resamples: int = 2000) -> dict:
     }
     for name, s in cand.items():
         out[name] = stats.auc_report(s, y, cl, resamples=resamples)
+    for feat in ("agree", "margin", "spread"):
+        v = np.array([r[feat] for r in rows if not (isinstance(r[feat], float) and math.isnan(r[feat]))], dtype=float)
+        if len(v):
+            out[feat + "_quantiles"] = {f"q{q:02d}": round(float(np.percentile(v, q)), 4) for q in (5, 25, 50, 75, 95)}
     out["share_flat_sufficient"] = float(np.mean([flat_sufficient(r) for r in rows])) if rows else None
     if y.sum() and len(y) - y.sum():
         fs = np.array([flat_sufficient(r) for r in rows])

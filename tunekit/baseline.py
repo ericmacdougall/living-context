@@ -53,6 +53,7 @@ class Tenant:
         self.env, self.tenant = env, tenant
         self.root = env.work / tenant
         self.admin = env.admin()
+        self.cleanup()          # a killed earlier attempt leaves indices, a registry document and key files: clear them first
         r = provision_tenant(self.admin, tenant, [CLS], key_dir=self.root / "keys", data_root=self.root / "data", journal_size=65536)
         self.gate = EsGate(env.url, env.ca, {tenant: r["keys"]})
         self.ks = Keystore(self.root / "ks.db", tenant)
@@ -61,15 +62,18 @@ class Tenant:
                              embed=lambda text: embed_by_text[text])
         self.leaf_index = class_index(tenant, CLS, "leaf")
 
-    def close(self) -> None:
+    def cleanup(self) -> None:
         st, rows = self.admin.request("GET", "/_cat/indices/lc-%s-*?format=json&h=index" % self.tenant)
         for row in rows if st == 200 and isinstance(rows, list) else []:
             self.admin.request("DELETE", "/" + row["index"])
         self.admin.request("DELETE", f"/lc-sys-registry/_doc/{self.tenant}?refresh=true")
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def close(self) -> None:
         try:
             self.ks.close()
         finally:
-            shutil.rmtree(self.root, ignore_errors=True)
+            self.cleanup()
 
 
 def ingest(t: Tenant, leaves: Sequence[dict]) -> dict:
@@ -104,6 +108,7 @@ class QueryRow:
     knn_cos: List[float]        # cosine of each kNN hit: ES cosine score is (1 + cos) / 2
     bm25_score: List[float]
     ms: float
+    took: float = 0.0           # Elasticsearch's own `took` for the _msearch (server side, no TLS handshake)
 
 
 def search(client: EsClient, index: str, text: str, qvec: Sequence[float], *, window: int = WINDOW) -> QueryRow:
@@ -126,19 +131,48 @@ def search(client: EsClient, index: str, text: str, qvec: Sequence[float], *, wi
         lists.append([h["_id"] for h in hits])
         scores.append([h["_score"] for h in hits])
     fused = [i for i, _ in rrf(lists, K_RRF, window)]
-    return QueryRow(-1, fused, lists[0], lists[1], [2.0 * s - 1.0 for s in scores[1]], scores[0], ms)
+    return QueryRow(-1, fused, lists[0], lists[1], [2.0 * s - 1.0 for s in scores[1]], scores[0], ms, float(body.get("took", 0.0)))
 
 
-def run_queries(t: Tenant, questions: Sequence[dict], qvecs: np.ndarray, *, warmup: int = 5) -> List[QueryRow]:
+def run_queries(t: Tenant, questions: Sequence[dict], qvecs: np.ndarray, *, warmup: int = 5, passes: int = 1) -> List[List[QueryRow]]:
+    """`passes` sequential passes over the questions (the first is the scored one); returns one row list per pass."""
     client = t.gate.client(t.tenant, "read-" + CLS)
     for i in range(min(warmup, len(questions))):   # not scored: warms caches so latency is steady-state
         search(client, t.leaf_index, questions[i]["text"], qvecs[i])
-    rows = []
-    for i, q in enumerate(questions):
-        r = search(client, t.leaf_index, q["text"], qvecs[i])
-        r.qid = q["qid"]
-        rows.append(r)
-    return rows
+    out = []
+    for _ in range(passes):
+        rows = []
+        for i, q in enumerate(questions):
+            r = search(client, t.leaf_index, q["text"], qvecs[i])
+            r.qid = q["qid"]
+            rows.append(r)
+        out.append(rows)
+    return out
+
+
+def exact_knn_check(t: Tenant, P: np.ndarray, doc_ids: Sequence[str], qvecs: np.ndarray, rows: Sequence[QueryRow], n: int = 50) -> dict:
+    """Compare Elasticsearch's kNN top 10 and cosines with exact dot products of the saved vectors (both unit length), for the first
+    n questions: set overlap of the top 10, and the largest absolute difference of the cosine Elasticsearch reports (2 x score - 1)
+    against the exact cosine of the same document."""
+    idx_of = {d: i for i, d in enumerate(doc_ids)}
+    ov, err, ann_miss = [], 0.0, 0
+    for i in range(min(n, len(rows))):
+        exact = P @ qvecs[i]
+        top = set(np.argsort(-exact)[:10].tolist())
+        got = [idx_of[d] for d in rows[i].knn[:10]]
+        ov.append(len(top & set(got)) / 10.0)
+        for d, cos in zip(rows[i].knn[:10], rows[i].knn_cos[:10]):
+            err = max(err, abs(cos - float(exact[idx_of[d]])))
+    return {"checked": len(ov), "mean_top10_overlap_with_exact": round(float(np.mean(ov)), 4), "max_abs_cosine_error": round(err, 6)}
+
+
+def embedding_mapping(t: Tenant) -> dict:
+    st, m = t.admin.request("GET", f"/{t.leaf_index}/_mapping")
+    if st != 200:
+        return {}
+    for v in m.values():
+        return v["mappings"]["properties"]["embedding"]
+    return {}
 
 
 def check_against_product(t: Tenant, questions: Sequence[dict], qvecs: np.ndarray, rows: Sequence[QueryRow], *, n: int = 20) -> dict:

@@ -1,0 +1,9 @@
+{
+  "generator_version": "tk-synth-2",
+  "note": "Fixed before the grid run (TUNING 4.2). Tuning seeds feed every table in docs/tuning. Pilot seeds were used once to check that the complexity endpoints give a usable range of difficulty, and are not reported as results. Held-out seeds are reserved for one acceptance run after defaults are frozen; no run so far has used them.",
+  "tuning": [1, 2, 3],
+  "pilot": [9001],
+  "held_out": [101, 102, 103],
+  "pool_layouts_tuning": [1, 2, 3],
+  "bootstrap_seed": 16096
+}

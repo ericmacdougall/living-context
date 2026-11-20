@@ -24,9 +24,7 @@ def avg_stats(n, level, seeds=(1, 2, 3), **over):
     return acc
 
 
-# q_mean_topic_words is reported but NOT a size-independent statistic: a terse question is as short as ground truth allows, so the
-# words it needs grow with the memory (that is the ambiguity the size knob adds, not a complexity knob moving).
-SIZE_INDEPENDENT = tuple(k for k in STAT_KEYS if k != "q_mean_topic_words")
+SIZE_INDEPENDENT = STAT_KEYS
 
 
 def violations(a, b, rel=0.20, absol=0.03):
@@ -75,9 +73,12 @@ class Independence(unittest.TestCase):
             small, large = avg_stats(600, lv), avg_stats(6000, lv)
             self.assertEqual(violations(small, large), [], (lv, small, large))
 
-    def test_terse_questions_need_more_words_in_a_bigger_memory(self):
-        small, large = avg_stats(600, 1.0), avg_stats(6000, 1.0)
-        self.assertGreater(large["q_mean_topic_words"], small["q_mean_topic_words"])
+    def test_question_spec_is_fixed_and_the_drop_rate_is_reported(self):
+        for n in (600, 6000):
+            c = synth.generate(synth.knobs_at(n, 1, 1.0))
+            self.assertEqual({len(q["text"].split(" regarding ")[1].rstrip("?").split()) for q in c.questions}, {1})   # one_word = 1 at c = 1
+            self.assertIn("question_drop_rate", c.manifest)
+            self.assertGreaterEqual(c.manifest["question_drop_rate"], 0.0)
 
     def test_the_deep_growth_control_turns_the_size_check_red(self):
         small, large = avg_stats(600, 0.5, growth="deep", fixed_topics=24), avg_stats(6000, 0.5, growth="deep", fixed_topics=24)
@@ -88,7 +89,7 @@ class Independence(unittest.TestCase):
         lo, hi = avg_stats(2000, 0.0), avg_stats(2000, 1.0)
         for k in ("entity_reuse", "dup_frac", "old_frac", "q_alias_frac", "q_para_frac", "topic_jaccard"):
             self.assertGreater(hi[k], lo[k] + 0.01, k)
-        self.assertLess(hi["q_mean_topic_words"], lo["q_mean_topic_words"])      # terse questions name fewer topic words
+        self.assertLess(hi["q_mean_topic_words"], lo["q_mean_topic_words"])      # one_word questions name fewer topic words
         for k in ("leaves_per_topic", "mean_session_len"):
             self.assertLess(abs(hi[k] - lo[k]), 0.2 * lo[k], k)
         self.assertLess(abs(hi["mean_words"] - lo["mean_words"]), 0.1 * lo["mean_words"])
@@ -101,8 +102,11 @@ class Independence(unittest.TestCase):
             "entity_reuse": ("entity_reuse", avg_stats(2000, 0.5, entity_reuse=5.0)),
             "topic_overlap": ("topic_jaccard", avg_stats(2000, 0.5, topic_overlap=0.8)),
             "paraphrase": ("q_para_frac", avg_stats(2000, 0.5, paraphrase=0.8)),
-            "terse": ("q_alias_frac", avg_stats(2000, 0.5, terse=1.0)),
         }
+        one = avg_stats(2000, 0.5, one_word=1.0)
+        self.assertLess(one["q_mean_topic_words"], base["q_mean_topic_words"] - 0.2)
+        for k in ("dup_frac", "old_frac", "leaves_per_topic", "mean_session_len"):
+            self.assertLess(abs(one[k] - base[k]), max(0.03, 0.25 * base[k]), k)
         for knob, (stat, got) in moved.items():
             self.assertGreater(got[stat], base[stat] + 0.01, knob)
             others = [k for k in ("dup_frac", "old_frac", "leaves_per_topic", "mean_session_len") if k != stat]

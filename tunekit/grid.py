@@ -13,7 +13,7 @@ from . import synth
 
 
 SHORT = {"paraphrase": "para", "topic_overlap": "ovl", "entity_reuse": "reuse", "near_dup": "dup", "update_rate": "upd",
-         "alias_rate": "alias", "topic_size": "tsize", "session_len": "slen"}
+         "alias_rate": "alias", "topic_size": "tsize", "session_len": "slen", "one_word": "oneword"}
 LONG = {v: k for k, v in SHORT.items()}
 
 
@@ -66,3 +66,30 @@ def save_vectors(path: Path, passages: np.ndarray, queries: np.ndarray) -> None:
 def load_vectors(path: Path):
     z = np.load(path)
     return z["p"].astype(np.float64), z["q"].astype(np.float64)
+
+
+SIZES = (64, 256, 1000, 4000, 20000)
+LEVELS = (0.0, 0.5, 1.0)
+KNOB_HIGH = {"topic_overlap": 0.8, "entity_reuse": 5.0, "near_dup": 0.4, "update_rate": 0.4, "alias_rate": 0.6, "one_word": 1.0}
+
+
+def main_grid() -> List[Cell]:
+    """The grid pre-stated in docs/tuning/RESULTS-Z2.md section 2, smallest cells first."""
+    cells: List[Cell] = []
+    for n in SIZES:
+        seeds = (1, 2, 3) if n <= 4000 else (1, 2)
+        for level in LEVELS:
+            cells += [Cell(n, s, level) for s in seeds]
+        seeds_deep = (1, 2) if n <= 4000 else (1,)
+        cells += [Cell(n, s, 0.5, growth="deep") for s in seeds_deep]
+    for s in (1, 2):
+        for k, v in KNOB_HIGH.items():
+            cells.append(Cell(4000, s, 0.5, over=((k, v),)))
+        for p in (0.0, 0.5, 1.0):
+            cells.append(Cell(4000, s, 0.5, over=(("paraphrase", p),)))
+    seen, out = set(), []
+    for c in cells:
+        if c.name not in seen:
+            seen.add(c.name)
+            out.append(c)
+    return out

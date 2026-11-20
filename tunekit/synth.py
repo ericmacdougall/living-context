@@ -30,7 +30,7 @@ import random
 from dataclasses import asdict, dataclass, field, replace
 from typing import Dict, List, Optional, Sequence, Tuple
 
-GEN_VERSION = "tk-synth-2"
+GEN_VERSION = "tk-synth-3"
 
 COMMON = ("garden kitchen travel planning pottery journey report design school family health music weather market office repair "
           "delivery contract ferry schedule training survey launch archive server network invoice holiday recipe fitness library "
@@ -88,7 +88,7 @@ class Knobs:
     session_len: float = 6.0
     paraphrase: float = 0.3
     alias_rate: float = 0.3
-    terse: float = 0.0            # probability that a question is as terse as ground truth allows (a name part, fewest topic words)
+    one_word: float = 0.0         # probability that a question gives ONE topic word instead of two (a fixed spec, not "as few as needed")
     topic_skew: float = 0.0
     growth: str = "wide"          # "wide" or "deep"
     fixed_topics: int = 40        # used when growth == "deep"
@@ -98,7 +98,7 @@ class Knobs:
     def validate(self) -> None:
         if self.n_leaves < 8:
             raise ValueError("n_leaves must be at least 8")
-        for name in ("topic_overlap", "near_dup", "update_rate", "paraphrase", "alias_rate", "terse"):
+        for name in ("topic_overlap", "near_dup", "update_rate", "paraphrase", "alias_rate", "one_word"):
             v = getattr(self, name)
             if not 0.0 <= v <= 1.0:
                 raise ValueError(f"{name} must be in [0, 1]")
@@ -111,8 +111,8 @@ class Knobs:
 
 
 # complexity levels: linear between the two endpoints; 0.0 is easy, 1.0 is hard (calibrated on pilot seeds, see docs/tuning)
-LOW = dict(topic_overlap=0.10, entity_reuse=1.0, near_dup=0.0, update_rate=0.0, paraphrase=0.0, alias_rate=0.0, terse=0.0)
-HIGH = dict(topic_overlap=0.80, entity_reuse=5.0, near_dup=0.40, update_rate=0.40, paraphrase=0.70, alias_rate=0.60, terse=1.0)
+LOW = dict(topic_overlap=0.10, entity_reuse=1.0, near_dup=0.0, update_rate=0.0, paraphrase=0.0, alias_rate=0.0, one_word=0.0)
+HIGH = dict(topic_overlap=0.80, entity_reuse=5.0, near_dup=0.40, update_rate=0.40, paraphrase=0.70, alias_rate=0.60, one_word=1.0)
 
 
 def complexity(level: float) -> dict:
@@ -317,34 +317,18 @@ def _questions(k: Knobs, leaves: List[dict], topics: List[List[str]], names: Lis
         alias_used = False
         alias = full
         words = None
-        if rng.random() < k.terse:
-            parts = full.split()
-            rng.shuffle(parts)
-            for cand in parts + [full]:
-                for size in range(0, 4):
-                    for w in _combos(L["tws"], size, rng):
-                        if unique(L, cand, w):
-                            alias, words, alias_used = cand, w, cand != full
-                            break
-                    if words is not None:
-                        break
-                if words is not None:
+        k_words = 1 if rng.random() < k.one_word else 2
+        if rng.random() < k.alias_rate:
+            part = rng.choice(full.split())
+            for w in _combos(L["tws"], k_words, rng):
+                if unique(L, part, w):
+                    alias, words, alias_used = part, w, True
                     break
-        else:
-            if rng.random() < k.alias_rate:
-                part = rng.choice(full.split())
-                if any(unique(L, part, w) for w in _word_sets(L["tws"], rng)):
-                    alias, alias_used = part, True
-            for w in _word_sets(L["tws"], rng):
-                if unique(L, alias, w):
+        if words is None:
+            for w in _combos(L["tws"], k_words, rng):
+                if unique(L, full, w):
                     words = w
                     break
-            if words is None and alias_used:
-                alias, alias_used = full, False
-                for w in _word_sets(L["tws"], rng):
-                    if unique(L, alias, w):
-                        words = w
-                        break
         if words is None:
             dropped += 1
             continue
@@ -370,12 +354,6 @@ def _combos(tws: Sequence[str], size: int, rng: random.Random):
 
 def _alias_match(alias: str, name: str) -> bool:
     return alias == name if " " in alias else alias in name.split()
-
-
-def _word_sets(tws: Sequence[str], rng: random.Random):
-    pairs = [(tws[i], tws[j]) for i in range(3) for j in range(i + 1, 3)]
-    rng.shuffle(pairs)
-    return pairs + [tuple(tws)]
 
 
 def complexity_stats(c: Corpus, *, pairs: int = 3000) -> dict:
@@ -422,6 +400,7 @@ def _manifest(c: Corpus, n_topics: int, epn: int, pool: int, n_sessions: int, dr
         h.update(json.dumps([q["text"], q["gold"]]).encode() + b"\n")
     return {"generator": GEN_VERSION, "knobs": asdict(c.knobs), "n_topics": n_topics, "entities_per_topic": epn,
             "entity_pool": pool, "n_sessions": n_sessions, "n_questions": len(c.questions), "questions_dropped_ambiguous": dropped,
+            "question_drop_rate": round(dropped / max(1, dropped + len(c.questions)), 4),
             "content_sha256": h.hexdigest(), "stats": complexity_stats(c),
             "text_caveat": "template text over a controlled vocabulary; not natural language"}
 
