@@ -196,3 +196,30 @@ class FailedCalls(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Scope(unittest.TestCase):
+    """S6-H1 scopes the journal per question: a resume that skips completed questions must not answer a later question's prompt with an
+    earlier question's journaled answer to an IDENTICAL prompt (an organise prompt carries no query text, so two questions can render
+    the same one). Unscoped keys (S2, S3) are unchanged."""
+
+    def test_an_identical_prompt_in_a_skipped_question_is_not_replayed_for_a_later_one(self):
+        with tempfile.TemporaryDirectory() as d:
+            p, inner, b, _ = make(d)
+            for ref in ("qa", "qb"):                     # first run: both questions ask the same prompt once
+                p.scope = ref
+                p.call(Task.JUDGE_RELEVANCE, J)
+            self.assertEqual(b.count(), 2)
+            p2, inner2, b2, _ = make(d)                  # resumed run: qa is complete and skipped; qb is asked again
+            p2.scope = "qb"
+            out = p2.call(Task.JUDGE_RELEVANCE, J)
+            self.assertEqual((p2.replayed, b2.count(), out.output["n"]), (1, 2, 2))      # qb's own answer, not qa's
+            p2.scope = "qc"                              # a new question with the same prompt is a new, charged call
+            p2.call(Task.JUDGE_RELEVANCE, J)
+            self.assertEqual((p2.replayed, b2.count()), (1, 3))
+
+    def test_without_a_scope_the_keys_are_the_unscoped_ones(self):
+        with tempfile.TemporaryDirectory() as d:
+            p, _, _, _ = make(d)
+            p.call(Task.JUDGE_RELEVANCE, J)
+            self.assertTrue(all("|" not in k for k in p.journal.results))

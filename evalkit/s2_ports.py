@@ -85,6 +85,10 @@ class ResilientPort:
         self._sleep, self._render, self._clock = sleep, render, clock
         self._retry_failed, self._fail_retries = tuple(retry_failed), failure_retries
         self._occ: Dict[str, int] = {}
+        # optional journal scope (S6-H1 sets the question reference before each question): occurrences are then counted per scope, so a
+        # resumed run that skips completed questions cannot answer a later question's prompt with an earlier question's journaled
+        # answer to an identical prompt; None keeps the unscoped keys of S2 and S3 unchanged
+        self.scope: Optional[str] = None
         self._lock = threading.Lock()
         self.replayed = self.fresh = self.lost = self.throttled = self.limited = 0
         self.delays: List[float] = []
@@ -110,6 +114,8 @@ class ResilientPort:
         with self._lock:                      # one call at a time, as the inner port already requires
             name = task.value
             sha = hashlib.sha256(self._render(name, inputs).encode()).hexdigest()[:32]
+            if self.scope is not None:
+                sha = "%s|%s" % (self.scope, sha)
             n = self._occ.get(sha, 0)
             self._occ[sha] = n + 1
             key = "%s:%d" % (sha, n)

@@ -53,9 +53,10 @@ def stratum_of(fs: ds.FreshSet) -> Dict[str, str]:
 
 def run_questions(fs: ds.FreshSet, hashes: Mapping[str, str], direct: Recorder, tree: Recorder, shuffled: Recorder, world: arms.World,
                   ledger: Ledger, *, beta: float, shuffled_qids: Sequence[str], stop: Callable[[], bool] = lambda: False,
-                  progress: Callable[[str], None] = lambda s: None) -> None:
+                  progress: Callable[[str], None] = lambda s: None, scope: Callable[[Optional[str]], None] = lambda s: None) -> None:
     """Every fresh question not yet in the ledger, in the seeded order; SHUFFLED only on `shuffled_qids`. A question is recorded only
-    when it completed; the stop file and the cap end the loop before recording (as in S2)."""
+    when it completed; the stop file and the cap end the loop before recording (as in S2). `scope(ref)` is called before each question
+    (the run sets the journal scope of its port, so a resume replays only the in-flight question's own calls)."""
     by = {q.qid: q for q in fs.questions}
     strata = stratum_of(fs)
     shuf = set(shuffled_qids)
@@ -68,6 +69,7 @@ def run_questions(fs: ds.FreshSet, hashes: Mapping[str, str], direct: Recorder, 
         if stop():
             raise StageStopped("stop file present")
         g = sorted({hashes[s] for s in q.gold_session_ids}) if not q.is_abstention else []
+        scope(ref)
         o = arms.run_question(q.question, direct, tree, world, beta=beta, shuffled_tree=shuffled if qid in shuf else None)
         for rec in (tree, shuffled if qid in shuf else None):
             if rec is not None and rec.last is not None and not rec.last.ok and rec.last.error == "BudgetExceeded":
