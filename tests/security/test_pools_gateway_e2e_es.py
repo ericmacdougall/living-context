@@ -100,6 +100,30 @@ class GatewayE2E(Base):
         self.assertEqual(self.gw.mint(T, b"user-alice", {"conversation": "c4", "scope": {a: ["query"]}, "human": True}), UNAV)
         self.assertEqual(self.gw.mint(T, b"user-alice", {"scope": "nope"}), UNAV)
 
+    def block_authz(self, on):
+        st, r = self.admin.request("PUT", f"/lc-{T}-authz/_settings", {"index.blocks.write": True if on else None})
+        self.assertEqual(st, 200, r)
+
+    def test_item0d_a_grant_removed_while_the_real_authz_index_is_write_blocked_stays_removed_after_a_restart(self):
+        r = self.adm(op="pool_create", cls="base", kind="team", label="blocked crew")
+        a = r["pool"]
+        self.assertTrue(self.adm(op="pool_grant", who="user-alice", pool=a)["ok"])
+        tok = self.mint_tok("alice", {a: ["query"]})
+        self.assertTrue(self.gw.handle(tok, {"op": "pool_query", "query": "anything"})["ok"])
+        self.block_authz(True)
+        try:
+            out = self.adm(op="pool_ungrant", who="user-alice", pool=a)               # the authz delete cannot land: the journal carries it
+            self.assertTrue(out["ok"], out)
+            self.assertEqual(self.gw.handle(tok, {"op": "pool_query", "query": "anything"}), UNAV)   # effective at the next call
+            st, doc = self.admin.request("GET", f"/lc-{T}-authz/_search", {"query": {"term": {"kind": "pgrant"}}})
+            self.assertGreaterEqual(doc["hits"]["total"]["value"], 1)                                  # the stale copy still holds the grant
+            self.restart()                                                                              # boot reads the stale copy, the journal wins
+        finally:
+            self.block_authz(False)
+        self.assertEqual(self.rt.service.dir.live_ops(T, "pt-user-alice", a), frozenset())
+        self.assertEqual(self.gw.mint(T, b"user-alice", {"conversation": "c9", "scope": {a: ["query"]}}), UNAV)
+        self.assertEqual(self.gw.handle(tok, {"op": "pool_query", "query": "anything"}), UNAV)
+
 
 if __name__ == "__main__":
     unittest.main()
