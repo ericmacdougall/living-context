@@ -719,6 +719,7 @@ tenant, and a pointer of another tenant fails to open (3.6).
 | Each pool costs its own shards | About 4 at stage 0 and up to 9 at stage 2 (ADAPTIVE 9.4); many pools need more data nodes |
 | Retired pointer keys | Retiring a compromised pointer-key version makes the pointers sealed under it `unavailable`; agents re-query |
 | A pool card is administrator text visible to grantees | It is meant for selection; it must not hold secrets |
+| Text delivered into a harness transcript is outside the erasure closure | With `deliver_text` above 0, an erasure cannot reach the agent's transcript; delivered is not opened, so delivery gives the loop no signal |
 
 ## 11. Build-plan step
 
@@ -806,6 +807,9 @@ independent reviews of this revision from different models or agents.
     selection over all tenant pools, or intersection after retrieval).
   - A save lands only in the named pool or the single default; with two save
     pools and none named it is `pool_required` (broken: best-match heuristic).
+  - A save, update, copy or retract into a pool whose state is `detached` or
+    `deleting` is `unavailable`, also when the state changed after the token was
+    minted (broken: state read at mint only).
   - Injection: plain path only (model-port counter 0 across a scripted
     conversation with eight tree pools in `G`); never repeats a held item, also
     when the log row write is made to fail; obeys every bound of 6.3; after a
