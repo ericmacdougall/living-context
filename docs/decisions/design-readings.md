@@ -90,3 +90,64 @@ Each entry names the passages, the reading the build follows and the test that k
 - The threshold is a trade: lower catches more quantisation drift, higher misses fewer copies as clean but never reports an unrelated
   leaf. The probe is one of six (text, kNN, get by id, lineage, authz, logs); the text, id and lineage probes do not depend on it.
 - Test: `test_a_near_miss_vector_below_the_threshold_is_not_residue_but_a_copy_is` (a vector at cosine 0.90 is not counted, the copy is).
+
+## Erasure scopes, holds and the guard (DESIGN 14.1, 14.2, 14.3, 14.6; ASSUMPTION, listed by the owner of the Step 14 close-out)
+
+- 14.1 says "legal hold wins: the erasure is queued and the delay is written in the receipt" and names no one who may place a hold, and 4.3
+  has no role for it. The build keeps holds in a durable registry (`erasure/hold.py`: an atomically replaced, fsynced file) with
+  `place`, `release` and a queue, and does not expose them through a gateway operation: placing a hold is an operator or
+  tenant-administrator action outside the people operations of 4.3. A hold names a subject token or a leaf id. While one covers a
+  request nothing is published, deleted or rewritten (not even the guard changes). The receipt's `hold_delay_s` is request to the start of
+  the released erasure. Test: `tests/security/test_erasure_scopes_es.py` (E5; the broken variant that ignores holds runs the erasure at once).
+- 14.1 lists three scopes (subject, item, class relabel) and the build had `erase_subject` and `relabel_erase` only. An item
+  erasure is the same closure started from the named leaf ids (`Executor.erase_item`); its journal record carries an empty subject and
+  restore replays it through the same path. The keys of other leaves of the same person are untouched.
+- 14.6 and EXPERIMENT E3 ("no erased-identifier HMACs"): the journal now records, per tombstone, the erased identifier tokens and bare-name
+  tokens, and `Guard.load_journal` rebuilds the in-memory guard from them at a restart or a restore. Without it a re-ingest of an erased
+  identifier was accepted again after the process restarted. The subject token of an identifier erasure is itself that identifier's HMAC.
+- EXPERIMENT E3 "reseal-before-quarantine" has no definition beyond its name. Followed reading: a held (quarantined) blob is sealed under a
+  data key that the subject tokens found in the text name at the moment of sealing, so destroying a subject destroys the held blob too;
+  sealing first and linking later (or never) leaves a key that no erasure by subject reaches. The broken variant seals under an unlinked key.
+  The quarantine document is reached by its lineage either way; the key is what the variant leaves behind.
+- 14.2 "second net" for query-shaped artefacts: the closure also collects the search ids of the rows and stored queries that are the
+  subject's own (the actor, or a query that mentions the subject) and deletes whatever names them in `lin_queries`, an edge's `evidence` or
+  a member's `shaped_by`. A row of another actor that only offered an item of the subject is that actor's history: it is stripped, and what
+  its own search shaped stays. The 14.2 steps "a leaf left with no member in a generation gets its placement-rule parent back" and
+  "node versions re-summarised from an erased search return to the placeholder" apply to a reorganiser that is built in Step 19;
+  the lineage walk already rewrites a node that names the search in `lin_queries`.
+- E1 "erase only the current generation": the closure walks every retained node version by lineage, so the broken variant filters the
+  closure to the newest version of each node id. The test makes the older version by copying a node document to the next version number
+  (what a rebuild leaves behind for pinned readers), because the stub rebuild does not always touch the node that holds the planted leaves.
+
+## People operations through the gateway (DESIGN 4.3, 4.4; ASSUMPTION, listed by the owner of the Step 15 close-out)
+
+- 4.4 requires two distinct administrators to revoke an administrator or a revoker and does not say how the second one signs. The
+  build records the first administrator's request as pending for `PENDING_S` (900 s, ASSUMPTION) and executes on the second call from a
+  different administrator, judged by `policy.decide(REVOKE_PRIVILEGED, co_signer)`. The first call answers `pending`, which only an
+  administrator can see (every other caller gets `refused`). The pending table is in memory: a restart drops it and the first
+  administrator asks again, which is the safe direction.
+- The body fields `tenant`, `principal`, `roles`, `read_set`, `write_set` are refused in every request (INV-1), so the people operations
+  name the target as `who` (an identifier, mapped to its per-tenant token by the gateway), the granted roles as `grant_roles` and the
+  operator's target tenant as `target_tenant`.
+- The operator's break-glass is a request from the operator's own session in the platform tenant, judged by `decide(BREAK_GLASS_REVOKE)`.
+  It reads no grant of the tenant, so no tenant role can remove or delay it; a tenant that holds a copy of the operator's principal
+  can revoke the copy and the break-glass still works (test with a broken variant that derives the authority from the tenant's grant).
+  A closed tenant (a journal fault) answers `unavailable` to every people operation; the operator's recovery call (`break_glass`) reopens it.
+- Class-grant removal removes the class and every class that dominates it from the read set (a read set must stay down-closed), takes the
+  class from the write set, journals an epoch bump and ends the principal's sessions at their next check.
+- Grants are held in the gateway's memory and persisted best-effort to the authz index (4.4); a restart without that persistence
+  loses grants made since, which fails closed (a principal without a grant cannot mint a session).
+- 4.4 says the tenant key owner rotates and invalidates the tenant's keys. An owner can only list and invalidate the keys it created, so
+  provisioning takes the owner's client (`provision_tenant(key_owner=...)`) and creates the tenant's keys through it. Keys created by the
+  bootstrap credential instead expire at their 7-day expiry and can be invalidated only with that credential.
+- The gateway drops a tenant's clients for good (`EsGate.drop_tenant` refuses to build a new client until `reload` names new keys). The
+  earlier behaviour forgot the cached clients and rebuilt them from the old key files at the next request, which did not stop any
+  gateway path.
+
+## Verifier kNN probe rescoring (DESIGN 14.7; owner of the Step 14 close-out)
+
+- The kNN probe asks for `rescore_vector` with an oversample of 3, so candidates are scored on the full-precision vectors. Without it,
+  2 of 30 fresh positive-control runs on the test cluster saw the best score of the canary's own copy at about 0.95, under the 0.99 threshold
+  (int8-quantised HNSW over very small segments), and the control raised `knn found nothing`; with it, 40 of 40 runs found the copy.
+  A miss of that kind in a residue run would be a false "clean", so the probe must not depend on the quantisation of a small segment.
+  The control raises loudly when it is blind; the residue run is valid only against a control of the same shape.
