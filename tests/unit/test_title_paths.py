@@ -23,7 +23,11 @@ def is_allowed_value(node) -> bool:
         return True
     if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "wrap"
             and isinstance(node.func.value, ast.Name) and node.func.value.id == "envelope"):
-        return True   # `envelope.wrap(...)`: an existing title escaped and labelled for display (POOLS 3.7); it writes no new title text
+        # `envelope.wrap(pool, label, origin, via, pointer, title, ...)`: an existing title escaped and labelled for display (POOLS 3.7). It
+        # writes no new title text, so it is allowed only when the title argument itself is an allowed value (an existing title); a title built
+        # from leaf text and then wrapped is still a second path.
+        return (len(node.args) >= 6 and not any(isinstance(a, ast.Starred) for a in node.args)
+                and not node.keywords and is_allowed_value(node.args[5]))
     if isinstance(node, ast.Attribute) and node.attr == "title":  # reading a stored title off a hit
         return True
     if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant) and node.slice.value == "title":
@@ -80,10 +84,14 @@ class TitlePaths(unittest.TestCase):
         for planted in ('d = {"title": model_text}', 'doc["title"] = summary', "make(title=text[:40])",
                         'x = {"title": build_title(a) + "x"}', 'x = {"title": src.get("summary")}', 'x = {"title": e["summary"]}', 'x = {"title": "free text"}',
                         'x = {"title": e["title"] if e else summary}', "title = text[:40]", "title: str = summary", "title += summary", "title, x = a, b", "(title := summary)",
-                        'doc.update(dict(title=summary))'):
+                        'doc.update(dict(title=summary))',
+                        'x = {"title": envelope.wrap(a, b, c, d, e, text[:40])}', 'x = {"title": envelope.wrap(a, b, c, d, e, leaf["text"])}',
+                        'x = {"title": envelope.wrap(a, b, c, d, e, summary)}', 'x = {"title": envelope.wrap(*args)}',
+                        'x = {"title": envelope.wrap(a, b, c, d, e, title=text[:40])}', 'x = {"title": envelope.wrap(a, b, c, d, e)}'):
             self.assertTrue(title_writes(planted), planted)
         for fine in ('d = {"title": build_title(t)}', "make(title=title.build_title(t))", 'x = r.get("title")', 'x = {"title": src.get("title", "")}', 'm = {"title": {"type": "text"}}',
-                     'x = {"title": e["title"]}', 'x = {"title": ""}', 'x = {"title": e["title"] if e else ""}', "title = build_title(t)", 'x = make(title=title)'):
+                     'x = {"title": e["title"]}', 'x = {"title": ""}', 'x = {"title": e["title"] if e else ""}', "title = build_title(t)", 'x = make(title=title)',
+                     'x = {"title": envelope.wrap(a, b, c, d, e, title)}', 'x = {"title": envelope.wrap(a, b, c, d, e, src.get("title", ""))}'):
             self.assertEqual(title_writes(fine), [], fine)
 
     def test_build_title_is_defined_once(self):

@@ -441,6 +441,26 @@ class Writer:
         self._put(class_index(self.tenant, cls, "ctl"), f"dq:{leaf_id}:{lv}", doc, cls=cls, create=True)  # 409 = already queued
 
     # ---- orphan repair ------------------------------------------------------------------------------
+    def _repair_pool_source(self, s: dict, doc_id: str, out: dict) -> None:
+        """Finish a pool write: the leaf is re-projected into the pool's own index and its head (`lh:<pool>:<leaf>`) recreated. A pool has
+        no placement before stage 1, so no queue record is written. Provenance that the source does not hold comes back as the least
+        trusted origin. A pool whose index is gone (deleted) is left alone."""
+        cls, pool, leaf_id, lv, seq = s["cls"], s["pool"], s["leaf_id"], int(s["lv"]), int(s["src_seq"])
+        idx = pool_index(self.tenant, cls, pool, "leaf")
+        if self._get(idx, doc_id) is not None:
+            return
+        try:
+            text = self._ks.decrypt(leaf_id, lv, base64.b64decode(s["ct"]), base64.b64decode(s["nonce"])).decode()
+        except KeystoreError:
+            out["erased_skipped"] += 1
+            return
+        try:
+            self._project(cls, leaf_id, lv, seq, text, list(s.get("lin_subjects", [])), pool, {"origin": "agent", "mode": "repair"})
+            self.advance_head(cls, leaf_id, lv, pool)
+        except WriterError:
+            return
+        out["reprojected"] += 1
+
     def repair(self, classes: Iterable[str]) -> dict:
         """Finish or undo partial writes. Source documents without a projection are re-projected from the
         source (decrypted with the leaf's key); a source whose key is gone was erased and is left alone;
@@ -465,6 +485,9 @@ class Writer:
                 s = h["_source"]
                 cls, leaf_id, lv, seq = s["cls"], s["leaf_id"], int(s["lv"]), int(s["src_seq"])
                 if cls not in classes:
+                    continue
+                if s.get("pool"):
+                    self._repair_pool_source(s, h["_id"], out)   # a pool source goes back into its own pool's index, never a class-level one
                     continue
                 leaf = class_index(self.tenant, cls, "leaf")
                 if self._get(leaf, h["_id"]) is None:
