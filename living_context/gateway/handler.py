@@ -32,7 +32,7 @@ UNAVAILABLE = {"ok": False, "error": "unavailable"}
 HELD = {"ok": False, "error": "held"}
 # A scoped or delegated token is attenuated to its pool scope (POOLS 2.6): it may call only these (default-deny, an explicit allow-list).
 # `token_revoke` is allowed without a `token_id` only (its own revocation).
-SCOPED_OPS = POOL_TOOLS | frozenset({"pool_list", "pool_describe", "token_revoke", "ping"})
+SCOPED_OPS = POOL_TOOLS | frozenset({"pool_list", "pool_describe", "token_revoke", "token_renew", "token_delegate", "ping"})
 
 
 class EsGate:
@@ -88,6 +88,39 @@ class Gateway:
             return None
         return {"pointer": ptr, "title": src.get("title", ""), "size": src.get("size_tokens", 0)}
 
+    def mint(self, tenant: str, proof: bytes, request: Any) -> dict:
+        """The one way to obtain a scoped token over the socket: an authentication proof (verified by the tenant's identity adapter) and a
+        request naming the conversation, the scope (pool id to operations), an optional default save pool and a lifetime. The `human` flag
+        is never read from the request: a token is `agent` unless the harness's own adapter says a human is present, and no request field
+        can say so. Every failure is the one `unavailable` answer."""
+        from .sessions import TokenError
+        try:
+            if not isinstance(request, dict) or not isinstance(request.get("scope"), dict) or not isinstance(proof, bytes):
+                return UNAVAILABLE
+            scope = {k: frozenset(v) for k, v in request["scope"].items() if isinstance(k, str) and isinstance(v, list)}
+            if len(scope) != len(request["scope"]):
+                return UNAVAILABLE
+            ttl = request.get("ttl_s")
+            tok = self._sessions.mint_scoped(tenant, proof, conversation=request.get("conversation"), scope=scope,
+                                             default_save_pool=request.get("default_save_pool"),
+                                             ttl_s=float(ttl) if isinstance(ttl, (int, float)) and not isinstance(ttl, bool) else None)
+            return {"ok": True, "token": tok}
+        except (TokenError, ValueError, TypeError):
+            return UNAVAILABLE
+
+    def _token_op(self, op: str, token: str, rec, request: dict) -> dict:
+        from .sessions import TokenError
+        try:
+            if op == "token_renew":
+                return {"ok": True, "exp": self._sessions.renew(token)}
+            scope = request.get("scope")
+            ttl = request.get("ttl_s")
+            if not isinstance(scope, dict) or not isinstance(ttl, (int, float)) or isinstance(ttl, bool):
+                return UNAVAILABLE
+            return {"ok": True, "token": self._sessions.delegate(token, {k: frozenset(v) for k, v in scope.items()}, float(ttl))}
+        except (TokenError, ValueError, TypeError):
+            return UNAVAILABLE
+
     def handle(self, token: str, request: Any) -> dict:
         rec = self._sessions.resolve(token)
         if rec is None:
@@ -108,6 +141,8 @@ class Gateway:
         lattice = self._lattices.get(rec.tenant)
         if lattice is None:
             return UNAVAILABLE
+        if op in ("token_renew", "token_delegate"):
+            return self._token_op(op, token, rec, request)
         if isinstance(op, str) and (op in POOL_OPS or op in POOL_TOOLS):
             svc = self._pools(rec.tenant) if self._pools else None
             if svc is None:
