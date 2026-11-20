@@ -1,10 +1,14 @@
 # living-context: adaptive mode (amendment to DESIGN, BUILD-PLAN, EXPERIMENT)
 
-Status: design amendment, revision 2, not yet adopted. Nothing here has been
-built or run. Revision 2 answers two independent reviews of revision 1 (review
-A: authorization and isolation; review B: lifecycle, adaptation, tuning). It
-removes the shared small-pool tier, the replay gate on transitions and the
-stage 0 queue records, and recomputes every cost from measured figures. Section
+Status: design amendment, revision 3, not yet adopted. Nothing here has been
+built or run. Revision 2 answered two independent reviews of revision 1 (review
+A: authorization and isolation; review B: lifecycle, adaptation, tuning): it
+removed the shared small-pool tier, the replay gate on transitions and the stage
+0 queue records, and recomputed every cost from measured figures. Revision 3
+answers a delta review of revision 2: probation is counted and capped inside the
+attempt bound and measured by interleaving against the flat list, one principal
+can neither force nor keep a tree, down-moves fence write-path jobs, and a stage
+0 pool costs one shard. Section
 numbers of DESIGN.md, BUILD-PLAN.md and EXPERIMENT.md refer to commit 6002839;
 section 14 lists the edits to make when this is adopted. This file does not edit
 them, and it changes nothing the registered experiment does (section 8).
@@ -69,7 +73,7 @@ transitions; a tenant with ten pools can have ten different stages.
 
 | Stage | Name | What exists in the pool | Write cost | Read cost |
 |---|---|---|---|---|
-| 0 | FLAT | leaves (text, vector, entities from code, code-built title), leaf heads, protocol log, stored queries; the tenant's source log holds the pool's source documents. No queue records, nodes, members, summaries, edges, notes or cache | 0 model calls (embedding runs on the embedding port, not the model port) | 0 model calls: direct search (DESIGN 8.5) with the version filter (POOLS 3.9), the same code as arm A0 |
+| 0 | FLAT | leaves (text, vector, entities from code, code-built title) in the pool's own leaf index; leaf heads, control documents, protocol log rows and stored queries in class-level indices, unscored (POOLS 1.2); the tenant's source log holds the pool's source documents. No queue records, nodes, members, summaries, edges, notes or cache | 0 model calls (embedding runs on the embedding port, not the model port) | 0 model calls: direct search (DESIGN 8.5) with the version filter (POOLS 3.9), the same code as arm A0 |
 | 1 | TREE | stage 0 plus the topic family: level-1 nodes (gists, summaries, facts), upper levels by the index-of-indexes rule (DESIGN 5.4), placement members, batch rebuilds, fan-out routing (DESIGN 8.2 to 8.4) | placement is model-free; a batch rebuild costs one build call per level-1 node with pending members, plus its ancestor path (DESIGN 7.6) | direct search plus the owner's fan-out on the full path: measured about 67 calls on the 6,000-leaf pool, capped at `T + 48` (5.4) |
 | 2 | LEARNING | stage 1 plus typed edges and bounded expansion (DESIGN 7.7, 8.6, 16), reflection, the reverse audit, the reorganiser and its gate (DESIGN 10 to 13), each per pool (POOLS 9.5) | typing: one call per 20 pairs, 3 pairs per leaf (DESIGN 7.7); loop calls under their existing caps | stage 1 plus edge expansion (model-free) |
 
@@ -87,8 +91,9 @@ Why three stages:
   defined by the topic head only.
 
 Stage is derived, not stored in a second field: stage 0 = no live topic
-generation; stage 1 = topic head `hd:topic` names a live generation; stage 2 = the
-pool's control index also holds a live learning head `hd:learn`. The flip that
+generation; stage 1 = topic head `hd:topic` names a live generation; stage 2 = a
+live learning head `hd:learn` also exists (both are control documents of the pool
+in the class control index, POOLS 1.2). The flip that
 defines a stage is one compare-and-set of one document (`hd:topic` for 0 to 1,
 creation of `hd:learn` for 1 to 2). A commit writes other documents first (`wp`;
 for 1 to 2 the generation head), each harmless to every reader if the process
@@ -102,7 +107,7 @@ and no node pointer exists at generation 0.
 
 | Tier | Where the pool's documents live | Index cost |
 |---|---|---|
-| S1 DEDICATED | from creation, the pool's own index family `lc-<t>-<c>-<p>-<kind>` (POOLS 1.2), each an alias over one physical index of one primary shard; kinds are created lazily | 4 shards at stage 0, 7 at stage 1, 9 at stage 2 (9.4) |
+| S1 DEDICATED | every scored kind in the pool's own index family `lc-<t>-<c>-<p>-<kind>` (POOLS 1.2), each an alias over one physical index of one primary shard; the leaf index from creation, the others created at the stage that needs them | 1 shard at stage 0, 6 at stage 1, 8 at stage 2 (9.4) |
 | S2 SHARDED | S1 with more than one physical index per kind behind the same aliases: new writes roll over to a new physical index at a size or age bound; reads search all of them | one more index per rolled kind per rollover |
 
 There is no shared small-pool tier. Revision 1 put small pools of one tenant and
@@ -132,11 +137,36 @@ Written out, it needs more than those three:
    for a half-moved pool;
 7. a verifier check that no document in the shared index lacks a valid `pool`.
 
-So the shared tier is dropped. What it would save is small now that automatic
-per-session scratch pools are gone and person and private pools would be
-dedicated anyway: about 4 shards for each small non-private pool. The cost of
-many pools is stated as a limit with its arithmetic (9.4, 12). This is also the
-default of owner question Q2 (POOLS 12).
+So the shared scored tier is dropped.
+
+What is shared instead, at stage 0, is unscored. A stage 0 pool's heads and
+control documents sit in the class control index, and its log rows and stored
+queries in the class-level row indices (POOLS 1.2); only its leaves, the one kind
+that is scored, have an index of their own. This does not bring back the round 1
+findings:
+
+- No cross-pool scoring statistic (review A F3). BM25 statistics and kNN
+  candidates exist only for scored reads, and every scored read is of the pool's
+  own leaf index. The shared documents are read by id (ids embed the pool; POOLS
+  3.6 checks `head.pool`) or by filter-context term and aggregation requests,
+  which have no idf, term frequency or candidate competition. Reformulation
+  detection uses the conversation's recent query embeddings in gateway memory
+  (4.1), not a vector search of stored queries.
+- One enforcement point (review A F4). Every read of these indices goes through
+  the gateway's class-level reader, which requires a `pool` term and refuses any
+  scored request; a dedicated negative test covers it (POOLS NEG-16).
+- No copier (review B M3, review A F16). At the 0 to 1 transition the pool's new
+  rows start going to its own row indices; older rows stay in the class-level
+  indices, read through the same reader with the pool term, until their retention
+  ends. Heads and control documents never move.
+- Residual channels. The time of an aggregation over a shared row index depends on
+  other pools' row volume (activity, not content), and only background jobs run
+  such aggregations, so no session can time them. The verifier checks that every
+  document in a class-level index has a valid `pool` (9.3).
+
+Layout 2 (every kind dedicated from creation, 4 shards at stage 0) remains a
+configuration; the owner chooses between them (POOLS 12 Q2, with the per-node
+figures of 9.4).
 
 ## 3. What each stage does on write and read
 
@@ -181,10 +211,19 @@ Inputs are gateway-derived only:
 - A unit is one recall of the pool: a protocol log row group with `via = recall`,
   written by the gateway. Rows with `via = injection` (POOLS 6.6) or `via = probe`
   (evaluation questions, TUNING 4.2) are never units.
-- The session of a unit is its root token (POOLS 2.3), assigned by the gateway; no
-  caller-supplied task id is read. Each session contributes at most `U_SESS`
+- The session of a unit is its (authenticated principal, conversation) (POOLS
+  2.3, 2.8), assigned by the gateway; no caller-supplied task id is read, and new
+  root tokens do not make new sessions. Each session contributes at most `U_SESS`
   units to a window and each principal at most `U_PRINC`, unless it is the pool's
-  only grantee with `query`.
+  only grantee with `query`. `U_PRINC / W_UNITS` (0.05 by default) is strictly
+  below every threshold a unit share feeds, the lowest being `RHO_DOWN x H_UP2`
+  (0.075).
+- Rows of a conversation tainted above the pool's class, or with a private set
+  other than this pool, are never units (POOLS 1.2). The pool's stage is shown to
+  every grantee of the pool, and it is a function of the signals, so counting such
+  a unit would let features of a query shaped by restricted or private content
+  change what a lower-class reader sees (against DESIGN 12 step 1). Such a pool
+  adapts on its memory gate and backstop only (limit, section 12).
 - A recall whose feature computation failed (embedding unavailable, a typed
   search error) or whose holders fell back (DESIGN 8.2) is not a unit; it is
   counted in `feature_fail` (INV-11 is met by counting). An evaluation whose
@@ -196,12 +235,12 @@ Inputs are gateway-derived only:
 |---|---|---|
 | `leaf_count` | live current leaf versions (heads with status live) | leaf heads |
 | `token_total` | sum of `size_tokens` over the same leaves | leaf index |
-| `session_count` | distinct `session_ref` holding at least 2 of those leaves (cardinality aggregation, approximate) | leaf index |
-| `entity_count` | distinct `entities` occurring in at least 2 of those leaves | leaf index |
-| `hard(unit)` | the recall was not flat-sufficient (6.2: low agreement, small margin, wide session spread), or the same session issued, within the window, a later recall with query cosine at least `TAU_RE` to it | log rows |
+| `session_count` | distinct `session_ref` holding at least 2 of those leaves, summed over writer principals with each principal's contribution capped at `S_PRINC` (below `RHO_DOWN x S_UP1`) unless the pool has a single writer (cardinality aggregation, approximate) | leaf index |
+| `entity_count` | distinct `entities` occurring in at least 2 of those leaves, each writer principal's contribution capped at `E_PRINC` likewise | leaf index |
+| `hard(unit)` | the recall was not flat-sufficient (6.2: low agreement, small margin, wide session spread), or the same conversation issued, within the window, a later recall with query cosine at least `TAU_RE` to it (from the conversation's recent query embeddings in gateway memory, POOLS 2.8) | log rows |
 | `hard_rate` | share of `hard` units among the last `W_UNITS` units, defined only when at least `R_MIN` exist | log rows |
-| `gain_rate`, `loss_rate` (stage 1 and above) | over tree-consulted units: share where an item in the fused top 10 and not in the direct top 10 was opened; share where an item in the direct top 10 and not in the fused top 10 was opened | log rows (`rank`, `direct_rank`, `opened`) |
-| `link_gain_rate` (stage 2) | share of units where an item offered only by link expansion was opened | log rows |
+| `il_win`, `il_loss` (stage 1 and above) | over interleaved units (5.3): share where the opened items credited to the tree's list outnumber those credited to the flat list, and the reverse | log rows (`il_team`, `opened`) |
+| `link_win`, `link_loss` (stage 2) | the same, interleaving the stage 2 list (with link expansion) against the stage 1 list | log rows |
 | `multi_rate` | share of units in which leaves of two or more distinct sessions were opened | log rows |
 | `open_share` | mean share of offered pointers opened per unit (DESIGN 9) | log rows |
 
@@ -210,25 +249,31 @@ Rules that keep these inside the existing design:
 - No signal treats "offered and not opened" as evidence (DESIGN 9, 11.1). Opens
   are used only as positive evidence, and only from `opened` rows the gateway
   wrote.
-- A pool's evaluator reads only its own pool's indices. It never reads the
-  class-level row indices of higher join classes (POOLS 1.2), so a pool never
-  sees a higher-class query (DESIGN 12 step 1); a lower-class pool's signals see
-  only queries made at its own class.
+- A pool's evaluator reads only its own pool's indices and, through the
+  class-level reader with the pool term, its own stage 0 rows in the class-level
+  indices of its own class. It never reads rows kept at a higher join class or for
+  a private set (POOLS 1.2), so a pool never sees a higher-class query (DESIGN 12
+  step 1).
 - The per-recall features (`agree`, `margin`, `spread`, section 6.2) are scalars
   in the pool's log rows, which carry lineage, so erasure reaches them.
 - The evaluator's state between evaluations is one control document `ad:<pool>`
-  in the pool's control index: per trigger a consecutive-evaluation count,
+  in the class control index: per trigger a consecutive-evaluation count,
   `cool_until`, an outcome count `k` (4.4), `leaf_count_at_outcome`, the
   attempt's spend `attempt_spent` (4.4), and the
   probation counters of 5.3. Scalars only, so it needs no lineage; a schema test
   asserts it. Signal values are recomputed at each evaluation, never stored.
 
 Flood bounds. One principal contributes at most `U_PRINC` of the `W_UNITS` units
-(one quarter by default), so on its own it moves `hard_rate` by at most 0.25. That
-can still help meet the difficulty gate; forcing a tree also needs the memory gate
-(writes, bounded by the stored-byte cap), and the most it can make the pool spend
-is the transition bound of 5.4, after which the backoff of 4.4 applies. Starving
-(holding a pool flat with easy recalls) lasts at most until `N_BACK` (4.3).
+(0.05), below every threshold, and the difficulty gate also needs hard units from
+at least `P_MIN` distinct principals (4.3), so one principal cannot meet it; its
+sessions and entities are capped in the memory gate likewise. Probation needs
+units from `P_MIN` principals, caps each at a quarter, and must hold with any one
+principal's units removed (5.3), and a void probation rolls back; so one
+principal can neither force a tree nor keep one. A principal that is the only
+grantee can do both, at its own cost only. Several colluding principals can still
+spend at most the attempt bound of 5.4, after which the backoff of 4.4 applies.
+Starving (holding a pool flat with easy recalls) lasts at most until `N_BACK`
+(4.3).
 
 ### 4.2 When it runs
 
@@ -244,7 +289,9 @@ Stage 0 to 1 (propose a tree), all of:
 1. `leaf_count > N_FLOOR`.
 2. Memory gate: `leaf_count >= N_UP1` or `token_total >= T_UP1` or
    `session_count >= S_UP1` or `entity_count >= E_UP1`.
-3. Difficulty gate: `hard_rate >= H_UP1` (so at least `R_MIN` units exist).
+3. Difficulty gate: `hard_rate >= H_UP1` (so at least `R_MIN` units exist), with
+   the hard units coming from at least `P_MIN` distinct principals unless the pool
+   has a single grantee with `query`.
 4. Conditions 1 to 3 hold at `E_CONSEC` consecutive non-void evaluations at least
    `EVAL_PERIOD` apart.
 5. No transition of this pool in flight, `now >= cool_until`, at least `D_DWELL`
@@ -288,11 +335,13 @@ Stage 1 to 2 (propose the learning layer), all of:
   kept past probation. Its model calls are counted in `attempt_spent`, carried
   across erasure-abort retries and lease-expiry restarts (5.6) and reset only when
   an outcome is recorded or the tree is kept, so one attempt never spends more than
-  `B_TRANS` however often it restarts.
+  `B_TRANS` however often it restarts. Probation's tree recalls are part of the
+  attempt and count in `attempt_spent` (5.3, 5.4).
 - Backoff. An outcome is an attempt whose candidate failed its structural checks,
   aborted on a failed build call or `budget_exceeded`, was aborted by
-  `E_ABORT_MAX` erasures in a row (5.6), or was rolled back at probation (5.3), or
-  an adopted tree demoted within `D_DWELL` of its adoption. A single erasure abort
+  `E_ABORT_MAX` erasures in a row (5.6), aborted at re-promotion because an
+  earlier residency's member or edge was visible (below), or was rolled back at
+  probation (5.3), or an adopted tree demoted within `D_DWELL` of its adoption. A single erasure abort
   or a lease expiry is not an outcome: the attempt continues under its remaining
   budget. Each outcome sets `k = k + 1`,
   `leaf_count_at_outcome = leaf_count`, and `cool_until = now + COOL_BASE x 2^k`
@@ -306,9 +355,18 @@ Stage 1 to 2 (propose the learning layer), all of:
 
 Down-moves. Memory shrinks through erasure, archiving and re-filing. ASSUMPTION
 (design decision): a pool moves down one rung when the memory gate is below its
-down thresholds, `hard_rate < RHO_DOWN x H_UP1` and (opens not void) `gain_rate <
-G_KEEP`, all at `E_CONSEC` consecutive evaluations, after the dwell. A probation
-rollback (5.3) uses the same mechanics at once. A down-move costs no model call.
+down thresholds, `hard_rate < RHO_DOWN x H_UP1` and (opens not void) `il_win -
+il_loss < G_KEEP` over the sampled interleaved units (5.3), all at `E_CONSEC`
+consecutive evaluations, after the dwell. A probation rollback (5.3) uses the
+same mechanics at once. A down-move costs no model call.
+
+Fence first. Every down-move starts by marking the pool `demoting` in the gateway's
+write-path tracker: from then on a step 6 of the pool records `flat` and creates no
+placement or link job (5.2). The down-move waits up to `J_WAIT` for the pool's open
+jobs to commit, and cancels the rest: the tracker refuses a cancelled job's commit
+(jobs run in the gateway and ask the tracker before committing), and the job's
+leaf becomes a flat leaf. Only then does it stamp `R`. So no member or edge is
+written after the stamp by a job that read the old stage.
 
 - 1 to 0, in one commit under the shared side of the tenant's write gate, with the
   tombstone check (DESIGN 7.6 step 6): allocate a retirement number `R` from the
@@ -329,7 +387,10 @@ rollback (5.3) uses the same mechanics at once. A down-move costs no model call.
   while kept (DESIGN 14.2, 14.4).
 - Re-promotion is a fresh bulk build (5.2). Before its flip the committer asserts
   that, under the candidate's own pin, no member or edge is visible except the
-  candidate's own; otherwise it aborts as a defect (counted).
+  candidate's own; otherwise it aborts as a defect (counted) and the abort is an
+  outcome (backoff applies), so a straggler the fence missed cannot make
+  re-promotions repeat without bound. The `demoting` mark is cleared when the
+  down-move's flip is done.
 
 Physical tiers only move up (rollover); merging physical indices back is an
 offline operator action.
@@ -366,28 +427,36 @@ tombstone guard (INV-8).
 
 A transition is the DESIGN 7.6 builder run as a bulk build (BUILD-PLAN Step 9:
 balanced clustering to `F_TARGET`, level-1 build calls, upper levels,
-index-of-indexes rule). DESIGN 7.6 batch rebuilds flip the head with no replay
-gate, and so does a transition. Revision 1 added the DESIGN 13.3 replay gate to
-transitions; it cost about 5,400 model calls whatever the pool's size (80 replays
-at about 67 calls) against a build of 133 calls at 2,000 leaves, so the decision
-cost 40 times the thing it decided.
+index-of-indexes rule).
 
-A replay bounded to a fraction of the build cost cannot decide either. The
-smallest gate DESIGN 13.3 allows has K = 8 clusters; at one query each that is 8 x
-67 = 536 routing calls plus about 32 judge calls (8 queries, both lists' top 10,
-5 items per call), about 570 calls: 4.3 times the build at 2,000 leaves, 1.4
-times at 6,000, 0.43 times at 20,000. Capped at half the build cost, it reaches K
-= 8 only above about 17,000 leaves (0.5 x N / 15 >= 570), and at K = 8 the gate's
-power is low (EXPERIMENT 7.3).
+What DESIGN gates. DESIGN 13.3's replay gate (labelled there OWNER "everything
+versioned" plus a research recommendation) gates reorganiser candidates, and they
+stay gated (section 13, row 7). First builds and DESIGN 7.6 batch rebuilds were
+never gated. So adopting a first tree on structural checks plus probation is a
+design decision about cost and latency, disclosed to the owner (section 15, Q7),
+not a deviation from the owner's words.
 
-Decision (ASSUMPTION): adopt on structural checks alone (zero model calls),
-then keep or roll back by a probation on live use (5.3). Trade-off, stated: a
-tree serves readers before any evidence that it helps them. What protects
-readers is that the direct search runs on every recall at every stage and its top
-10 always reach the digest, either offered by the tree or in the direct section
-(DESIGN 8.1, 8.5); so a reader of a new tree loses no item the flat path would
-have given, and the worst a bad tree does is reorder the fused list and spend
-model calls until probation rolls it back. The measured direction on the
+Revision 1 added the replay gate to transitions at 80 replays, about 5,400 model
+calls whatever the pool's size, against a build of 133 calls at 2,000 leaves. The
+smallest gate DESIGN 13.3 allows has K = 8 clusters: at one query each, 8 routing
+recalls plus about 32 judge calls (8 queries, both lists' top 10, 5 items per
+call), that is 8 x 67 + 32 = 568 at the measured 67 calls per recall, or 480, 608
+and 456 at the caps `r_max` of 2,000, 6,000 and 20,000 leaves (56, 72, 53), and at K
+= 8 its power is low (EXPERIMENT 7.3). Probation (5.3) costs more model calls, up
+to `B_PROB = N_PROB x r_max` (2,800, 3,600 and 2,650 at those sizes), but they are
+the tree recalls of real readers, interleaved with the flat list, so they measure
+the tree on the pool's own queries with the opens of its own users; the replay
+gate needs stored queries and a judge model and measures neither. Both options and
+their costs are in Q7.
+
+Decision (ASSUMPTION, owner question Q7): adopt on structural checks alone (zero
+model calls), then keep or roll back by probation (5.3). Trade-off, stated: a tree
+serves some readers before there is evidence that it helps them. What a reader is
+guaranteed (POOLS 5.1): during probation, only probation units consult the tree,
+and their per-pool list is an interleave that holds the flat list's top
+`ceil(K_POOL / 2)` (5); every other recall is flat. After a tree is kept, each
+tree pool's list keeps the flat top `D_FLOOR` (3); other flat items can be
+displaced by tree items (limit, section 12). The measured direction on the
 6,000-leaf pool (tree about 0.77 to 0.80 against 0.67, not significant) is
 consistent with that choice; it does not establish it.
 
@@ -396,8 +465,11 @@ consistent with that choice; it does not establish it.
 1. Propose: the evaluator (4.3) writes a candidate manifest (status building,
    `stage_target = 1`, the fired trigger names, not their values, and the pin
    state), takes the build lease (5.6), and sets the candidate's `W` to the
-   highest committed source sequence of the pool's leaves. (The pool's `wp` is not
-   used: stage 0 does not advance it.) The budget counter (DESIGN 18.1) gets
+   highest source sequence `s` such that every entry of the pool at or below `s`
+   is closed in the write-path tracker (its step 6 has recorded `flat` or its job
+   has finished), so no sequence below `W` can still be uncommitted and fall into
+   neither the build nor the gap. (The pool's `wp` is not used: stage 0 does not
+   advance it.) The budget counter (DESIGN 18.1) gets
    `B_TRANS - attempt_spent`, with `B_TRANS` computed at the attempt's first `W`
    (5.4, 4.4).
 2. Build: bulk build over every live leaf of the pool with `src_seq <= W`, read
@@ -448,24 +520,43 @@ stage 2 at step 6 and get write-path link jobs under P.
 
 ### 5.3 Probation and rollback
 
-Probation starts at the flip and lasts for the first `N_PROB` tree-consulted units
-of the pool (4.1: gateway-derived, capped per session and principal, no injection
-or probe rows, no failed features). It costs no model call: it reads only log
-rows the gateway wrote for recalls readers made anyway.
+Probation starts at the flip. It is part of the attempt: its tree recalls count
+in `attempt_spent`, under the attempt bound of 5.4.
 
-- For each unit the log rows give the fused top 10 and the direct top 10 (field
-  `direct_rank`), and which items were opened.
-- At the end, if `open_share` is inside the DESIGN 9 bounds: the tree is rolled
-  back if `gain_rate < G_KEEP` or `loss_rate > gain_rate`. A tree whose own items
-  are not being opened, or that pushes opened direct items out of the top 10 more
-  often than it adds opened ones, is not paying for its calls.
-- If `open_share` is outside the bounds, opens are void (DESIGN 9): the tree is
-  kept, a typed event `probation_void` is written, and only the memory-based
-  down-move can later demote it (ASSUMPTION; limit, section 12).
+- Which recalls consult the tree. Only a recall that will count as a probation
+  unit (4.1: gateway-derived, at most `U_SESS` per session, at most `N_PROB / 4`
+  per principal, no injection or probe rows, no tainted rows, no failed features)
+  takes the full path; every other recall of the pool during probation takes the
+  flat path (logged `tree_consulted = false`, `esc_reason = probation`). So
+  probation spends at most `B_PROB = N_PROB x r_max` model calls, and most readers
+  see no change in latency.
+- How a unit is measured, without being blind to losses. The flat list of the
+  pool (its direct search, which runs on every recall, DESIGN 8.1) is computed in
+  shadow. The pool's list shown to the reader is a team-draft interleave, seeded
+  by the search id, of the fused list and the flat list, cut at `K_POOL`: each
+  pick takes the picking list's best item not yet shown, the first picker
+  alternates by a coin, and each shown item is logged with `il_team` (`tree` or
+  `flat`). A unit is a win if the reader opened more items credited to the tree's
+  list than to the flat list, a loss if fewer, a tie otherwise. A bad tree that
+  pushes flat items down now loses units, because the flat list's picks are shown
+  and opened; the reader always sees the flat top `ceil(K_POOL / 2)`.
+- End. Probation ends at `N_PROB` units, when `B_PROB` is spent, or after `D_PROB`,
+  whichever comes first.
+- Decision. The tree is kept only if all hold: at least `N_PROB` units were
+  collected; they come from at least `P_MIN` distinct principals unless the pool
+  has a single grantee with `query`; `open_share` is inside the DESIGN 9 bounds;
+  and `il_win - il_loss >= G_KEEP`, also with any one principal's units removed.
+  Otherwise the tree is rolled back: a short, void or principal-dominated
+  probation rolls back, never keeps (typed events `probation_short`,
+  `probation_void`, `probation_loss`).
+- After a kept probation, a share `EPS_IL` of tree-consulted units is still
+  interleaved, seeded by the search id, so the down-move's benefit test (4.4) has
+  the same measure.
 - Rollback is the 1 to 0 down-move of 4.4, at once and with no dwell; it is an
   outcome (4.4), so the backoff applies.
-- 1 to 2 has the same probation on `link_gain_rate < G_KEEP`, rolling back to
-  stage 1.
+- 1 to 2 has the same probation, interleaving the stage 2 list against the stage 1
+  list (`link_win`, `link_loss`), rolling back to stage 1. Link expansion is
+  model-free, so its probation spends no model call beyond stage 1's own recalls.
 
 ### 5.4 Cost
 
@@ -485,21 +576,41 @@ Per attempt:
 | Build | `build(N, m)`; failed calls count, and retries are capped at the same figure again (DESIGN 18.1): at most `2 x build(N, m)` |
 | Structural checks and adoption decision | 0 |
 | Gap rebuild (first batch rebuild after the flip) | at most one call per level-1 node holding gap leaves plus its ancestor path: at most `build(N, m)` |
-| Probation | 0 extra (it reads the rows of recalls readers make anyway) |
-| `B_TRANS`, enforced by the counter | `3 x build(N, M_MAX)`, computed at `W` |
+| Probation | at most `B_PROB = N_PROB x r_max`: only units consult the tree (5.3) |
+| `B_TRANS`, enforced by the counter | `3 x build(N, M_MAX) + B_PROB`, computed at the attempt's first `W` |
 
-Worst case from empty to an adopted tree (failed calls doubling the build, every
-level-1 node in the gap, `m = M_MAX`), and the backoff's cumulative bound: each
-failed or rolled-back attempt raises the next attempt's size by `RHO_RETRY = 1.5`,
-so the attempts before an attempt at N cost at most a geometric series of ratio
-2/3, and all attempts together cost at most `3 x B_TRANS(N) = 9 x build(N, 2)`
-(build is close to linear in N).
+Worst case from empty to a kept tree (failed calls doubling the build, every
+level-1 node in the gap, `m = M_MAX`, probation spent in full), and the backoff's
+cumulative bound. Each failed or rolled-back attempt raises the next attempt's
+size by `RHO_RETRY = 1.5`, so the builds of all attempts up to size N form a
+geometric series of ratio 2/3 and sum to at most `9 x build(N, 2)` (build is close
+to linear in N). Probation does not shrink with size, so it is bounded by the
+number of attempts: at most `A(N) = floor(log_1.5(N / N_FLOOR)) + 1` attempts can
+fit between `N_FLOOR` and N, each spending at most `N_PROB x (F_MAX + 48) = 3,600`
+on probation. Cumulative bound: `9 x build(N, 2) + A(N) x 3,600`.
 
-| Pool size N | T at m = 1 (r_max) | build, m = 1 (planned) | build, m = 2 | worst one attempt `3 x build(N, 2)` | worst cumulative `9 x build(N, 2)` | level-1 input tokens, m = 1 | build time, m = 1, two model slots, 17 s per call | revision 1 at 67 per replay, for comparison |
-|---|---|---|---|---|---|---|---|---|
-| 2,000 | 8 (56) | 133 | 266 | 798 | 2,394 | 1.9 M | about 19 min | about 5,700 |
-| 6,000 | 24 (72) | 399 (measured) | 800 | 2,400 | 7,200 | 5.6 M | about 57 min | about 6,300 |
-| 20,000 | 5 (53) | 1,334 | 2,667 | 8,001 | 24,003 | 18.8 M | about 3.1 h | about 8,300 |
+| Pool size N | T at m = 1 (r_max) | build, m = 1 (planned) | build, m = 2 | `B_PROB` | worst one attempt `3 x build(N, 2) + B_PROB` | A(N) | worst cumulative | level-1 input tokens, m = 1 | build time, m = 1, two model slots, 17 s per call | revision 1 at 67 per replay, for comparison |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 2,000 | 8 (56) | 133 | 266 | 2,800 | 3,598 | 5 | 20,394 | 1.9 M | about 19 min | about 5,700 |
+| 6,000 | 24 (72) | 399 (measured) | 800 | 3,600 | 6,000 | 7 | 32,400 | 5.6 M | about 57 min | about 6,300 |
+| 20,000 | 5 (53) | 1,334 | 2,667 | 2,650 | 10,651 | 10 | 60,003 | 18.8 M | about 3.1 h | about 8,300 |
+
+The replay-gated alternative (Q7) spends `3 x build(N, 2)` plus one K = 8 replay
+(480, 608, 456 at the caps) per attempt: 1,278, 3,008 and 8,457, and cumulatively
+`9 x build(N, 2) + A(N) x 608`: 5,434, 11,456 and 30,083. It serves no reader
+before adoption, and after adoption every recall pays the full path as under the
+default.
+
+Latency. A flat recall makes no model call. A tree recall makes up to `r_max`
+model calls in the parallel waves of DESIGN 8.2 (at least one routing wave and one
+organise call); its latency is not measured (PENDING_REAL_TEST).
+During probation only the `N_PROB` unit recalls pay it; after a tree is kept,
+every full-path recall of the pool does.
+
+Tokens. Calls are capped; input tokens per attempt are bounded by the calls times
+the largest build input, at most `F_MAX` children of at most `LEAF_CAP` tokens
+(DESIGN 7.2, 7.6), and are reported per attempt (the measured level-1 input is
+about 15k tokens per call). A separate token cap is not added.
 
 Arithmetic: at 2,000, 125 level-1 nodes and 8 upper (m = 1), 250 and 16 (m = 2);
 at 6,000, 375 and 24, or 750, 47 and 3; at 20,000, 1,250, 79 and 5, or 2,500, 157
@@ -507,10 +618,9 @@ and 10. Revision 1 is `2 x (N / 15 + L) + 72 + 80 x 67` with `L` the upper-level
 nodes at m = 1 (8, 24, 84), and it omitted its judge calls (160 to 320 more). Upper-level call tokens and times are not measured; the
 time column assumes 17 s for every call.
 
-After adoption, reads cost model calls that a flat pool does not: each full-path
-recall at most `r_max` (about 67 measured at 6,000), so probation's `N_PROB` units
-cost about 50 x 67 = 3,350 calls of ordinary reads per attempt, which are what
-the owner's method costs on a tree, not a transition cost. Several tree pools in
+After a tree is kept, reads cost model calls that a flat pool does not: each
+full-path recall at most `r_max` (about 67 measured at 6,000); that is what the
+owner's method costs on a tree, not a transition cost. Several tree pools in
 one recall are bounded by `R_CAP` (POOLS 5.3), and injections never call the
 model (POOLS 6.1). Ordinary upkeep after adoption is DESIGN 7.6: per batch
 rebuild at most `min(new leaves x M_MAX, level-1 nodes)` calls plus ancestor paths.
@@ -533,8 +643,10 @@ Enforcement:
 
 - Before the flip: stage 0, bit for bit. A task started before the flip keeps `gen
   = 0` for its life (DESIGN 13.2); its delegates inherit it.
-- At the flip: new tasks pin `G+1` and the stage 1 path; the candidate's members
-  were invisible until the head changed (13.2).
+- At the flip: new tasks pin `G+1`; the candidate's members were invisible until
+  the head changed (13.2). During probation, a recall that counts as a unit gets
+  the interleaved list (5.3) and the tree's latency; every other recall stays on
+  the flat path.
 - At a rollback: tasks pinned at `G+1` keep it for their life; new tasks are flat.
 - The digest reports the stage of pools in `S` (3.2), not that a build runs.
 - Latency of an unrelated recall is unaffected: the build runs in the pool's
@@ -547,7 +659,7 @@ Enforcement:
 | A build call fails | DESIGN 7.6: the generation aborts, unshared documents deleted, counted (INV-11); stage unchanged; outcome (4.4) |
 | Structural check fails | delete the candidate; outcome `structure_fail` |
 | `B_TRANS` reached | abort; outcome `budget_exceeded` |
-| Probation rolls back | 1 to 0 down-move (4.4); outcome `no_benefit` |
+| Probation rolls back (loss, short, void or one principal deciding) | 1 to 0 down-move (4.4) with its fence; outcome `no_benefit` |
 | An erasure's boundary publishes mid-transition | the commit takes the shared side of the write gate and checks the published tombstone sequence; an intersecting tombstone aborts the candidate (DESIGN 7.6 step 6). Retry after the erasure's closure finishes, in the same attempt and under its remaining budget (4.4); `E_ABORT_MAX` such aborts in a row end the attempt as one outcome (a pool under constant erasure may stay at its stage; limit) |
 | Pool deleted mid-run | the pool-scope tombstone aborts the commit; the candidate's documents are in the pool's closure |
 | Builder paused by the hourly budget | keeps its lease: the lease is renewed by a heartbeat every `LEASE_BEAT` while the builder process lives, paused or not |
@@ -597,7 +709,8 @@ On, for a pool at stage 1 or 2:
 ### 6.3 Logging, so the log stays truthful
 
 Each protocol log row (DESIGN 9) gains: `stage`, `route` (`flat` or `full`),
-`tree_consulted`, `esc_reason` (`rule`, `sample`, `forced`, `budget`, `none`),
+`tree_consulted`, `esc_reason` (`rule`, `sample`, `forced`, `budget`,
+`probation`, `none`), `il_team` per shown item of an interleaved unit (5.3),
 `p_esc` (the propensity of the action taken: 1 for `rule`, `forced` and `budget`;
 `EPS_ESC` for `sample`; `1 - EPS_ESC` for a flat-sufficient recall not escalated),
 `direct_rank`, and the scalars `agree`, `margin`, `spread`. Every consumer of
@@ -608,7 +721,7 @@ Each protocol log row (DESIGN 9) gains: `stage`, `route` (`flat` or `full`),
 | DESIGN 10 step 3, `tree_missed` | only over searches with `tree_consulted = true`; estimates over the sampled escalations use weights `1 / p_esc` |
 | DESIGN 12 steps 3 and 4 | a flat-answered search is "tree not consulted", never a miss |
 | DESIGN 11.1 "judge: relevant but never offered", "reverse-audit misses" | same exclusion |
-| Probation and down-move signals (5.3, 4.4) | tree-consulted units only |
+| Probation and down-move signals (5.3, 4.4) | interleaved tree-consulted units only |
 | EXPERIMENT 2.2 (c) | arms force the full path (section 8), so every row is consulted |
 
 `any_missed` is unaffected. The opened-share bounds (DESIGN 9) are over all
@@ -619,7 +732,7 @@ Each protocol log row (DESIGN 9) gains: `stage`, `route` (`flat` or `full`),
 | Invariant or concern | Stage 0 | Stage 1 and 2 | During a transition | Down-move or rollback |
 |---|---|---|---|---|
 | INV-1 tenant on everything | every document, including `ad:<pool>` and manifests, carries `tenant`, pool and class | same | lease, budget and cooldown keys embed the tenant (INV-10) | same |
-| INV-2 trim before retrieval | only the pool's own indices are read; the version filter is not an access filter | same | the builder reads only its pool | n/a |
+| INV-2 trim before retrieval | only the pool's own leaf index is searched; its heads, control documents and rows in class-level indices are read only through the pool-term reader (POOLS 1.2); the version filter is not an access filter | same, plus the pool's own row and tree indices | the builder reads only its pool | n/a |
 | INV-3 join | log rows and notes take the join class; a pool's evaluator reads only its own indices | edges in the pool's index, which is the pool's class | candidate documents take the pool's class | n/a |
 | INV-4 lineage | the only stored adaptive state is `ad:<pool>` and manifests, scalars and ids only | same | candidate nodes, members and edges carry lineage; the structural check refuses any that lacks it | stamped documents keep their lineage |
 | INV-5 no credential | the evaluator and builders call the gateway | same | same | same |
@@ -654,7 +767,8 @@ no value.
 - Stage 1 and 2: as DESIGN 14, including the walk up `lin_nodes` in every retained
   generation.
 - Physical indices: the closure and the verifier enumerate the pool's manifest of
-  physical indices (9.3).
+  physical indices (9.3), and the class-level indices that hold the pool's heads,
+  control documents and stage 0 rows (POOLS 1.2), matched by the `pool` field.
 
 ### 7.2 Erasure arriving mid-transition
 
@@ -717,7 +831,8 @@ hyphen. The class key's pattern `lc-<t>-<c>-*` covers every pool of the class
 
 Append-only kinds (leaf, log, stored queries) roll over: when the current physical
 index crosses the size or age bound, a new physical index is created and recorded
-in the pool's manifest of physical indices first, then the write alias is moved to
+in the pool's manifest of physical indices (a control document of the pool in the
+class control index) first, then the write alias is moved to
 it in one atomic `_aliases` action (PENDING_REAL_TEST P8); the search alias gains
 the new index and keeps the old ones. Because the manifest is written before the
 alias moves, an erasure closure never misses an index that can hold a document.
@@ -731,15 +846,17 @@ behind the alias (DESIGN 14.5); rollover needs neither.
 
 ### 9.3 Erasure and the verifier across physical indices
 
-- Each pool keeps a manifest of its physical indices in its control index (ids
-  only). The erasure closure, the purge loop, copy-and-swap and the verifier
+- Each pool keeps a manifest of its physical indices as a control document in the
+  class control index (ids only). The erasure closure, the purge loop, copy-and-swap and the verifier
   enumerate that manifest, not an alias.
 - The purge (DESIGN 14.5) runs per physical index; `docs.deleted == 0` is required
   on every physical index of the pool before the physical purge is reported.
 - The verifier reads each physical index directly (14.7). Its positive control
   plants a canary in each physical index; it asserts that the manifest equals the
-  set of indices matching the pool's pattern, and that no document in a pool's
-  index has a `pool` other than that pool.
+  set of indices matching the pool's pattern, that no document in a pool's index
+  has a `pool` other than that pool, and that every document in a class-level
+  index has a `pool` naming an existing pool of that class (a count of documents
+  with a missing or unknown `pool` must be zero).
 - Snapshots follow DESIGN 6.5 (source, control and authz indices); a restore
   rebuilds projections for every physical index named in the manifest after the
   tombstone journal is applied (14.6), then re-reads the epoch journal records of
@@ -747,22 +864,29 @@ behind the alias (DESIGN 14.5); rollover needs neither.
 
 ### 9.4 Cost of many pools
 
-Per tenant: `src`, `ctl`, `authz` (3 shards) plus, per class, the class-level row
-indices `log`, `sq`, `note`, `cache` (up to 4, created lazily, POOLS 1.2). Per
-pool, with kinds created lazily: stage 0 holds leaf, control, log and stored-query
-indices (4 shards); stage 1 adds node, member and cache (7); stage 2 adds edge and
-note (9); each rollover adds one per rolled kind. Each counts `(1 + r)` with `r`
-replicas.
+Layout 1 (the default, 2.3). Per tenant: `src`, `ctl`, `authz` (3 shards) plus,
+per class, the class control index and the class-level row indices `log`, `sq`,
+`note`, `cache` (up to 5, created lazily, POOLS 1.2). Per pool: stage 0 holds its
+leaf index only (1 shard); stage 1 adds node, member, cache and its own log and
+stored-query indices (6); stage 2 adds edge and note (8); each rollover adds one
+per rolled kind. Layout 2: per tenant 3 plus 4 per class; per pool 4 at stage 0
+(leaf, control, log, stored queries), 7 at stage 1, 9 at stage 2. Each shard
+counts `(1 + r)` with `r` replicas.
 
 With DESIGN 6.4's 1,000 shards per node, about 20 system shards and provisioning's
-80% ceiling, about 780 shards are usable per node. One tenant with two classes uses
-3 + 8 = 11, leaving room for about 190 pools at stage 0 or about 85 at stage 2 per
-data node with no replicas, and half that with one replica. A tenant with 500
-person pools at stage 0 and one replica needs about 4,000 shards, 6 data (4,000 / 780 = 5.1, rounded up)
-nodes. Provisioning refuses a pool that would take the node above the 80% ceiling,
-with a typed refusal. Many small indices also cost cluster-state size and per-shard
-overhead (SOURCE: the shard-size guidance cited in DESIGN 5.6). This is the price of
-dropping the shared tier (2.3), stated as a limit (12).
+80% ceiling, about 780 shards are usable per node. One tenant with two classes:
+
+| Pools per data node | Layout 1, no replica | Layout 1, one replica | Layout 2, no replica | Layout 2, one replica |
+|---|---|---|---|---|
+| tenant base shards | 13 | 26 | 11 | 22 |
+| all pools at stage 0 | (780 - 13) / 1 = 767 | (780 - 26) / 2 = 377 | (780 - 11) / 4 = 192 | (780 - 22) / 8 = 94 |
+| all pools at stage 2 | (780 - 13) / 8 = 95 | (780 - 26) / 16 = 47 | (780 - 11) / 9 = 85 | (780 - 22) / 18 = 42 |
+| 500 person pools at stage 0 | 513 shards, 1 node | 1,026 shards, 2 nodes | 2,011 shards, 3 nodes | 4,022 shards, 6 nodes |
+
+Provisioning refuses a pool that would take the node above the 80% ceiling, with a
+typed refusal. Many small indices also cost cluster-state size and per-shard
+overhead (SOURCE: the shard-size guidance cited in DESIGN 5.6). Tree pools still
+cost 6 to 8 shards each, stated as a limit (12).
 
 ## 10. Build-plan step
 
@@ -802,14 +926,35 @@ the counter only.
   - Structural checks: a candidate with a leaf in no node, or a node without
     lineage, is not adopted (broken: adopt on build completion).
   - Probation, with opens scripted as the fixture's gold items opened (as TUNING
-    D7): with the stub's router replaced by a random router (a known-bad tree), the
-    tree is rolled back at `N_PROB` in at least 95% of seeded runs; with
-    the normal stub, kept in at least 95% (broken: no probation; probation on
-    offers instead of opens). With opens void, the tree is kept and
-    `probation_void` is written.
+    D7) and credited through the team-draft interleave (5.3): with the stub's
+    router replaced by a random router (a known-bad tree) in a recall whose gold
+    items are spread over two pools, `il_loss` exceeds `il_win` and the tree is
+    rolled back at `N_PROB` in at least 95% of seeded runs; with the normal stub,
+    kept in at least 95% (broken: no probation; credit on offers instead of opens;
+    losses not observed because the flat list is not interleaved). With opens void,
+    with fewer than `N_PROB` units by `D_PROB`, with units from fewer than `P_MIN`
+    principals in a pool with several grantees, or with the keep decided only by
+    one principal's units (the leave-one-principal-out check fails), the tree is
+    rolled back, never kept (broken: `probation_void` keeps the tree; units
+    counted per token). During probation every interleaved digest holds the flat
+    top `ceil(K_POOL / 2)` and every other recall of the pool has
+    `tree_consulted = false`; after a kept tree every digest holds the flat top
+    `D_FLOOR` (broken: the tree list alone).
+  - Probation spend: probation calls count in `attempt_spent`, and probation ends
+    at `B_PROB` calls with the tree rolled back if the keep rule is not met by then
+    (broken: probation outside the attempt bound; no `B_PROB` cap).
+  - Principal bounds: 300 root tokens minted by one principal, each with its own
+    conversation, count as one principal in `session_count`, `U_PRINC`, `P_MIN`
+    and the leave-one-principal-out check (broken: counts keyed by root token or
+    conversation); one principal's units are at most `U_PRINC / W_UNITS` of the
+    window and its sessions at most `S_PRINC` (broken: no per-principal cap);
+    tainted rows and rows of a private set feed no signal and no probation unit
+    (broken: `taint` not filtered); the difficulty gate is not met with fewer than
+    `P_MIN` distinct principals among the hard units (broken: no principal count).
   - Backoff: after a rollback the pool is not proposed again until `cool_until` and
     `RHO_RETRY` growth; a scripted adopt-then-demote trace spends at most `9 x
-    build(N, 2)` over all attempts (broken: re-propose at the next evaluation).
+    build(N, 2) + A(N) x 3,600` over all attempts, probation included (broken:
+    re-propose at the next evaluation).
   - Budget: with the stub set to the measured profile (one build call per 16
     leaves at level 1, 67 calls per recall), a transition's counter never exceeds
     `B_TRANS`, and a call past it aborts with `budget_exceeded` (broken: no cap); an
@@ -828,6 +973,17 @@ the counter only.
     pinned after re-promotion, and visible to a task pinned before the down-move
     (broken: no `R` stamp; `R` missing from later ancestry; stamping the old
     generation number instead of `R`).
+  - Down-move fence: a placement job paused by test hook between its stage read
+    and its commit, around a probation rollback and around a memory down-move;
+    released before `J_WAIT` it commits before `R` is stamped, released after it
+    is cancelled and its commit refused, and in both cases no member or edge
+    without `R` in `gen_to` exists after the stamp; a step 6 after the `demoting`
+    mark records `flat` (broken: stamp `R` with no fence; a cancelled job's commit
+    accepted).
+  - Re-promotion abort: a planted member without `R` (the fence bypassed by test
+    hook) makes the re-promotion's pre-flip assertion abort the candidate as a
+    defect, the abort counts as an outcome, and the next attempt waits for
+    `cool_until` (broken: abort not counted; immediate re-proposal).
   - Erasure at each phase of a transition (before the build, mid-build, between the
     check and the compare-and-set by test hook, after the flip, during the gap
     rebuild) and during a down-move commit, and after a down-move with canaries in
@@ -858,14 +1014,15 @@ the counter only.
     signal sequences (at most one move per dwell, none on a single evaluation, none
     on a void evaluation) and the signal tests.
   - AC-3 A transition is a structurally checked candidate whose cost is bounded by
-    `B_TRANS`, and whose total spend over failed attempts is bounded by `9 x build(N,
-    2)`. Verify by: the budget, backoff and lease tests with the measured stub
-    profile.
+    `B_TRANS` (probation included), and whose total spend over failed attempts is
+    bounded by `9 x build(N, 2) + A(N) x 3,600`. Verify by: the budget, probation
+    spend, backoff and lease tests with the measured stub profile.
   - AC-4 Readers are unaffected by a transition, a rollback and a down-move. Verify
     by: a pinned task across each flip (version probe), digests before the flip equal
     those of a pool with no transition, and the resurrection tests.
-  - AC-5 A tree that does not help is rolled back. Verify by: the probation tests
-    with the random-router control.
+  - AC-5 A tree that does not help is rolled back, and no single principal can
+    force or keep one. Verify by: the probation tests with the random-router
+    control and the principal-bound tests.
   - AC-6 The per-query choice is logged truthfully. Verify by: the log rows of a
     mixed run; `tree_missed` with and without the exclusion differ, and the first
     matches a hand computation on the fixture.
@@ -883,9 +1040,11 @@ the counter only.
   - NEG-3 (AC-3) A transition at or below `N_FLOOR`, one past `B_TRANS`, or a second
     attempt before `cool_until` and growth: red.
   - NEG-4 (AC-4) A flip, rollback or down-move changes what a task pinned before it
-    sees, or a re-promotion shows a member or edge from an earlier residency: red.
-  - NEG-5 (AC-5) The random-router tree survives probation in more than 5% of runs:
-    red.
+    sees, a re-promotion shows a member or edge from an earlier residency, or a
+    write-path job commits after the `R` stamp: red.
+  - NEG-5 (AC-5) The random-router tree survives probation in more than 5% of runs;
+    a void, short or single-principal probation keeps a tree; or one principal's
+    root tokens count as several principals: red.
   - NEG-6 (AC-6) A flat-answered recall counted as a tree miss: red.
   - NEG-7 (AC-7) A tombstone that intersects the candidate does not abort it; a
     demoted pool's canary survives; or a threshold, count or stage of one tenant or
@@ -908,15 +1067,19 @@ the tier code.
 
 | Limit | Why |
 |---|---|
-| Each pool costs its own shards | 4 at stage 0, up to 9 at stage 2 (9.4): about 190 stage 0 pools per data node with no replicas; a tenant with many person pools needs more nodes, or per-person tenants (DESIGN 4.2) |
-| A tree serves readers before any evidence that it helps | Structural adoption (5.1); the direct top 10 always reaches the digest, and probation rolls a tree back from opens; until then the tree spends model calls |
-| Probation needs opens | With `open_share` outside the DESIGN 9 bounds the tree is kept (`probation_void`) and only the memory-based down-move can remove it |
+| Each pool costs its own shards | 1 at stage 0, 6 at stage 1, 8 at stage 2 in the default layout (9.4): about 767 stage 0 pools per data node with no replica, 377 with one; layout 2 (Q2 in POOLS 12) costs 4 at stage 0 (192 and 94); a tenant with many person pools needs more nodes, or per-person tenants (DESIGN 4.2) |
+| Stage 0 pools share the class-level unscored indices | Log and stored-query rows of a stage 0 pool live in the class-level indices, read only by id or in filter context through the class-level reader with a mandatory pool term (2.3); the residual is that one pool's activity volume can affect another's background-job timing, never a score or a result |
+| A tree serves probation units before any evidence that it helps | Structural adoption (5.1); during probation only unit recalls consult the tree and their list holds the flat top `ceil(K_POOL / 2)`; a void, short or one-principal probation rolls back; until then the tree spends model calls |
+| A kept tree can displace flat items | After a kept probation each tree pool's list holds the flat top `D_FLOOR` (3) only; flat items below it can be pushed out by tree items (POOLS 5.1); the sampled interleave (`EPS_IL`) keeps measuring this and drives the down-move |
+| Probation needs opens | With `open_share` outside the DESIGN 9 bounds probation is void and the tree is rolled back (`probation_void`); a pool whose readers never open items stays flat |
+| Probation units pay the tree's latency | Up to `r_max` model calls in parallel waves per unit recall, not measured (5.4, PENDING_REAL_TEST); at most `N_PROB` recalls per probation |
+| Tainted and private-set rows feed no signal | Stage is visible to every grantee and derived from the signals (DESIGN 12 step 1), so rows a grantee could not read never count; a pool used mostly from tainted conversations adapts on the rest only |
 | The difficulty features are heuristics | Tuned on development data; a wrong "easy" costs recall, a wrong "hard" costs calls; the sampled escalation measures the error |
 | Implicit supersedes and contradictions are detected only at stage 2 | Detection shares the typing call (DESIGN 7.7); an explicit `pool_update supersede` is honoured at every stage (POOLS 3.9) |
 | A pool under constant erasure may never complete a transition | Each intersecting erasure aborts the candidate (5.6, DESIGN 7.6) |
 | Adaptive state holds scalars derived from the pool | Counts and timestamps only; not content; recomputed from live data |
 | A tree has upkeep costs | After adoption each batch rebuild calls the model per level-1 node with pending members (DESIGN 7.6) |
-| One principal can still help meet the difficulty gate | Its share is capped at `U_PRINC`; the cost it can cause is the transition bound and the backoff |
+| Several colluding principals can still force a transition | One principal cannot (4.1 flood bounds: `U_PRINC`, `S_PRINC`, `E_PRINC`, `P_MIN`, leave-one-principal-out); `P_MIN` colluding principals can, and the cost they cause is the attempt bound of 5.4 and the backoff; a pool's only grantee can do both, at its own cost |
 | After a failed attempt and a mass erasure, re-proposal waits for regrowth | The next attempt needs `RHO_RETRY` times the size at the last outcome, and `N_BACK` does not waive it; this keeps the spend bound of 5.4 |
 
 ## 13. Conflicts with DESIGN, and the edit that resolves each
@@ -929,11 +1092,11 @@ the tier code.
 | 4 | 7.7: link creation for each new leaf | only at stage 2 | add the stage condition |
 | 5 | 8.1 step 3; 8.2 "Every top-level holder ... is asked in parallel"; AGREED (a) | the per-query path serialises and can skip the fan-out | DEVIATION proposal (6.1); off by default |
 | 6 | 10 step 3 `tree_missed`; 12 steps 3 and 4; 11.1; 13.3 | they assume the tree was consulted | restrict to `tree_consulted` (6.3) |
-| 7 | 13.3 gates reorganiser candidates; 7.6 batch rebuilds are not gated | revision 1 gated transitions too | none now: a transition is a 7.6 bulk build with structural checks and probation (5.1); 13.3 is unchanged |
+| 7 | 13.3 gates reorganiser candidates by replay; first builds and 7.6 batch rebuilds were never gated | none: a transition is a first build (7.6 bulk build), so 13.3 does not apply to it; reorganisations of a tree pool stay replay-gated | none to DESIGN; adopting on structural checks plus probation instead of a replay is a disclosed cost and latency design decision (5.1, Q7), not a deviation |
 | 8 | 5.6: generation 1 is the first generation; P advances with write-path jobs | stage 0 has none | generation 0 implicit; `wp` not advanced at stage 0, set to `W` at the flip; the `flat` outcome and gap rule (5.2) |
-| 9 | 5.6: "The write-path watermark P (`_id = wp`, one per tenant in `lc-<t>-ctl` ...) ... one P serves every class" | the watermark and generations are per pool | `wp`, heads and manifests live in the pool's control index; `src_seq` stays one monotone counter per tenant, so sequences compare across pools; P of a pool counts only its own leaves |
-| 10 | 6.4: shard budget `(9 x C + 3) x (1 + r)` per tenant | pools add an axis | `(3 + 4 x C + sum over pools of kinds present) x (1 + r)` (9.4) |
-| 11 | 5.7: log rows, stored queries, notes and cache entries live in the index of their join class | names now carry a pool | a row whose join class is the pool's class lives in the pool's index; a higher join class lives in the class-level index of that class with `pool` (POOLS 1.2) |
+| 9 | 5.6: "The write-path watermark P (`_id = wp`, one per tenant in `lc-<t>-ctl` ...) ... one P serves every class" | the watermark and generations are per pool | `wp`, heads and manifests are per pool and live in the class control index `lc-<t>-<c>-ctl`, each `_id` carrying the pool, read by id (POOLS 1.2); `src_seq` stays one monotone counter per tenant, so sequences compare across pools; P of a pool counts only its own leaves |
+| 10 | 6.4: shard budget `(9 x C + 3) x (1 + r)` per tenant | pools add an axis | `(3 + 5 x C + sum over pools of kinds present) x (1 + r)` in the default layout, `(3 + 4 x C + ...)` in layout 2 (9.4) |
+| 11 | 5.7: log rows, stored queries, notes and cache entries live in the index of their join class | names now carry a pool | from a pool's first tree, a row whose join class is the pool's class lives in the pool's own index; at stage 0, and for a higher join class or a foreign private set, it lives in the class-level index of that class with `pool`, never scored (POOLS 1.2) |
 | 12 | 7.3: subjects from declarations "and by the entity list from the build call" | stage 0 has no build call | subjects from declarations and the code extractor at every stage; the build call's list never the only source (3.1) |
 | 13 | 13.2 visibility; 5.6 ancestry | a down-move must hide old write-path members and edges from later pins | the retirement number `R` stamped into `gen_to` and listed in every later ancestry (4.4) |
 | 14 | 20 "Cost of the owner's routing: 25 to 77 model calls per recall ...; no design change can make agent-per-holder routing cheap" | adaptivity pays it only for pools at stage 1 or 2, and per query only with the switch on | edit the row; state the measured 67 at 6,000 leaves |
@@ -959,8 +1122,11 @@ DESIGN.md
 - 2A: a line under each concern pointing to ADAPTIVE 7.
 - 4.1: the POOLED tier is not a pool.
 - 5.3: per pool. 5.6: generation 0, `wp` per pool, `hd:learn`, `ad:<pool>`, the
-  retirement number `R`, the manifest of physical indices. 5.7 and 9: the new log
-  fields of 6.3 (`direct_rank` included) and `via = probe`.
+  retirement number `R`, the manifest of physical indices, all in the class
+  control index (POOLS 1.2). 5.7 and 9: the new log fields of 6.3 (`direct_rank`
+  and `il_team` included), `esc_reason = probation` and `via = probe`; stage 0
+  log and stored-query rows in the class-level indices, read through the
+  class-level reader (POOLS 1.2).
 - 6.2, 6.4: pool names, lazily created kinds, the shard formula of 9.4.
 - 7.3: subjects at every stage (conflict 12). 7.4 step 6, 7.5, 7.6, 7.7: stage
   conditions, the `flat` tracker outcome, the gap rebuild placing leaves without a
@@ -973,7 +1139,9 @@ DESIGN.md
   transition jobs, lease heartbeat, budgets (5.4, 5.6).
 - 17: rewrite the "New tenant, no tree yet" row; add rows for a transition at a tiny
   pool, erasure mid-transition, a bulk import with no recalls, an outage during
-  evaluation, a pool shrunk below threshold, a probation rollback.
+  evaluation, a pool shrunk below threshold, a probation rollback (loss, short,
+  void, one principal), a write-path job running across a down-move (the fence of
+  4.4).
 - 18.1: the budget handle gets a per-transition cap and the `budget_exceeded`
   outcome.
 - 19: add `adaptive/` and `recall/route.py`.
@@ -1008,28 +1176,33 @@ EXPERIMENT.md (committed alone before the run it affects, with the reason)
 | Id | Question | Default in force |
 |---|---|---|
 | Q6 | May a recall of a tree pool be answered from the flat path alone when the query looks easy (a deviation from "asks all context index shard holders")? | built behind a switch, off until TUNING D4 passes, then on with 5% sampled escalation |
-| Q7 | Is the automatic transition spend acceptable: at most `3 x build(N, 2)` model calls per attempt (2,400 at 6,000 leaves) and `9 x build(N, 2)` over all attempts (7,200), within the tenant's hourly budget, with no absolute cap? | yes, automatic, with a typed event per transition; the owner may set an absolute per-pool cap |
+| Q7 | How is a tree adopted, and is its spend acceptable? (a) Default: adopt on structural checks, keep or roll back by probation (5.1, 5.3); probation counts inside the attempt bound, capped at `B_PROB`. Per attempt `3 x build(N, 2) + B_PROB`: 3,598, 6,000 and 10,651 model calls at 2,000, 6,000 and 20,000 leaves; over all attempts `9 x build(N, 2) + A(N) x 3,600`: 20,394, 32,400 and 60,003. Up to `N_PROB` (50) reader recalls pay the tree's latency (up to `r_max` calls in parallel waves, not measured) before the keep decision. (b) Alternative: gate adoption on one K = 8 replay of stored queries (the smallest gate DESIGN 13.3 allows: 8 x 67 + 32 = 568 calls at the measured 67 per recall; 480, 608 and 456 at the caps): per attempt 1,278, 3,008 and 8,457; over all attempts 5,434, 11,456 and 30,083; no reader sees a tree before the replay, but the replay needs stored queries in 8 clusters and a judge model, measures neither real readers nor their opens, and has low power at K = 8 (EXPERIMENT 7.3); with no probation, a bad tree that passes the replay is removed only by the down-move's sampled interleave (4.4). After either, every full-path recall of a kept tree pays up to `r_max` (about 67 measured at 6,000 leaves). All within the tenant's hourly budget, with no absolute cap. | (a), automatic, with a typed event per transition; the owner may pick (b) or set an absolute per-pool cap |
 
-POOLS 12 (Q1 to Q5) and TUNING 7 (Q8, Q9) hold the other owner questions.
+POOLS 12 (Q1 to Q4) and TUNING 7 (Q8, Q9) hold the other owner questions.
 
 ## 16. Index of ASSUMPTIONS and PLACEHOLDERS introduced here
 
 Each is in TUNING's table (D1 to D8 here; D9 to D13 in POOLS). ASSUMPTIONS: three
 stages and the rung grouping; leaf cut kept at stage 0; stage derived from heads;
 every pool dedicated, no shared tier; `ad:<pool>` as a scalar control document; no
-replay gate on transitions; structural adoption with probation; keep the tree when
-opens are void; the gap through the write-path tracker; the retirement number;
+replay gate on transitions; structural adoption with probation; probation units
+only consult the tree, interleaved with the flat list; roll the tree back when
+probation is void, short or decided by one principal; the per-principal caps; the
+down-move fence; the gap through the write-path tracker; the retirement number;
 down-moves; backoff by outcomes; lower priority for transition calls; per-query
-path and its sampled escalation; lazy creation of kinds.
+path and its sampled escalation; lazy creation of kinds; layout 1 with stage 0's
+unscored rows in class-level indices.
 
 PLACEHOLDERS (no measurement): [D2] `N_UP1` 2,000 leaves, `T_UP1` 2.5 million
 tokens, `S_UP1` 300 sessions, `E_UP1` 2,000 entities, `N_BACK` 50,000 leaves
 (absolute, not tuned); [D3] `W_UNITS` 200, `R_MIN` 50, `H_UP1` 0.20, `TAU_RE` 0.85,
-`U_SESS` 5, `U_PRINC` 50, `F_FAIL_MAX` 0.10; [D4] `A_MIN` 0.4, `G_MIN` 0.1, `S_MAX`
-6, `EPS_ESC` 0.05; [D5] `E_CONSEC` 3, `EVAL_PERIOD` 1 hour, `A_EVERY` 500 writes,
-`D_DWELL` 24 hours, `D_DWELL1` 24 hours, `COOL_BASE` 6 hours, `COOL_MAX` 7 days,
-`RHO_DOWN` 0.5, `RHO_RETRY` 1.5, `E_ABORT_MAX` 3, `T_PAR` 1, `LEASE_BEAT` 60 s;
-[D6] `R2_MIN` 200, `H_UP2` 0.15, `M_UP2` 0.25; [D7] `N_PROB` 50 units, `G_KEEP`
-0.05; [D8] `B_SHARD_TARGET` 10 GiB, `AGE_ROLL` 30 days. Derived, not tuned:
-`N_FLOOR = F_MAX x F_TARGET`, `build(N, m)`, `B_TRANS = 3 x build(N, M_MAX)`,
-`r_max = T + 48`.
+`U_SESS` 5, `U_PRINC` 10 (so `U_PRINC / W_UNITS` = 0.05), `F_FAIL_MAX` 0.10;
+[D2] `S_PRINC` 75 sessions, `E_PRINC` 500 entities; [D4] `A_MIN` 0.4, `G_MIN` 0.1,
+`S_MAX` 6, `EPS_ESC` 0.05; [D5] `E_CONSEC` 3, `EVAL_PERIOD` 1 hour, `A_EVERY` 500
+writes, `D_DWELL` 24 hours, `D_DWELL1` 24 hours, `COOL_BASE` 6 hours, `COOL_MAX` 7
+days, `RHO_DOWN` 0.5, `RHO_RETRY` 1.5, `E_ABORT_MAX` 3, `T_PAR` 1, `LEASE_BEAT` 60
+s, `J_WAIT` 60 s; [D6] `R2_MIN` 200, `H_UP2` 0.15, `M_UP2` 0.25; [D7] `N_PROB` 50
+units, `G_KEEP` 0.05, `P_MIN` 3 principals, `D_PROB` 14 days, `EPS_IL` 0.05; [D8]
+`B_SHARD_TARGET` 10 GiB, `AGE_ROLL` 30 days. Derived, not tuned: `N_FLOOR = F_MAX
+x F_TARGET`, `build(N, m)`, `B_PROB = N_PROB x r_max`, `B_TRANS = 3 x build(N,
+M_MAX) + B_PROB`, `A(N) = floor(log_1.5(N / N_FLOOR)) + 1`, `r_max = T + 48`.
