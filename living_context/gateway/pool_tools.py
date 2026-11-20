@@ -14,6 +14,7 @@ taint, review mode, retraction or copy yet.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import re
 import threading
@@ -37,7 +38,8 @@ from ..policy import Op, decide
 
 UNAVAILABLE = pl.UNAVAILABLE
 TOKEN_SHAPE = re.compile(r"[a-z0-9]{4,16}\.[0-9a-f]{64}")
-ORIGIN_RANK = {"agent": 0, "import": 1, "human": 2}   # the least trusted wins (POOLS 3.8)
+ORIGIN_RANK = {"unknown": -1, "agent": 0, "import": 1, "human": 2}   # the least trusted wins (POOLS 3.8); unknown is below agent
+origin_of = wmod.origin_of   # the ONE reader of a version's origin: missing or unknown is `unknown` (strict for edits, untrusted for display)
 
 
 def err(code: str, **extra) -> dict:
@@ -51,7 +53,7 @@ def pl_taint(cls: str, private_ids: list, directory, tenant: str):
 
 
 def least_trusted(*origins: str) -> str:
-    return min(origins, key=lambda o: ORIGIN_RANK.get(o, 0))
+    return min(origins, key=lambda o: ORIGIN_RANK.get(o, -1))
 
 
 class PoolTools:
@@ -78,7 +80,6 @@ class PoolTools:
         self._saves: dict[tuple, list] = {}
         self._retracts: dict[tuple, list] = {}
         self._update_keys: dict[tuple, tuple] = {}
-        self._leaf_locks: dict[tuple, threading.Lock] = {}
         self.plan: list[str] = []    # every index an operation named, for the request-plan assertions
 
     # ---- routing ---------------------------------------------------------------------------------------------------------
@@ -206,12 +207,17 @@ class PoolTools:
             return bad or err("invalid")
         body = hashlib.sha256(json.dumps([mode, pool.id, s.id, req["text"], if_lv]).encode()).hexdigest()
         ik = (rec.tenant, rec.principal_token, rec.conversation, key)
-        with self._lock:
-            lk = self._leaf_locks.setdefault((pool.id, s.id), threading.Lock())
-        with lk:   # one update of a leaf at a time (one gateway process, DESIGN 20): the head is read, claimed and advanced as one step
-            return self._update_locked(rec, pool, s, mode, req, if_lv, body, ik)
+        return self._update_claimed(rec, pool, s, mode, req, if_lv, body, ik)
 
-    def _update_locked(self, rec, pool, s, mode, req, if_lv, body, ik) -> dict:
+    def _conflict(self, pool, leaf_id: str, cur: int) -> dict:
+        head = self._head(pool.cls, pool.id, leaf_id)
+        return err("version_conflict", current=self._seal(pool.id, leaf_id, int(head.source["current_lv"]) if head else cur))
+
+    def _update_claimed(self, rec, pool, s, mode, req, if_lv, body, ik) -> dict:
+        """POOLS 3.3 by one claim on the head (class C3): the head is claimed at the version read (live, no claim in flight) BEFORE any
+        write, the new version or leaf is written, and the claim is committed by compare-and-set. A retract, another update or a crash in
+        between can never be overwritten: a retract sees the claim and conflicts, a second update loses the claim, and a claim left by a
+        crashed process is finished or undone by the next operation on the leaf (`Writer.recover_claim`)."""
         with self._lock:
             first = self._update_keys.get(ik)
         if first is not None:
@@ -227,33 +233,43 @@ class PoolTools:
             return err("version_conflict", current=self._seal(pool.id, s.id, cur))
         if not self._rate_ok(rec):
             return err("rate_limited")
-        old_origin = old.get("origin", "agent")
+        old_origin = origin_of(old)
         if mode == "correct" and rec.actor == "agent" and old_origin != "agent":
             return err("invalid")   # an agent corrects only what an agent wrote; it may supersede instead
         if self._tainted_write(rec, pool):
             return self._hold(rec, pool, req["text"], "update")
         writer_origin = "human" if rec.actor == "human" else "agent"
         origin = writer_origin if self._b["origin"] else least_trusted(writer_origin, old_origin)
-        if mode == "correct":
-            res = self.w.remember(rec.principal_token, pool.cls, req["text"], pool=pool.id, _version=(s.id, cur + 1),
-                                  prov={**self._prov(rec, "correct"), "origin": origin})
-            if res.status != wmod.STORED:
-                return self._answer(res, pool.id)
-            now_head = self._head(pool.cls, pool.id, s.id)
-            if now_head is None or int(now_head.source["current_lv"]) != cur + 1:
-                return err("version_conflict", current=self._seal(pool.id, s.id, int(now_head.source["current_lv"]) if now_head else cur))
-            out = {"ok": True, "pointer": self._seal(pool.id, s.id, cur + 1), "pool": pool.id}
-        else:
-            res = self.w.remember(rec.principal_token, pool.cls, req["text"], pool=pool.id,
-                                  prov={**self._prov(rec, "supersede", supersedes=s.id), "origin": origin})
-            if res.status != wmod.STORED:
-                return self._answer(res, pool.id)
-            if not self.w.update_head(pool.cls, pool.id, s.id, cur, status="superseded", superseded_by=res.leaf_id):
-                # a lost supersede leaves no live duplicate: the new leaf's own head is taken out of retrieval
-                self.w.update_head(pool.cls, pool.id, res.leaf_id, res.lv, status="aborted")
-                return err("version_conflict", current=self._seal(pool.id, s.id, cur))
-            out = {"ok": True, "pointer": self._seal(pool.id, res.leaf_id, res.lv), "pool": pool.id,
-                   "old": {"status": "superseded", "newer": self._seal(pool.id, res.leaf_id, res.lv)}}
+        new_id = wmod.new_leaf_id() if mode == "supersede" else None
+        opid = self.w.leaf_claim(pool.cls, pool.id, s.id, cur, mode, lv=cur + 1, new=new_id)
+        if opid is None:
+            return self._conflict(pool, s.id, cur)
+        done = False
+        try:
+            if mode == "correct":
+                res = self.w.remember(rec.principal_token, pool.cls, req["text"], pool=pool.id, _version=(s.id, cur + 1), _head=None,
+                                      prov={**self._prov(rec, "correct"), "origin": origin})
+                if res.status != wmod.STORED:
+                    return self._answer(res, pool.id)
+                if not self.w.leaf_commit(pool.cls, pool.id, s.id, opid, {"current_lv": cur + 1}):
+                    return self._conflict(pool, s.id, cur)
+                done = True
+                out = {"ok": True, "pointer": self._seal(pool.id, s.id, cur + 1), "pool": pool.id}
+            else:
+                # the new leaf's head is created `pending` (out of retrieval) and goes live only after the old head says superseded
+                res = self.w.remember(rec.principal_token, pool.cls, req["text"], pool=pool.id, _version=(new_id, 1), _head="pending",
+                                      head_extra={"supersedes": s.id}, prov={**self._prov(rec, "supersede", supersedes=s.id), "origin": origin})
+                if res.status != wmod.STORED:
+                    return self._answer(res, pool.id)
+                if not self.w.leaf_commit(pool.cls, pool.id, s.id, opid, {"status": "superseded", "superseded_by": new_id}):
+                    self.w.head_transition(pool.cls, pool.id, new_id, {"status": "pending"}, {"status": "aborted"})
+                    return self._conflict(pool, s.id, cur)
+                done = True
+                self.w.head_transition(pool.cls, pool.id, new_id, {"status": "pending"}, {"status": "live"})   # a crash here: repair
+                out = {"ok": True, "pointer": self._seal(pool.id, new_id, 1), "pool": pool.id,
+                       "old": {"status": "superseded", "newer": self._seal(pool.id, new_id, 1)}}
+        finally:
+            self.w.leaf_release(pool.cls, pool.id, s.id, opid, abandon=not done)
         with self._lock:
             self._update_keys[ik] = (body, out)
         return out
@@ -287,9 +303,9 @@ class PoolTools:
             return UNAVAILABLE
         ptr = req["pointer"]
         raised = self._raise(auth.rec, [pool])
-        text = envelope.wrap(pool.id, pool.label, leaf.get("origin", "agent"), "fetch", ptr, leaf.get("title", ""), leaf.get("text", ""))
+        text = envelope.wrap(pool.id, pool.label, origin_of(leaf), "fetch", ptr, leaf.get("title", ""), leaf.get("text", ""))
         handle = hashlib.sha256(f"{leaf.get('writer', '')}\x00{pool.id}".encode()).hexdigest()[:12]   # per-pool, cannot link a writer across pools
-        return {"ok": True, "status": "ok", "text": text, "origin": leaf.get("origin", "agent"), "wrote_at": leaf.get("wrote_at"),
+        return {"ok": True, "status": "ok", "text": text, "origin": origin_of(leaf), "wrote_at": leaf.get("wrote_at"),
                 "mode": leaf.get("mode"), "writer_handle": handle, "pool": pool.id,
                 **({"taint_raised": raised} if raised else {})}
 
@@ -351,11 +367,13 @@ class PoolTools:
                 leaf = self._leaf(pool.cls, pool.id, x.id, cur)
                 if leaf is None:
                     return UNAVAILABLE   # fail closed: an unread leaf is never assumed to be agent-written (a 429, a 503, a missing leaf)
-                if auth.rec.actor == "agent" and leaf.get("origin", "agent") != "agent" and not self._b["ret_human"]:
+                if auth.rec.actor == "agent" and origin_of(leaf) != "agent" and not self._b["ret_human"]:
                     self.w.record_retraction(pool.cls, pool.id, x.id, cur, auth.rec.principal_token, "agent", reason, "requested")
                     result = "held"       # the item stays live until a human with `review` confirms
-                elif self.w.update_head(pool.cls, pool.id, x.id, cur, status="retracted", retract_reason=reason):
+                elif self.w.leaf_retract(pool.cls, pool.id, x.id, cur, reason):   # the head claim shared with pool_update (class C3)
                     self.w.record_retraction(pool.cls, pool.id, x.id, cur, auth.rec.principal_token, auth.rec.actor, reason, "done")
+                else:
+                    result = "version_conflict"   # a change of this leaf is in flight or landed first: nothing was retracted
             out.append(result)     # a leaf already retracted or gone reads the same: no existence signal
         return {"ok": True, "accepted": True, "results": out}
 
@@ -426,12 +444,17 @@ class PoolTools:
             return UNAVAILABLE
         auth, pool, cls, doc, hid = got
         pid = pool.id
+        if decision == "admit":
+            shown = self.w.held_text(cls, pid, hid)
+            if shown is None or not isinstance(req.get("content_hash"), str) or not hmac.compare_digest(shown[1], req["content_hash"]):
+                return UNAVAILABLE   # the human approved other content than the one held: nothing is logged, nothing released
+        # the approval is logged FIRST, with a stable identity, under the write gate and the active-pool check (class C4): a crash after
+        # it leaves a hold that a retry finishes and the same event row; a pool deleted meanwhile refuses the event and the release
+        self.w.record_event(cls, pid, "hold_" + decision, auth.rec.principal_token, doc.source.get("lin_subjects", []), event_id=hid,
+                            hold=hid, content_hash=req.get("content_hash", "") if decision == "admit" else "", state="approved")
         res = self.w.release_held(cls, pid, pool.cls, hid, decision, {"released_by": auth.rec.principal_token},
                                   expect_hash=req.get("content_hash") if decision == "admit" else None)
         ok = res.status == "discarded" if decision == "discard" else res.status == wmod.STORED
-        if ok:
-            self.w.record_event(cls, pid, "hold_" + decision, auth.rec.principal_token, doc.source.get("lin_subjects", []), hold=hid,
-                                content_hash=req.get("content_hash", ""))
         if decision == "discard":
             return {"ok": True, "status": "discarded"} if ok else UNAVAILABLE
         return self._answer(res, pid) if ok else UNAVAILABLE
@@ -479,10 +502,10 @@ class PoolTools:
             leaf_id, lv = leaf_ref.split(":")
             ptr = self._seal(pid, leaf_id, int(lv))
             title = d.get("title", "")
-            if d.get("origin", "agent") == "agent" and not self._b["raw_title"]:
+            if origin_of(d) not in ("human", "import") and not self._b["raw_title"]:
                 title = envelope.wrap(pid, G[pid].label, "agent", "recall", ptr, title)   # built from agent-written text: inside the envelope
             items.append({"pointer": ptr, "title": title, "size": d.get("size_tokens", 0), "pool": pid, "label": G[pid].label,
-                          "origin": d.get("origin", "agent"), "stage": 0})
+                          "origin": origin_of(d), "stage": 0})
         return {"ok": True, "items": items, "pools": S, "taint_raised": raised}
 
     def _pool_candidates(self, pool: pl.Pool, text: str, info: dict) -> list:
@@ -541,6 +564,10 @@ class PoolRouter:
 
     def __init__(self, service, tools):
         self.service, self.tools = service, tools
+
+    def admit(self) -> bool:
+        """Whether the tenant's epoch journal admits (open, lane open). A fault closes the tenant; nothing pool-related runs then."""
+        return self.service.rev.admit()
 
     def handle(self, op: str, p, rec, req, *, token: str = ""):
         if op in ("pool_save", "pool_update", "pool_query", "pool_fetch", "pool_holds", "pool_hold_show", "pool_release", "pool_retract"):

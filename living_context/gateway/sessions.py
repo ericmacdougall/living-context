@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import math
 import os
 import threading
 import time
@@ -237,6 +238,36 @@ class Sessions:
             except Exception:
                 pass   # best effort: the journal, not this copy, is what a revoke relies on
 
+    # ---- the one validation point of every token operation (pools delta review, class C2) ---------------------------------
+    @staticmethod
+    def lifetime(value, cap: float) -> float:
+        """A requested lifetime in seconds: a real number, finite, above zero, capped at `cap`. Anything else (NaN, an infinity, zero, a
+        negative, a boolean, a string) is the one `unavailable`. Every mint, delegate and renew computes `exp` from this value only."""
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TokenError("unavailable")
+        v = float(value)
+        if not math.isfinite(v) or v <= 0:
+            raise TokenError("unavailable")
+        return min(v, float(cap))
+
+    def _admit_record(self, rec: Record) -> None:
+        """Where a scoped record enters the table (mint, delegate, restore): its lifetime fields are finite or it is not stored."""
+        if not (math.isfinite(rec.exp) and math.isfinite(rec.created) and math.isfinite(rec.max_age)) or rec.exp > rec.max_age:
+            raise TokenError("unavailable")
+        with self._lock:
+            self._by_hash[rec.hash] = rec
+
+    def _human(self, adapter, tenant: str, proof: bytes, human: Optional[bool]) -> bool:
+        """POOLS 2.3: `human` only for an identity adapter that declares the capability, from a proof the ADAPTER says carries a fresh
+        user-presence assertion (`presence(tenant, proof)`). `human=None` (the socket's mint) asks the adapter only; a harness-side
+        `human=True` still needs the adapter's capability, and its presence check when the adapter has one. A request never decides."""
+        if not getattr(adapter, "human_presence", False) or human is False:
+            return False
+        presence = getattr(adapter, "presence", None)
+        if callable(presence):
+            return bool(presence(tenant, proof))
+        return human is True
+
     def _live_scope(self, tenant: str, principal: str, requested: Mapping[str, frozenset]) -> Optional[dict]:
         """`requested` intersected with the live grant table; None when any named pool is not held (the whole mint is refused with
         the one `unavailable`)."""
@@ -250,7 +281,7 @@ class Sessions:
         return out
 
     def mint_scoped(self, tenant: str, proof: bytes, *, conversation: str, scope: Mapping[str, frozenset],
-                    default_save_pool: Optional[str] = None, ttl_s: Optional[float] = None, human: bool = False) -> str:
+                    default_save_pool: Optional[str] = None, ttl_s: Optional[float] = None, human: Optional[bool] = False) -> str:
         """A root scoped token for a harness, from an authentication proof (never a bare principal id). `scope` is pool id to
         operations and is never wider than the principal's live grants. `human` is a harness-side argument, never read from a
         request, and is honoured only for an identity adapter that declares the capability (POOLS 2.3)."""
@@ -267,20 +298,19 @@ class Sessions:
             raise TokenError("unavailable")   # a pool not held, not active or not existing: one answer (2.7)
         if default_save_pool is not None and pl.SAVE not in live.get(default_save_pool, frozenset()):
             raise TokenError("unavailable")
+        ttl = self.lifetime(ttl_s if ttl_s is not None else self._c.token_ttl_s, self._c.token_ttl_s)
         now = self._clock()
         if not self._bt["live"] and self._live_count(tenant, ptoken, now) >= self._c.tok_live_max:
             raise TokenError("rate_limited")
         if not self._rate_ok(tenant, ptoken, now):
             raise TokenError("rate_limited")
-        ttl = min(float(ttl_s if ttl_s is not None else self._c.token_ttl_s), self._c.token_ttl_s)
         token = f"{tenant}.{os.urandom(32).hex()}"
         h = self._hash(token)
         rec = Record(tenant, ptoken, g.roles, g.read_set, g.write_set, g.own_class, self._epochs.epoch(tenant, ptoken),
-                     actor="human" if human and getattr(adapter, "human_presence", False) else "agent", root=h, parent="",
+                     actor="human" if self._human(adapter, tenant, proof, human) else "agent", root=h, parent="",
                      conversation=conversation, scope=live, default_save_pool=default_save_pool, exp=now + ttl, created=now,
                      max_age=now + self._c.token_max_age_s, hash=h)
-        with self._lock:
-            self._by_hash[h] = rec
+        self._admit_record(rec)
         self._persist(rec)
         return token
 
@@ -293,6 +323,7 @@ class Sessions:
             raise TokenError("unavailable")
         if parent.parent and not self._bt["depth"]:
             raise TokenError("scope_widened")   # a child cannot delegate
+        ttl = self.lifetime(ttl_s, self._c.token_ttl_s)
         now = self._clock()
         child_scope: dict = {}
         for pid, ops in scope.items():
@@ -300,7 +331,7 @@ class Sessions:
             if not self._bt["attenuate"] and not ops <= parent.scope.get(pid, frozenset()):
                 raise TokenError("scope_widened")
             child_scope[pid] = ops
-        if not self._bt["ttl"] and now + float(ttl_s) > parent.exp:
+        if not self._bt["ttl"] and now + ttl > parent.exp:
             raise TokenError("scope_widened")
         if not self._bt["live"] and self._live_count(parent.tenant, parent.principal_token, now) >= self._c.tok_live_max:
             raise TokenError("rate_limited")
@@ -312,9 +343,8 @@ class Sessions:
                      parent.epoch, actor="agent", root=parent.root or parent.hash, parent=parent.hash,
                      conversation=parent.conversation, scope=child_scope,
                      default_save_pool=parent.default_save_pool if parent.default_save_pool in child_scope else None,
-                     exp=now + float(ttl_s), created=now, max_age=parent.max_age, hash=h)
-        with self._lock:
-            self._by_hash[h] = rec
+                     exp=now + ttl, created=now, max_age=parent.max_age, hash=h)
+        self._admit_record(rec)
         self._persist(rec)
         return token
 
@@ -346,20 +376,22 @@ class Sessions:
         self._persist(rec)
         return rec.exp
 
-    def find_by_id(self, token_id: str) -> Optional[str]:
-        """The hash of the one token whose id (the first 16 hex characters of its hash) is `token_id`, or None."""
-        if not isinstance(token_id, str) or len(token_id) < 16:
+    def find_by_id(self, tenant: str, token_id: str) -> Optional[str]:
+        """The hash of the one token OF `tenant` whose id (the first 16 hex characters of its hash) is `token_id`, or None. The tenant is
+        filtered before uniqueness, so another tenant's token never matches and never makes the lookup ambiguous (one shared table)."""
+        if not isinstance(tenant, str) or not isinstance(token_id, str) or len(token_id) < 16:
             return None
         with self._lock:
-            hit = [h for h in self._by_hash if h.startswith(token_id)]
+            hit = [h for h, r in self._by_hash.items() if r.tenant == tenant and h.startswith(token_id)]
         return hit[0] if len(hit) == 1 else None
 
-    def revoke_hash(self, h: str) -> Optional[tuple[str, float]]:
-        """Mark one token revoked (in memory, to run under the send fence; the caller journals it and returns `denied`). Children die
-        with it by check 3. A revoked token cannot renew. Returns (hash, exp), or None when there is no such token."""
+    def revoke_hash(self, h: str, tenant: str) -> Optional[tuple[str, float]]:
+        """Mark one token of `tenant` revoked (in memory, to run under the send fence; the caller journals it and returns `denied`).
+        Children die with it by check 3. A revoked token cannot renew. Returns (hash, exp), or None when there is no such token in the
+        tenant."""
         with self._lock:
             rec = self._by_hash.get(h)
-            if rec is None:
+            if rec is None or rec.tenant != tenant:
                 return None
             if self._bt["by_epoch"]:   # BROKEN variant: no per-token record, the principal's epoch moves instead
                 self._epochs.bump(rec.tenant, rec.principal_token, revoke=False, in_fence=True)
@@ -378,15 +410,19 @@ class Sessions:
             return sorted((h, e) for h, e in self._revoked_tokens.items() if e > now)
 
     def restore_token(self, h: str, d: Mapping) -> None:
-        """A token record read back from the authz copy at start-up (memory only)."""
-        with self._lock:
-            self._by_hash[h] = Record(d["tenant"], d["principal"], frozenset(Role(x) for x in d.get("roles", [])),
+        """A token record read back from the authz copy at start-up (memory only). A record whose lifetime fields are not finite is
+        dropped (the same validation as a mint)."""
+        try:
+            self._admit_record(Record(d["tenant"], d["principal"], frozenset(Role(x) for x in d.get("roles", [])),
                                       frozenset(d.get("read", [])), frozenset(d.get("write", [])), d.get("own_class") or None,
                                       int(d["epoch"]), actor=d.get("actor", "agent"), root=d.get("root", ""), parent=d.get("parent", ""),
                                       conversation=d.get("conversation", ""),
                                       scope={k: frozenset(v) for k, v in d.get("scope", {}).items()},
                                       default_save_pool=d.get("default_save_pool") or None, exp=float(d["exp"]),
-                                      created=float(d.get("created", 0)), max_age=float(d.get("max_age", INF)), hash=h)
+                                      created=float(d.get("created", 0)), max_age=float(d.get("max_age", d["exp"])),
+                                      hash=h))
+        except TokenError:
+            return
 
     def live_token_count(self, tenant: str, principal: str) -> int:
         return self._live_count(tenant, principal, self._clock())

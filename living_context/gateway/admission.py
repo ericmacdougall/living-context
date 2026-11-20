@@ -56,7 +56,23 @@ def count_structures(raw: bytes, limit: int) -> None:
         raise Refused("too_many_structures")
 
 
-def parse(raw: bytes, *, max_structures: int, parse_fn: Callable[[bytes], object] = json.loads):
+def _no_constant(name: str):
+    raise ValueError("non-standard JSON constant")   # NaN, Infinity, -Infinity are not JSON (RFC 8259)
+
+
+def _finite(text: str) -> float:
+    v = float(text)
+    if v != v or v in (float("inf"), float("-inf")):
+        raise ValueError("number out of range")      # 1e400 parses to an infinity; it is refused like the literal
+    return v
+
+
+def strict_loads(raw: bytes):
+    """JSON as RFC 8259 defines it: no NaN or infinity reaches a request handler (a lifetime, a limit, a counter)."""
+    return json.loads(raw, parse_constant=_no_constant, parse_float=_finite)
+
+
+def parse(raw: bytes, *, max_structures: int, parse_fn: Callable[[bytes], object] = strict_loads):
     count_structures(raw, max_structures)
     try:
         return parse_fn(raw)

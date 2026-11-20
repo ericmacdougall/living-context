@@ -157,7 +157,7 @@ class Delegation(Base):
         with self.assertRaises(TokenError) as e:
             w.mint("alice", {self.a: q("query")}, conv="over")
         self.assertEqual(e.exception.code, "rate_limited")
-        w.sessions.revoke_hash(w.sessions.resolve(toks[0]).hash)   # a loop of mint and revoke cannot grow the records
+        w.sessions.revoke_hash(w.sessions.resolve(toks[0]).hash, T)   # a loop of mint and revoke cannot grow the records
         with self.assertRaises(TokenError):
             w.mint("alice", {self.a: q("query")}, conv="over2")
         w.clock.t += w.consts.token_ttl_s + 1

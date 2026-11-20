@@ -27,10 +27,10 @@ from .admin import GrantStore
 from .handler import EsGate
 from .journal import TombstoneJournal
 from .keyowner import invalidate_all
+from .reads import complete_hits, search_path
 from .revocation import OPEN, RevocationService
 from .sessions import EpochTable
 
-PAGE = 10000   # grants read back at start-up; a tenant with more principals than this is a stated limit (DESIGN 20)
 
 
 def grant_doc(tenant: str, p: Principal) -> dict:
@@ -51,22 +51,28 @@ def grant_persister(gate: EsGate, tenant: str) -> Callable[[Principal], None]:
     return persist
 
 
-def load_grants(gate: EsGate, tenant: str) -> list[Principal]:
-    """Every grant record of the tenant's authz index. A read that fails is an error (the caller starts with no grants, which
-    fails closed: nobody can mint a session until a grant is made again)."""
+def load_grants(gate: EsGate, tenant: str, *, page: int = 1000) -> list[Principal]:
+    """Every grant record of the tenant's authz index, paged with `search_after` until exhausted. A failed or partial page is an error
+    (`reads.complete_hits`; the caller starts with no grants, which fails closed: nobody can mint a session until a grant is made
+    again)."""
     c = gate.client(tenant, "authz")
-    st, r = c.request("POST", f"/lc-{tenant}-authz/_search", {"size": PAGE, "query": {"term": {"kind": "grant"}}})
-    if st != 200 or not isinstance(r, dict):
-        raise RuntimeError(f"authz read failed ({st})")
-    out = []
-    for h in r["hits"]["hits"]:
-        s = h["_source"]
-        try:
-            out.append(Principal(tenant, s["principal"], frozenset(Role(x) for x in s["roles"]), frozenset(s.get("read", [])),
-                                 frozenset(s.get("write", [])), s.get("own_class") or None))
-        except (KeyError, ValueError):
-            continue   # a record that does not parse is no grant
-    return out
+    out, after = [], None
+    while True:
+        body = {"size": page, "sort": [{"_doc": "asc"}], "query": {"term": {"kind": "grant"}}}
+        if after is not None:
+            body["search_after"] = after
+        st, r = c.request("POST", search_path(f"lc-{tenant}-authz"), body)
+        hits = complete_hits(st, r)
+        if not hits:
+            return out
+        for h in hits:
+            s = h["_source"]
+            try:
+                out.append(Principal(tenant, s["principal"], frozenset(Role(x) for x in s["roles"]), frozenset(s.get("read", [])),
+                                     frozenset(s.get("write", [])), s.get("own_class") or None))
+            except (KeyError, ValueError):
+                continue   # a record that does not parse is no grant
+        after = hits[-1]["sort"]
 
 
 @dataclass
@@ -83,11 +89,15 @@ class TenantRuntime:
 
 
 def start_tenant(tenant: str, *, gate: EsGate, epochs: EpochTable, epoch_dir: Path, tombstone_paths: tuple[Path, Path],
-                 keystore: Keystore, holds_path: Path, d_fsync_s: float = 2.0, broken_skip_load: bool = False) -> TenantRuntime:
+                 keystore: Keystore, holds_path: Path, d_fsync_s: float = 2.0, broken_skip_load: bool = False,
+                 start_journal: bool = True) -> TenantRuntime:
     """Start one tenant. Admission opens only when the epoch journal replayed cleanly and wrote its start record; a tenant whose
-    journal is torn or unterminated stays closed (`rt.revocation.state`) until the operator's break-glass recovery."""
+    journal is torn or unterminated stays closed (`rt.revocation.state`) until the operator's break-glass recovery.
+    `start_journal=False`: the caller starts the journal itself, exactly once, after it has registered the pool records' replay and
+    read the pool state back (the composition root, `app.start_app`, via `pool_root.start_pools`)."""
     rev = RevocationService(tenant, epochs, epoch_dir, d_fsync_s=d_fsync_s)
-    rev.start()
+    if start_journal:
+        rev.start()
     tomb = TombstoneJournal(*tombstone_paths)
     guard = Guard(TokenSource(keystore))
     grants = GrantStore(persist=grant_persister(gate, tenant))

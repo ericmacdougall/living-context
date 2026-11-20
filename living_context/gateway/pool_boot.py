@@ -13,6 +13,7 @@ from typing import Any, Callable, Optional
 
 from ..policy import pools as pl
 from .pool_admin import PoolService
+from .reads import complete_hits, search_path
 from .sessions import Sessions
 
 PAGE = 1000   # documents per page of the start-up read; the read is paged until exhausted (no cap)
@@ -30,16 +31,15 @@ def token_persister(authz: Callable[[], Any], tenant: str) -> Callable[[str, dic
 
 
 def _read_all(authz: Callable[[], Any], tenant: str, page: int) -> list:
-    """Every pool, grant and token record of the authz copy, in pages sorted by `_doc` with `search_after`. A failed page raises."""
+    """Every pool, grant and token record of the authz copy, in pages sorted by `_doc` with `search_after`. A failed or partial page
+    raises (`reads.complete_hits`)."""
     out, after = [], None
     while True:
         body = {"size": page, "sort": [{"_doc": "asc"}], "query": {"terms": {"kind": ["pool", "pgrant", "token"]}}}
         if after is not None:
             body["search_after"] = after
-        st, r = authz().request("POST", f"/lc-{tenant}-authz/_search", body)
-        if st != 200 or not isinstance(r, dict):
-            raise RuntimeError("authz read failed")
-        hits = r["hits"]["hits"]
+        st, r = authz().request("POST", search_path(f"lc-{tenant}-authz"), body)
+        hits = complete_hits(st, r)   # a failed OR partial page (HTTP 200 with timed_out or a failed shard) raises: the start-up fails
         if not hits:
             return out
         out += [{**h["_source"], "_id": h["_id"]} for h in hits]

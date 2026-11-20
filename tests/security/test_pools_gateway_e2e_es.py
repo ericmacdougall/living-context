@@ -1,6 +1,7 @@
 """The pools through the real Gateway handler on a real Elasticsearch, wired by the composition root `pool_root.start_pools` (review: the
-foundation was tested as classes, not as the product): mint over the socket operation, save, query, fetch, update, retract, scoped-token
-default-deny, delegation, revocation, and a restart that keeps a removed grant removed. Needs LC_TEST_ES_URL, LC_TEST_CA and LC_TEST_PW."""
+foundation was tested as classes, not as the product): mint through `Gateway.mint`, save, query, fetch, update, retract, scoped-token
+default-deny, delegation, revocation, and a restart that keeps a removed grant removed. The same flow over the local socket, from the composition root, is
+tests/security/test_pools_socket_e2e_es.py. Needs LC_TEST_ES_URL, LC_TEST_CA and LC_TEST_PW."""
 import tempfile
 import unittest
 from pathlib import Path
