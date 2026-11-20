@@ -36,6 +36,12 @@ vocabulary (tunekit/synth.py states the limits): lexical overlap between a quest
   generator's topic vocabularies, otherwise it is dropped and counted. The drop rate by size is reported; a drop rate that rises with
   size would bias later sizes towards easier questions, and the note says so if it does. (An earlier design used the fewest words
   that still identify the leaf; it made questions easier as memory grew and was replaced before any grid run.)
+- Set questions: up to 200 more per cell, "what did <entity> report regarding <topic words>" whose gold is EVERY current leaf of
+  that entity in that topic (two or more; about three on average). They are the regime a single top-10 list serves worst, since
+  the gold leaves differ in attribute and share only the entity and the topic. They are scored apart from the point questions:
+  `all10` is 1 when every gold leaf is in the fused top 10, and item recall@10 is found gold leaves over all gold leaves (Wilson
+  over items, optimistic because items of a question are not independent). Their uniqueness rule is the same as for point
+  questions (one entity-and-topic group matches), with the drop rate reported.
 - Order and cut: cells run smallest first, sizes up to 4,000 before 20,000, and the knob contrasts last. If time or disk runs
   out, the cut is made from the end of that order and the note lists exactly which cells were not run.
 - Knob contrasts at 4,000 leaves, c = 0.5 base, one knob moved to its HIGH value at a time, seeds 1 and 2; and paraphrase at 0, 0.5
@@ -49,12 +55,17 @@ vocabulary (tunekit/synth.py states the limits): lexical overlap between a quest
 - Intervals: pooled over seeds, Wilson 95% on recall (questions treated as independent given a corpus, which is optimistic:
   the per-seed range is printed beside). Signal AUCs use a cluster bootstrap over (cell, topic) clusters, 2,000 resamples, seed
   16096 (EXPERIMENT 7 names 10,000; 2,000 is a cost deviation), percentile 95%.
+- A pilot on one seed outside the grid seeds (4,000 leaves or fewer, point questions only) showed recall@10 at or above 0.975
+  at every level while recall@1 fell from about 0.92 to 0.60 as complexity rose; the set questions were added for that reason,
+  before the grid. The expectation stated here: point recall@10 stays high across the grid and the fall shows in recall@1 and
+  MRR; set `all10` falls with size and complexity. These expectations can fail.
 - Fall points per series: (a) SEPARATED FALL: the smallest size whose pooled recall@10 Wilson upper bound lies below the Wilson lower
-  bound at the series' smallest size; (b) the first size with point recall@10 below 0.95; (c) below 0.90. The bars 0.95 and 0.90 are
-  assumptions, there to name a point, not claims about what is enough.
+  bound at the series' smallest size; (b) the first size with the metric below 0.95; (c) below 0.90. Each is applied to point
+  recall@10, to set `all10` and to set item recall@10. The bars 0.95 and 0.90 are assumptions, there to name a point, not claims
+  about what is enough.
 - Signals, as ADAPTIVE 4.1 and 6.2 define them, with the placeholder thresholds (A_MIN 0.4, G_MIN 0.1, S_MAX 6): `agree`, `margin`,
   `spread`, the rule "flat-sufficient", and the memory signals. Label: `gold not in the fused top 10` ("flat missed a gold item in
-  its top 10"). An AUC is reported only with at least 30 positives and 30 negatives in the group, else NOT ESTABLISHED. A signal
+  its top 10"); for a set question, `not every gold leaf in the top 10`. Point and set questions are analysed separately. An AUC is reported only with at least 30 positives and 30 negatives in the group, else NOT ESTABLISHED. A signal
   counts as supported (still exploratory, synthetic) when its AUC lower bound is at least 0.65 (the TUNING D3 bar) and as dropped when
   that lower bound is not above 0.55. Where the second branch of `hard(unit)` (re-query within a conversation) or any tree signal is
   needed, it is not computable here and is not redefined.
