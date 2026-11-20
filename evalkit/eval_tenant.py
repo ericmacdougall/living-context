@@ -37,18 +37,22 @@ CLS = "base"
 LATTICE = ClassLattice([CLS], [])
 
 
-def reset_tenant(admin: EsClient, tenant: str) -> None:
+def reset_tenant(admin: EsClient, tenant: str, *, registry_doc_only: bool = False) -> None:
+    """Deletes the tenant's indices and the tenant registry. `registry_doc_only` (S6-H1, on an Elasticsearch shared with other stages'
+    tenants) deletes only this tenant's registry document instead of the whole registry index, which holds the other tenants' rows."""
     st, rows = admin.request("GET", "/_cat/indices/lc-*?format=json&h=index")
     for row in rows if st == 200 and isinstance(rows, list) else []:
-        if row["index"].startswith(f"lc-{tenant}-") or row["index"] == "lc-sys-registry":
+        if row["index"].startswith(f"lc-{tenant}-") or (row["index"] == "lc-sys-registry" and not registry_doc_only):
             admin.request("DELETE", "/" + row["index"])
+    if registry_doc_only:
+        admin.request("DELETE", f"/lc-sys-registry/_doc/{tenant}?refresh=true")
 
 
 class EvalTenant:
     def __init__(self, es_url: str, ca_path: str, admin_credential_path: str, tenant: str, root: Path, *,
                  consts: Optional[Constants] = None, embed: Callable[[str], list] = embed_stub.embed, reset: bool = True,
                  query_embed: Optional[Callable[[str], list]] = None, a0_fields: Sequence[str] = A0_FIELDS_DEFAULT,
-                 attach: bool = False):
+                 attach: bool = False, registry_doc_only: bool = False):
         """`embed` embeds leaf text (the passage side); `query_embed` embeds a query (the query side; the hashed stub has one
         function for both, so it defaults to `embed`). `a0_fields` is the field set of the flat BM25 list (flat.py). `attach` re-opens a
         tenant this process (or an earlier one, same root) already built: nothing is reset or provisioned, the key files and the
@@ -63,7 +67,7 @@ class EvalTenant:
                 raise RuntimeError("nothing to attach to: no key files under the tenant root")
         else:
             if reset:
-                reset_tenant(self.admin, tenant)
+                reset_tenant(self.admin, tenant, registry_doc_only=registry_doc_only)
             keys = provision_tenant(self.admin, tenant, [CLS], key_dir=self.root / "keys", data_root=self.root / "data",
                                     journal_size=65536)["keys"]
         self.gate = EsGate(es_url, ca_path, {tenant: keys})

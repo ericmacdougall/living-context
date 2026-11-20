@@ -51,7 +51,11 @@ python -m evalkit.run_s6h1 --dataset <dataset> --es-url <es-url> --es-ca <es-ca>
 ```
 
 - `--approved-cap` is the hard cap (at most 35,574, the owner's number); the durable counter is charged before every call.
-- `--stamp-registry` is one append-only file per host: a stamped S6-H1 run in any other run directory refuses this one.
+- `--stamp-registry` is one append-only file per host: a stamped S6-H1 run in any other run directory refuses this one. Use ONE path
+  for every start on the host; a different path is not checked against it.
+- The run is stamped (STAMP.json and the registry row) only after every no-call gate passed: fresh-set counts, pool count, memory proof
+  and the budget at the exact leaf count. A refusal before that leaves the stamp unspent; an ingested tenant is attached, not re-ingested.
+- A fresh start deletes the `s6h1` tenant's own indices and its own registry row only; other tenants on the same Elasticsearch are kept.
 - `--model` and `--a0-fields` must be the frozen ones; `--commit` must be the manifest's code commit.
 
 ## Watch, stop, resume

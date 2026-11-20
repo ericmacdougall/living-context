@@ -158,7 +158,8 @@ def _default_tenant(a, embedder, attach: bool):
     pport, qport = e5.ports(embedder, limit=2)
     return EvalTenant(a.es_url, a.es_ca, a.es_pw_file, TENANT, Path(a.run_dir) / "tenant", consts=Constants(),
                       embed=pport.for_tenant(TENANT), query_embed=qport.for_tenant(TENANT),
-                      a0_fields=A0_FIELDS_TEXT if a.a0_fields == "text" else A0_FIELDS_STRONG, attach=attach)
+                      a0_fields=A0_FIELDS_TEXT if a.a0_fields == "text" else A0_FIELDS_STRONG, attach=attach,
+                      registry_doc_only=True)      # the Elasticsearch is shared with S2/S3 tenants: never delete their registry rows
 
 
 def whole_pool(qs) -> List[tuple]:
@@ -192,18 +193,15 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
     vals = man["values"]
     proven_max_leaves = int(mem_proof(a.mem_proof, root)["leaves"])
     stamp = run_dir / "STAMP.json"
-    if not stamp.exists():
-        stamp.write_text(json.dumps({"stage": STAGE, "commit": a.commit, "cap": a.approved_cap, "approval_ref": a.approval_ref,
-                                     "release_ref": a.release_ref, "freeze_sha256": fsha, "a0_fields": a.a0_fields, "model": a.model,
-                                     "beta": vals["beta"], "mem_proof_sha256": fz._sha(Path(a.mem_proof)), "started": time.time()},
-                                    sort_keys=True))
-        with open(a.stamp_registry, "a") as f:
-            f.write(json.dumps({"stage": STAGE, "run_dir": os.path.realpath(a.run_dir), "commit": a.commit, "freeze_sha256": fsha,
-                                "at": time.time()}, sort_keys=True) + "\n")
-    qs = loader(a) if loader else ds.load_questions(a.dataset)
-    fs = ds.fresh_questions(qs, stage=STAGE, run_dir=run_dir, release_ref=a.release_ref, freeze_sha256=fsha,
-                            registered=registered_fresh if registered_fresh is not None else vals["registered_fresh"],
-                            extra_dev_exposed=vals.get("dev_exposed_extra", ()))
+    # nothing is stamped until every no-call gate has passed (data counts, pool count, memory, budget): a refusal leaves the run
+    # directory and the host's stamp registry unspent, so a corrected start is still the stage's one stamped run
+    try:
+        qs = loader(a) if loader else ds.load_questions(a.dataset)
+        fs = ds.fresh_questions(qs, stage=STAGE, run_dir=run_dir, release_ref=a.release_ref, freeze_sha256=fsha,
+                                registered=registered_fresh if registered_fresh is not None else vals["registered_fresh"],
+                                extra_dev_exposed=vals.get("dev_exposed_extra", ()))
+    except ds.DatasetError as e:          # Unreleased is a DatasetError
+        return write_state(run_dir, "REFUSED", error="%s: %s" % (type(e).__name__, e))
     hashes = ds.session_hashes(qs)
     clusters = ds.content_clusters(qs, hashes)
     pool = whole_pool(qs)
@@ -239,6 +237,14 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
     if why:
         et.close()
         return write_state(run_dir, "REFUSED", leaves=n_leaves, error=why[0])
+    if not stamp.exists():
+        stamp.write_text(json.dumps({"stage": STAGE, "commit": a.commit, "cap": a.approved_cap, "approval_ref": a.approval_ref,
+                                     "release_ref": a.release_ref, "freeze_sha256": fsha, "a0_fields": a.a0_fields, "model": a.model,
+                                     "beta": vals["beta"], "mem_proof_sha256": fz._sha(Path(a.mem_proof)), "leaves": n_leaves,
+                                     "started": time.time()}, sort_keys=True))
+        with open(a.stamp_registry, "a") as f:
+            f.write(json.dumps({"stage": STAGE, "run_dir": os.path.realpath(a.run_dir), "commit": a.commit, "freeze_sha256": fsha,
+                                "at": time.time()}, sort_keys=True) + "\n")
 
     runner = runner or claude_cli.CliRunner(a.binary, a.model, run_dir / "cwd")
     budget = Budget(run_dir / "counter", a.approved_cap)

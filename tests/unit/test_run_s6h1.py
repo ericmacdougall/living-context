@@ -201,11 +201,15 @@ def factory(run):
     return make
 
 
-POOL = len(rs.whole_pool(rel.QS))
+POOL = len({ds.turns_hash(t) for q in rel.QS for _, t in q.sessions})     # counted independently of whole_pool
 
 
 @mock.patch.object(rs, "EXPECTED_LEAVES", 1)          # the synthetic pool is tiny; proofs then cover it
 class Body(unittest.TestCase):
+    def test_the_pool_count_is_the_distinct_contents(self):
+        self.assertEqual(len(rs.whole_pool(rel.QS)), POOL)
+        self.assertLess(POOL, sum(len(q.sessions) for q in rel.QS))         # the synthetic set repeats contents, so dedup matters
+
     def go(self, base, s3, run, man, runner=None, proven=None, **kw):
         if proven is not None:
             proof(base / "mem.json", leaves=proven)
@@ -241,6 +245,7 @@ class Body(unittest.TestCase):
         self.assertEqual(self.go(base, s3, run, man, proven=10), 2)
         self.assertEqual(json.loads((run / "STATE.json").read_text())["state"], "REFUSED")
         self.assertFalse((run / "calls.jsonl").exists())
+        self.assertUnspent(base, run)
 
     def test_an_estimate_over_the_cap_at_the_exact_leaf_count_is_refused_before_any_call(self):
         base, s3, man, run = setup_dirs()
@@ -249,6 +254,8 @@ class Body(unittest.TestCase):
         self.assertEqual(st["state"], "REFUSED")
         self.assertIn("exceeds the approved cap", st["error"])
         self.assertFalse((run / "calls.jsonl").exists())
+        self.assertUnspent(base, run)
+        self.assertEqual(rs.check_prereqs(args(base, s3, run), embed=RealEmbed(), manifest_path=man, mem_available=lambda: 64000.0), [])
 
     def test_a_stopped_run_resumes_to_the_same_result_without_charging_twice(self):
         base, s3, man, run = setup_dirs()
@@ -273,7 +280,50 @@ class Body(unittest.TestCase):
                     registered_pool=POOL + 1, registered_fresh=rel.REG, manifest_path=man)
         self.assertEqual(rc, 2)
         self.assertFalse((run / "calls.jsonl").exists())
+        self.assertUnspent(base, run)
+
+    def test_fresh_counts_that_differ_are_refused_without_spending_the_stamp(self):
+        base, s3, man, run = setup_dirs()
+        rc = rs.run(args(base, s3, run), embedder=RealEmbed(), runner=Runner(), loader=lambda _a: rel.QS, tenant_factory=factory(run),
+                    registered_pool=POOL, registered_fresh=dict(rel.REG, primary=rel.REG["primary"] + 1), manifest_path=man)
+        self.assertEqual(rc, 2)
+        self.assertIn("DatasetError", json.loads((run / "STATE.json").read_text())["error"])
+        self.assertUnspent(base, run)
+
+    def assertUnspent(self, base, run):
+        self.assertFalse((run / "STAMP.json").exists())
+        self.assertEqual(rs._registry_rows(base / "stamps.jsonl"), [])
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Reset(unittest.TestCase):
+    """S6-H1 shares the Elasticsearch with S2/S3 tenants: its reset deletes its own indices and its own registry row only."""
+    class Admin:
+        def __init__(self):
+            self.calls = []
+
+        def request(self, method, path, body=None):
+            self.calls.append((method, path))
+            if method == "GET":
+                return 200, [{"index": "lc-s6h1-base-leaf"}, {"index": "lc-s3h1-base-leaf"}, {"index": "lc-sys-registry"}]
+            return 200, {}
+
+    def test_registry_doc_only_keeps_other_tenants(self):
+        from evalkit.eval_tenant import reset_tenant
+        a = self.Admin()
+        reset_tenant(a, "s6h1", registry_doc_only=True)
+        deleted = [p for m, p in a.calls if m == "DELETE"]
+        self.assertIn("/lc-s6h1-base-leaf", deleted)
+        self.assertNotIn("/lc-s3h1-base-leaf", deleted)
+        self.assertNotIn("/lc-sys-registry", deleted)
+        self.assertTrue(any(p.startswith("/lc-sys-registry/_doc/s6h1") for p in deleted))
+        b = self.Admin()
+        reset_tenant(b, "s2test")                                             # the S2/S3 default is unchanged
+        self.assertIn("/lc-sys-registry", [p for m, p in b.calls if m == "DELETE"])
+
+    def test_the_runner_asks_for_the_narrow_reset(self):
+        import inspect
+        self.assertIn("registry_doc_only=True", inspect.getsource(rs._default_tenant))
