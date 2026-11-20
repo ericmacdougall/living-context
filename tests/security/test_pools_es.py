@@ -35,7 +35,7 @@ from living_context.policy import ClassLattice, Principal, Role
 
 URL, CA, PW = (os.environ.get(k) for k in ("LC_TEST_ES_URL", "LC_TEST_CA", "LC_TEST_PW"))
 HAVE = bool(URL and CA and PW)
-T = "plsa"
+T = os.environ.get("LC_POOLS_T", "plsa")
 LAT = {T: ClassLattice(["base", "restricted"], [("restricted", "base")])}
 UNAV = {"ok": False, "error": "unavailable"}
 

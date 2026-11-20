@@ -296,6 +296,43 @@ class Writer:
         self._ks.destroy(leaf_id=qid)
         return res if decision == "admit" else WriteResult("rejected")
 
+    # ---- held saves of a tainted conversation (POOLS 2.8) -------------------------------------------------------
+    def hold_tainted(self, principal: str, taint_cls: str, pool: str, lin_pools: Iterable[str], text: str, prov: dict) -> str:
+        """Keep a save that the write floor held: ciphertext under its own data key (named by the subject tokens found in the text and
+        the writer), stored at the TAINT class in the class control index with `pool = target` and `lin_pools` = the private set, so
+        every erasure and the pool delete reach it. It is never written to the target pool's indices."""
+        hid = new_leaf_id()
+        tokens = sorted(set(self._guard.tokens_in(text)) | {principal})
+        ct, nonce, key_ref = self._ks.encrypt(hid, 1, json.dumps({"text": text}).encode(), tokens)
+        doc = self._base("quarantine", taint_cls, lin_subjects=tokens, lin_leaf_ids=[hid], qid=hid, principal=principal, state="held",
+                         reason="taint", pool=pool, lin_pools=sorted(set(lin_pools) | {pool}), prov=prov,
+                         ct=base64.b64encode(ct).decode(), nonce=base64.b64encode(nonce).decode(), key_ref=key_ref)
+        self._put(class_index(self.tenant, taint_cls, "ctl"), f"th:{pool}:{hid}", doc, cls=taint_cls, create=True)
+        self._es.request("POST", f"/{class_index(self.tenant, taint_cls, 'ctl')}/_refresh")
+        return hid
+
+    def release_held(self, taint_cls: str, pool: str, pool_cls: str, hid: str, decision: str, release_prov: Optional[dict] = None) -> WriteResult:
+        """`admit` writes the held text into the target pool as an ordinary pool leaf (origin and writer kept from the hold: a release does
+        not change origin) and strips the held ciphertext; `discard` strips it. Either way the key is destroyed."""
+        cur = self._cget(taint_cls, "ctl", f"th:{pool}:{hid}", pool)
+        if cur is None or cur["_source"].get("state") != "held" or decision not in ("admit", "discard"):
+            return WriteResult(REFUSED)
+        s = cur["_source"]
+        res = WriteResult(REFUSED)
+        if decision == "admit":
+            held = json.loads(self._ks.decrypt(hid, 1, base64.b64decode(s["ct"]), base64.b64decode(s["nonce"])))
+            if s.get("prov", {}).get("mode") not in (None, "save"):
+                return WriteResult(REFUSED)   # only a held save can be released here; a held update is not releasable yet
+            res = self.remember(s["principal"], pool_cls, held["text"], pool=pool, prov=dict(s["prov"], **(release_prov or {})))
+            if not res.ok:
+                return res
+        doc = {k: v for k, v in s.items() if k not in ("ct", "nonce", "key_ref")}
+        doc["state"] = "released" if decision == "admit" else "discarded"
+        self._put(class_index(self.tenant, taint_cls, "ctl"), f"th:{pool}:{hid}", doc, cls=taint_cls, cas=(cur["_seq_no"], cur["_primary_term"]))
+        self._es.request("POST", f"/{class_index(self.tenant, taint_cls, 'ctl')}/_refresh")
+        self._ks.destroy(leaf_id=hid)
+        return res if decision == "admit" else WriteResult("discarded")
+
     # ---- idempotency ------------------------------------------------------------------------------
     def _claim_id(self, principal: str, cls: str, key: str) -> str:
         """Scope (tenant, principal, key), as DESIGN 7.1 names it: the class is NOT part of the scope. The full claim

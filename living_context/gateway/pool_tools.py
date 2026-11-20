@@ -31,7 +31,9 @@ from . import pointers
 from .class_reader import ClassReader, ReaderRefused
 from .indices import pool_index
 from .pool_authz import authorize
+from .session_state import SessionStates, StateError
 from .sessions import Sessions
+from ..policy import Op, decide
 
 UNAVAILABLE = pl.UNAVAILABLE
 TOKEN_SHAPE = re.compile(r"[a-z0-9]{4,16}\.[0-9a-f]{64}")
@@ -52,13 +54,17 @@ class PoolTools:
                  consts: Optional[Constants] = None, clock: Callable[[], float] = time.time, model: Any = None,
                  broken_no_head_filter: bool = False, broken_pool_from_head: bool = False, broken_origin_from_editor: bool = False,
                  broken_key_scope_without_conversation: bool = False, broken_no_refill: bool = False,
-                 broken_raw_title: bool = False, broken_best_match_pool: bool = False):
+                 broken_raw_title: bool = False, broken_best_match_pool: bool = False, states: Optional[SessionStates] = None,
+                 broken_taint_ignored: bool = False, broken_hold_in_target: bool = False, broken_release_by_review_only: bool = False,
+                 broken_default_selection_over_g: bool = False):
         self.tenant, self.dir, self.sessions, self.lattices, self.w, self.reader = tenant, directory, sessions, lattices, writer, reader
         self.es_for, self.keys, self.c, self._clock = es_for, keys, consts or Constants(), clock
+        self.states = states
         self._model = model   # never called: stage 0 costs no model call (a test passes a port that fails if it is touched)
         self._b = dict(head=broken_no_head_filter, pool_head=broken_pool_from_head, origin=broken_origin_from_editor,
                        key=broken_key_scope_without_conversation, refill=broken_no_refill, title=broken_raw_title,
-                       best=broken_best_match_pool)
+                       best=broken_best_match_pool, taint=broken_taint_ignored, hold_target=broken_hold_in_target,
+                       review_only=broken_release_by_review_only, sel_g=broken_default_selection_over_g)
         self._lock = threading.Lock()
         self._saves: dict[tuple, list] = {}
         self._update_keys: dict[tuple, tuple] = {}
@@ -67,8 +73,9 @@ class PoolTools:
     # ---- routing ---------------------------------------------------------------------------------------------------------
     def handle(self, op: str, p, rec, req: Mapping[str, Any], *, token: str) -> dict:
         try:
-            return {"pool_save": self.save, "pool_update": self.update, "pool_query": self.query, "pool_fetch": self.fetch}[op](token, req)
-        except (ReaderRefused, wmod.WriterError):
+            return {"pool_save": self.save, "pool_update": self.update, "pool_query": self.query, "pool_fetch": self.fetch,
+                    "pool_holds": self.holds, "pool_release": self.release}[op](token, req)
+        except (ReaderRefused, wmod.WriterError, StateError):
             return UNAVAILABLE
 
     # ---- helpers ---------------------------------------------------------------------------------------------------------
@@ -137,10 +144,23 @@ class PoolTools:
             return bad or err("invalid")
         if not self._rate_ok(rec):
             return err("rate_limited")
+        if self._tainted_write(rec, pool):
+            return self._hold(rec, pool, req["text"], "save")
         scope_key = key if self._b["key"] else f"{rec.conversation}\x00{key}"   # (tenant, principal, conversation, key)
         res = self.w.remember(rec.principal_token, pool.cls, req["text"], key=scope_key, pool=pool.id,
                               prov={**self._prov(rec, "save"), "origin": "human" if rec.actor == "human" else "agent"})
         return self._answer(res, pool.id)
+
+    def _tainted_write(self, rec, pool) -> bool:
+        return self.states is not None and not self._b["taint"] and self.states.blocks_write(rec, pool)
+
+    def _hold(self, rec, pool, text: str, mode: str) -> dict:
+        """The write floor (POOLS 2.8): the item is kept at the TAINT class (never in the target pool's indices) for a human to approve."""
+        t = self.states.get(rec)
+        cls = pool.cls if self._b["hold_target"] or t.cls is None else t.cls
+        self.w.hold_tainted(rec.principal_token, cls, pool.id, t.private, text,
+                            {**self._prov(rec, mode), "origin": "human" if rec.actor == "human" else "agent"})
+        return err("held", reason="taint")
 
     def _answer(self, res, pool_id: str) -> dict:
         if res.status == wmod.STORED:
@@ -185,6 +205,8 @@ class PoolTools:
         old_origin = old.get("origin", "agent")
         if mode == "correct" and rec.actor == "agent" and old_origin != "agent":
             return err("invalid")   # an agent corrects only what an agent wrote; it may supersede instead
+        if self._tainted_write(rec, pool):
+            return self._hold(rec, pool, req["text"], "update")
         writer_origin = "human" if rec.actor == "human" else "agent"
         origin = writer_origin if self._b["origin"] else least_trusted(writer_origin, old_origin)
         if mode == "correct":
@@ -235,10 +257,68 @@ class PoolTools:
         if leaf is None:
             return UNAVAILABLE
         ptr = req["pointer"]
+        raised = self._raise(auth.rec, [pool])
         text = envelope.wrap(pool.id, pool.label, leaf.get("origin", "agent"), "fetch", ptr, leaf.get("title", ""), leaf.get("text", ""))
         handle = hashlib.sha256(f"{leaf.get('writer', '')}\x00{pool.id}".encode()).hexdigest()[:12]   # per-pool, cannot link a writer across pools
         return {"ok": True, "status": "ok", "text": text, "origin": leaf.get("origin", "agent"), "wrote_at": leaf.get("wrote_at"),
-                "mode": leaf.get("mode"), "writer_handle": handle, "pool": pool.id}
+                "mode": leaf.get("mode"), "writer_handle": handle, "pool": pool.id,
+                **({"taint_raised": raised} if raised else {})}
+
+    def _raise(self, rec, pools) -> list:
+        """Raise the conversation's taint for what is about to be handed off, durably, BEFORE the response goes (a failed write aborts it).
+        Returns the pool ids that changed it."""
+        if self.states is None:
+            return []
+        new = self.states.raised_by(rec, pools)
+        old = self.states.get(rec)
+        if new == old:
+            return []
+        lat = self.lattices[rec.tenant]
+        self.states.raise_to(rec, new)
+        return sorted(p.id for p in pools if not (old.cls is not None and lat.dominates(old.cls, p.cls) and (not p.private or p.id in old.private)))
+
+    # ---- held saves: list and release (POOLS 2.8) ----------------------------------------------------------------------------
+    def _holds_of(self, rec, p, pool) -> list:
+        out = []
+        for cls in sorted(p.read_set):
+            for d in self.reader.search(cls, "ctl", pool.id, [{"term": {"kind": "quarantine"}}, {"term": {"reason": "taint"}}], size=200):
+                out.append((cls, d))
+        return out
+
+    def holds(self, token: str, req: Mapping[str, Any]) -> dict:
+        """The held saves of a pool: id, time, state, never the text. For a principal with `review` and `query` on the pool."""
+        pid = req.get("pool")
+        auth = authorize(self.sessions, self.dir, self.lattices, token, {pid: {pl.REVIEW, pl.QUERY}}) if isinstance(pid, str) else None
+        if auth is None:
+            return UNAVAILABLE
+        return {"ok": True, "holds": [{"hold": d.id.split(":")[2], "state": d.source.get("state"), "at": d.source.get("created_at")}
+                                      for _, d in self._holds_of(auth.rec, auth.principal, auth.pools[pid])]}
+
+    def release(self, token: str, req: Mapping[str, Any]) -> dict:
+        """Release (`admit`) or discard a held save. Needs a token of actor `human` that holds `review` and `query` on the target pool and
+        `query` on every pool of the hold's private set, and whose read set covers the taint class. Approval is a human declassification
+        and is logged by the gateway event of the tool call."""
+        pid, hid, decision = req.get("pool"), req.get("hold"), req.get("decision")
+        if not (isinstance(pid, str) and isinstance(hid, str) and decision in ("admit", "discard")):
+            return UNAVAILABLE
+        need = {pl.REVIEW} if self._b["review_only"] else {pl.REVIEW, pl.QUERY}
+        auth = authorize(self.sessions, self.dir, self.lattices, token, {pid: need})
+        if auth is None or (auth.rec.actor != "human" and not self._b["review_only"]):
+            return UNAVAILABLE
+        pool = auth.pools[pid]
+        found = [(c, d) for c, d in self._holds_of(auth.rec, auth.principal, pool) if d.id == f"th:{pid}:{hid}"]
+        if not found:
+            return UNAVAILABLE
+        cls, doc = found[0]
+        priv = [x for x in doc.source.get("lin_pools", []) if x != pid]
+        if priv and not self._b["review_only"] and authorize(self.sessions, self.dir, self.lattices, token, {x: {pl.QUERY} for x in priv}) is None:
+            return UNAVAILABLE
+        if not self._b["review_only"] and not decide(auth.principal, Op.RECALL, tenant=self.tenant, lattice=self.lattices[self.tenant], cls=cls):
+            return UNAVAILABLE
+        res = self.w.release_held(cls, pid, pool.cls, hid, decision, {"released_by": auth.rec.principal_token})
+        if decision == "discard":
+            return {"ok": True, "status": "discarded"} if res.status == "discarded" else UNAVAILABLE
+        return self._answer(res, pid) if res.status == wmod.STORED else UNAVAILABLE
 
     # ---- pool_query ------------------------------------------------------------------------------------------------------
     def query(self, token: str, req: Mapping[str, Any]) -> dict:
@@ -260,11 +340,15 @@ class PoolTools:
             S = sorted(set(hint))
             raised = sorted(h for h in S if G[h].private)
         else:
-            S, raised = sorted(pid for pid, pool in G.items() if not pool.private), []
+            S = sorted(pid for pid, pool in G.items()
+                       if self._b["sel_g"] or (self.states.neutral(rec, pool) if self.states is not None else not pool.private))
+            raised = []
         if not isinstance(text, str) or not text.strip() or len(text) > 4096:
             return err("invalid") if (G or hint) else UNAVAILABLE
         if not S:
             return UNAVAILABLE if not G else {"ok": True, "items": [], "pools": [], "taint_raised": raised}
+        if hint and self.states is not None:
+            raised = self._raise(rec, [G[h] for h in S])
         lists, info = {}, {}
         for pid in S:
             lists[pid] = self._pool_candidates(G[pid], text, info)
@@ -342,6 +426,6 @@ class PoolRouter:
         self.service, self.tools = service, tools
 
     def handle(self, op: str, p, rec, req, *, token: str = ""):
-        if op in ("pool_save", "pool_update", "pool_query", "pool_fetch"):
+        if op in ("pool_save", "pool_update", "pool_query", "pool_fetch", "pool_holds", "pool_release"):
             return self.tools.handle(op, p, rec, req, token=token)
         return self.service.handle(op, p, rec, req)
