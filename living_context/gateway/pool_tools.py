@@ -63,7 +63,7 @@ class PoolTools:
         self.states = states
         self._model = model   # never called: stage 0 costs no model call (a test passes a port that fails if it is touched)
         self._b = dict(head=broken_no_head_filter, pool_head=broken_pool_from_head, origin=broken_origin_from_editor,
-                       key=broken_key_scope_without_conversation, refill=broken_no_refill, title=broken_raw_title,
+                       key=broken_key_scope_without_conversation, refill=broken_no_refill, raw_title=broken_raw_title,
                        best=broken_best_match_pool, taint=broken_taint_ignored, hold_target=broken_hold_in_target,
                        review_only=broken_release_by_review_only, sel_g=broken_default_selection_over_g, ret_human=broken_agent_retracts_human, ret_rate=broken_no_retract_rate)
         self._lock = threading.Lock()
@@ -417,7 +417,7 @@ class PoolTools:
             leaf_id, lv = leaf_ref.split(":")
             ptr = self._seal(pid, leaf_id, int(lv))
             title = d.get("title", "")
-            if d.get("origin", "agent") == "agent" and not self._b["title"]:
+            if d.get("origin", "agent") == "agent" and not self._b["raw_title"]:
                 title = envelope.wrap(pid, G[pid].label, "agent", "recall", ptr, title)   # built from agent-written text: inside the envelope
             items.append({"pointer": ptr, "title": title, "size": d.get("size_tokens", 0), "pool": pid, "label": G[pid].label,
                           "origin": d.get("origin", "agent"), "stage": 0})

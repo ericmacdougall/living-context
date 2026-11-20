@@ -21,6 +21,9 @@ def is_allowed_value(node) -> bool:
     if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get"
             and node.args and isinstance(node.args[0], ast.Constant) and node.args[0].value == "title"):
         return True
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "wrap"
+            and isinstance(node.func.value, ast.Name) and node.func.value.id == "envelope"):
+        return True   # `envelope.wrap(...)`: an existing title escaped and labelled for display (POOLS 3.7); it writes no new title text
     if isinstance(node, ast.Attribute) and node.attr == "title":  # reading a stored title off a hit
         return True
     if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant) and node.slice.value == "title":
