@@ -1,0 +1,4 @@
+# real embedding backend (BUILD-PLAN 1.1: extra `embed`); linux x86_64, CPU wheels, Python 3.12
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+transformers
