@@ -32,6 +32,10 @@ REWRITE_KINDS = frozenset({"node"})
 KEEP_KINDS = frozenset({"manifest", "tomb", "counter", "idem_scope"})  # ids only, or no content
 
 
+class Held(Exception):
+    """A legal hold covers the closure (DESIGN 14.1): nothing was published, deleted or rewritten; the caller queues the request."""
+
+
 class State:
     """What the read and send paths consult in memory: the published tombstone sequence and the redact set."""
 
@@ -145,13 +149,14 @@ class Executor:
         return out
 
     # ---- the request ------------------------------------------------------------------------------------------
-    def erase_item(self, leaf_ids: Iterable[str], *, apply_guard: Callable[[], None] = lambda: None) -> Receipt:
+    def erase_item(self, leaf_ids: Iterable[str], *, holds=None, apply_guard: Callable[[], None] = lambda: None) -> Receipt:
         """Erase one or more items (DESIGN 14.1): every version of the named leaves and everything derived from them."""
-        return self.erase_subject("", item_leaves=leaf_ids, apply_guard=apply_guard)
+        return self.erase_subject("", item_leaves=leaf_ids, holds=holds, apply_guard=apply_guard)
 
     def erase_subject(self, subject: str, *, identifiers: Iterable[str] = (), bare_tokens: Iterable[str] = (),
-                      item_leaves: Iterable[str] = (), apply_guard: Callable[[], None] = lambda: None) -> Receipt:
-        """`identifiers` and `bare_tokens` are the erased identifier and bare-name HMAC tokens: they go into the journal
+                      item_leaves: Iterable[str] = (), holds=None, apply_guard: Callable[[], None] = lambda: None) -> Receipt:
+        """`holds` (a `HoldRegistry`) is checked against the closure under the write gate, before anything is published: a hold on a
+        leaf the closure reaches, or on a subject of a leaf it reaches, raises `Held`. `identifiers` and `bare_tokens` are the erased identifier and bare-name HMAC tokens: they go into the journal
         record so a restart or a restore rebuilds the guard that refuses re-ingest (E3; the journal holds HMACs, no content)."""
         t0 = time.monotonic()
         er, rc = self._er(), Receipt()
@@ -159,6 +164,10 @@ class Executor:
             er.request("POST", f"/lc-{self.tenant}-*/_refresh")
             hits, leaves = self.closure(subject, item_leaves)
             self._pause("closure")
+            if holds is not None:
+                toks = {t for h in hits.values() if h.kind in ("src", "leaf") for t in h.lin_subjects}
+                if holds.covered(subject, leaves, toks):
+                    raise Held()
             pub = hits
             if self._early:   # BROKEN variant: the boundary publishes a redact set from a closure that is not complete yet
                 keep, self._transitive = self._transitive, False

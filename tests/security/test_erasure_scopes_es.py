@@ -82,6 +82,31 @@ class Scopes(V.VerifierAndRestore):
             self.check_hold(honour=False)
         self.assertIn("ran under a legal hold", str(cm.exception))
 
+    def check_hold_closure(self, honour=True):
+        self.plant()
+        a, b = list(self.canaries.leaf_ids)
+        v = self.verifier()
+        ex = self.executor()
+        reg = HoldRegistry(self.dir / "holds2" / "h.json", honour_holds=honour)
+        reg.place(leaf_ids=[a])   # a hold on one leaf, not on the person
+        out = request_erasure(ex, reg, self.subject, apply_guard=self.guard_fn())
+        self.assertTrue(out.queued, "an erasure ran although its closure reaches a leaf under a legal hold")
+        self.assertEqual((self.state.seq, self.journal.last_seq), (0, 0))
+        reg2 = HoldRegistry(self.dir / "holds3" / "h.json", honour_holds=honour)
+        reg2.place(subject=self.subject)   # a hold on the person: an item of theirs is covered too
+        out = request_erasure(ex, reg2, "", leaf_ids=[b])
+        self.assertTrue(out.queued, "an item erasure ran although its leaf belongs to a person under a legal hold")
+        self.assertGreater(v.probe(self.canaries).total, 0, "held content was touched")
+        self.assertEqual(release_hold(ex, reg2, leaf_ids=["unrelated"]), [], "releasing another scope ran the erasure")
+
+    def test_a_hold_on_a_leaf_or_on_a_person_covers_what_the_closure_reaches(self):
+        self.check_hold_closure()
+
+    def test_broken_hold_ignored_for_the_closure_is_red(self):
+        with self.assertRaises(AssertionError) as cm:
+            self.check_hold_closure(honour=False)
+        self.assertIn("legal hold", str(cm.exception))
+
     # ---- an item erasure --------------------------------------------------------------------------------------------------
     def check_item(self, **kw):
         self.plant()
@@ -243,6 +268,7 @@ class Scopes(V.VerifierAndRestore):
         self.canaries.data_marker = marker
         v = self.verifier(data_roots=[root])
         before = v.positive_control(self.canaries)
+        print(f"verifier kNN best score {v.knn_best:.4f} (rescored)")
         self.assertIn("data_root", [n for n, _, _ in before.steps])
         self.executor().erase_subject(self.subject, apply_guard=self.guard_fn())
         self.assertEqual(v.residue(self.canaries, before).total, 0)

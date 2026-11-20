@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
-from .executor import Executor, Receipt
+from .executor import Executor, Held, Receipt
 
 
 @dataclass
@@ -58,11 +58,17 @@ class HoldRegistry:
         self._state["holds"] = sorted(self.holds() | _keys(subject, leaf_ids))
         self._save()
 
-    def covered(self, subject: str, leaf_ids: Iterable[str]) -> bool:
-        return self._honour and bool(self.holds() & _keys(subject, leaf_ids))
+    def covered(self, subject: str, leaf_ids: Iterable[str], tokens: Iterable[str] = ()) -> bool:
+        """`tokens`: the subject tokens of the leaves the closure reaches (a hold on a person covers an item of theirs)."""
+        return self._honour and bool(self.holds() & (_keys(subject, leaf_ids) | {f"s:{t}" for t in tokens}))
 
-    def enqueue(self, subject: str, leaf_ids: Iterable[str]) -> None:
-        self._state["queue"].append({"subject": subject, "leaf_ids": sorted(set(leaf_ids)), "requested_at": self._clock()})
+    def enqueue(self, subject: str, leaf_ids: Iterable[str], identifiers: Iterable[str] = (), bare_tokens: Iterable[str] = ()) -> None:
+        self._state["queue"].append({"subject": subject, "leaf_ids": sorted(set(leaf_ids)), "identifiers": sorted(set(identifiers)),
+                                     "bare_tokens": sorted(set(bare_tokens)), "requested_at": self._clock()})
+        self._save()
+
+    def requeue(self, q: dict) -> None:
+        self._state["queue"].append(q)
         self._save()
 
     def release(self, *, subject: str = "", leaf_ids: Iterable[str] = ()) -> list:
@@ -74,14 +80,19 @@ class HoldRegistry:
         return sorted(due, key=lambda q: q["requested_at"])
 
 
-def request_erasure(ex: Executor, reg: HoldRegistry, subject: str, *, leaf_ids: Iterable[str] = (),
-                    apply_guard: Callable[[], None] = lambda: None) -> Outcome:
+def request_erasure(ex: Executor, reg: HoldRegistry, subject: str, *, leaf_ids: Iterable[str] = (), identifiers: Iterable[str] = (),
+                    bare_tokens: Iterable[str] = (), apply_guard: Callable[[], None] = lambda: None) -> Outcome:
     """File an erasure. A held scope is queued (nothing is published); otherwise it runs at once."""
     leaf_ids = list(leaf_ids)
     if reg.covered(subject, leaf_ids):
-        reg.enqueue(subject, leaf_ids)
+        reg.enqueue(subject, leaf_ids, identifiers, bare_tokens)
         return Outcome(queued=True)
-    return Outcome(queued=False, receipt=ex.erase_subject(subject, item_leaves=leaf_ids, apply_guard=apply_guard))
+    try:
+        return Outcome(queued=False, receipt=ex.erase_subject(subject, item_leaves=leaf_ids, identifiers=identifiers,
+                                                              bare_tokens=bare_tokens, holds=reg, apply_guard=apply_guard))
+    except Held:   # a hold on something the closure reaches, found under the gate before anything was published
+        reg.enqueue(subject, leaf_ids, identifiers, bare_tokens)
+        return Outcome(queued=True)
 
 
 def release_hold(ex: Executor, reg: HoldRegistry, *, subject: str = "", leaf_ids: Iterable[str] = (),
@@ -90,7 +101,12 @@ def release_hold(ex: Executor, reg: HoldRegistry, *, subject: str = "", leaf_ids
     out = []
     for q in reg.release(subject=subject, leaf_ids=leaf_ids):
         delay = max(0.0, reg._clock() - q["requested_at"])
-        rc = ex.erase_subject(q["subject"], item_leaves=q["leaf_ids"], apply_guard=apply_guard)
+        try:
+            rc = ex.erase_subject(q["subject"], item_leaves=q["leaf_ids"], identifiers=q.get("identifiers", []),
+                                  bare_tokens=q.get("bare_tokens", []), holds=reg, apply_guard=apply_guard)
+        except Held:   # another hold still covers what the closure reaches: the request stays queued, with its original time
+            reg.requeue(q)
+            continue
         rc.hold_delay_s = delay
         out.append(Outcome(queued=False, receipt=rc, delay_s=delay))
     return out
