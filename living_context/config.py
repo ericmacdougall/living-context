@@ -71,6 +71,16 @@ class Constants:
     max_classes: int = 4            # ASSUMPTION
     embed_dims: int = 384           # SOURCE: multilingual-e5-small
     embed_window_tokens: int = 480  # ASSUMPTION
+    # Memory pools and scoped tokens (POOLS 2, 3; every value a PLACEHOLDER, set by TUNING D13, never on retrieval data)
+    token_ttl_s: int = 3600         # PLACEHOLDER: TOKEN_TTL, one hour
+    token_max_age_s: int = 12 * 3600  # PLACEHOLDER: the latest `exp` can reach
+    tok_live_max: int = 4           # PLACEHOLDER: tokens with an `exp` not yet passed, per principal, revoked ones included
+    mint_rate_per_h: int = 60       # PLACEHOLDER: MINT_RATE
+    save_max_chars: int = 64 * 1024  # PLACEHOLDER: SAVE_MAX
+    save_rate_per_h: int = 200      # PLACEHOLDER: SAVE_RATE, per conversation, shared by save and update
+    k_pool: int = 10                # PLACEHOLDER: K_POOL
+    k_total: int = 30               # PLACEHOLDER: K_TOTAL
+    pool_window: int = 50           # POOLS 3.9: each list is cut at 50 before the version filter
 
 
 @dataclass(frozen=True)

@@ -34,7 +34,7 @@ from ..embed import stub as embed_stub
 from ..gateway import validator
 from ..gateway.gate import NoGate
 from ..gateway.es import EsClient
-from ..gateway.indices import TENANT_CLS, class_index, tenant_index
+from ..gateway.indices import TENANT_CLS, class_index, pool_index, tenant_index
 from ..graph import entities
 from ..ids import new_leaf_id
 from ..keystore.store import Keystore, KeystoreError
@@ -79,8 +79,9 @@ def _now() -> str:
 class Writer:
     def __init__(self, es: Callable[[], EsClient], keystore: Keystore, tenant: str, guard: subjects.Guard, *,
                  consts: Optional[Constants] = None, embed: Callable[[str], list] = embed_stub.embed,
-                 pause: Optional[Callable[[str], None]] = None, use_cas: bool = True, gate=None, write_path=None,
+                 pause: Optional[Callable[[str], None]] = None, use_cas: bool = True, gate=None, write_path=None, reader=None,
                  broken_quarantine_key_unlinked: bool = False):
+        self._reader = reader  # gateway.class_reader.ClassReader: the only way a pool's class-level documents are read
         self._wp = write_path  # a structure.watermark.WritePath: a job opens at allocation and stays open until the link job finishes
         self._es_fn, self._ks, self.tenant, self._guard = es, keystore, tenant, guard
         self._c = consts or Constants()
@@ -114,6 +115,13 @@ class Writer:
             raise WriterError(f"index step failed ({st})")
         return st, body if isinstance(body, dict) else {}
 
+    def _cget(self, cls: str, kind: str, doc_id: str, pool: Optional[str]) -> Optional[dict]:
+        """A class-level document: through the class reader for a pool's document (it carries the pool term), directly otherwise."""
+        if pool is None:
+            return self._get(class_index(self.tenant, cls, kind), doc_id)
+        d = self._reader.get(cls, kind, doc_id, pool)
+        return None if d is None else {"_source": dict(d.source), "_seq_no": d.seq_no, "_primary_term": d.primary_term}
+
     def _get(self, index: str, doc_id: str) -> Optional[dict]:
         st, body = self._es.request("GET", f"/{index}/_doc/{doc_id}")
         if st == 404:
@@ -142,13 +150,14 @@ class Writer:
             time.sleep(0.005)
         raise WriterError("sequence counter contended")
 
-    def advance_head(self, cls: str, leaf_id: str, lv: int) -> int:
-        """Create or advance the leaf head `lh:<leaf_id>` to at least `lv` by compare-and-set; return the stored version."""
+    def advance_head(self, cls: str, leaf_id: str, lv: int, pool: Optional[str] = None) -> int:
+        """Create or advance the leaf head `lh:<leaf_id>` (`lh:<pool>:<leaf_id>` in a pool) to at least `lv` by compare-and-set;
+        return the stored version."""
         idx = class_index(self.tenant, cls, "ctl")
-        hid = f"lh:{leaf_id}"
+        hid = f"lh:{pool}:{leaf_id}" if pool else f"lh:{leaf_id}"
         for _ in range(CAS_TRIES):
-            cur = self._get(idx, hid)
-            doc = self._base("head", cls, current_lv=lv, status="live", lin_leaf_ids=[leaf_id])
+            cur = self._cget(cls, "ctl", hid, pool)
+            doc = self._base("head", cls, current_lv=lv, status="live", lin_leaf_ids=[leaf_id], **({"pool": pool} if pool else {}))
             if cur is None:
                 st, _ = self._put(idx, hid, doc, cls=cls, create=True)
                 if st in (200, 201):
@@ -163,15 +172,30 @@ class Writer:
                 return lv
         raise WriterError("head contended")
 
+    def update_head(self, cls: str, pool: str, leaf_id: str, expect_lv: int, **fields) -> bool:
+        """Set fields of a pool leaf head by compare-and-set, only while its `current_lv` is still `expect_lv`. False when the head
+        moved on or is gone (the caller reports a version conflict)."""
+        idx, hid = class_index(self.tenant, cls, "ctl"), f"lh:{pool}:{leaf_id}"
+        for _ in range(CAS_TRIES):
+            cur = self._cget(cls, "ctl", hid, pool)
+            if cur is None or int(cur["_source"]["current_lv"]) != expect_lv:
+                return False
+            doc = dict(cur["_source"], **fields)
+            st, _ = self._put(idx, hid, doc, cls=cls, cas=(cur["_seq_no"], cur["_primary_term"]))
+            if st in (200, 201):
+                return True
+        raise WriterError("head contended")
+
     # ---- the write ---------------------------------------------------------------------------------
     def remember(self, principal: str, cls: str, text: str, *, subjects_declared: Iterable[str] = (),
                  key: Optional[str] = None, source_ref: Optional[dict] = None, refresh: bool = True,
-                 _admitted: bool = False, _version: Optional[tuple] = None) -> WriteResult:
+                 _admitted: bool = False, _version: Optional[tuple] = None, pool: Optional[str] = None,
+                 prov: Optional[dict] = None) -> WriteResult:
         """A commit: takes the shared side of the tenant's write gate (an erasure's closure-to-boundary holds it
         exclusively), and the guard check runs inside it so a tombstone published meanwhile is seen."""
         with self._gate.shared():
             return self._remember(principal, cls, text, subjects_declared=subjects_declared, key=key,
-                                  source_ref=source_ref, refresh=refresh, _admitted=_admitted, _version=_version)
+                                  source_ref=source_ref, refresh=refresh, _admitted=_admitted, _version=_version, pool=pool, prov=prov)
 
     def relabel_write(self, principal: str, leaf_id: str, lv: int, new_cls: str, text: str, **kw) -> WriteResult:
         """The new-class copy of a relabelled leaf (DESIGN 14.1): the same leaf id with a new `lv`, written after the old-class
@@ -180,8 +204,9 @@ class Writer:
 
     def _remember(self, principal: str, cls: str, text: str, *, subjects_declared: Iterable[str] = (),
                   key: Optional[str] = None, source_ref: Optional[dict] = None, refresh: bool = True,
-                  _admitted: bool = False, _version: Optional[tuple] = None) -> WriteResult:
-        if cls == TENANT_CLS:
+                  _admitted: bool = False, _version: Optional[tuple] = None, pool: Optional[str] = None,
+                  prov: Optional[dict] = None) -> WriteResult:
+        if cls == TENANT_CLS or (pool is not None and self._reader is None):
             return WriteResult(REFUSED)
         if not isinstance(text, str) or not text.strip():
             return WriteResult(EMPTY)
@@ -194,10 +219,11 @@ class Writer:
         if verdict == subjects.HELD and not _admitted:
             self._quarantine(principal, cls, text, declared, source_ref)
             return WriteResult(HELD)
-        body = json.dumps({"cls": cls, "text": text, "subjects": declared, "ref": source_ref}, sort_keys=True).encode()
+        body = json.dumps({"cls": cls, "text": text, "subjects": declared, "ref": source_ref,
+                           **({"pool": pool} if pool else {})}, sort_keys=True).encode()
         claim = None
         if key is not None:
-            claim = self._claim(principal, key, body, cls)
+            claim = self._claim(principal, key, body, cls, pool) if pool else self._claim(principal, key, body, cls)
             if isinstance(claim, WriteResult):
                 return claim
             leaf_id, lv, seq = claim
@@ -206,23 +232,24 @@ class Writer:
         job = self._wp.begin(seq) if self._wp is not None else None
         try:
             self._pause("allocated")
-            tokens = sorted({self._ks.subject_token(s) for s in declared + subjects.identifiers(text)})
-            self._append_source(cls, leaf_id, lv, seq, text, tokens, source_ref)
+            tokens = sorted({self._ks.subject_token(s) for s in declared + subjects.identifiers(text)} | ({principal} if pool else set()))   # the writer is in a pool leaf's lineage (POOLS 3.8)
+            self._append_source(cls, leaf_id, lv, seq, text, tokens, source_ref, pool)
             self._pause("source")
-            self._project(cls, leaf_id, lv, seq, text, tokens)
+            self._project(cls, leaf_id, lv, seq, text, tokens, pool, prov)
             self._pause("projection")
-            self.advance_head(cls, leaf_id, lv)
+            self.advance_head(cls, leaf_id, lv, pool)
             self._pause("head")
-            self._enqueue(cls, leaf_id, lv, seq)
+            if pool is None:   # a pool at stage 0 has no tree: nothing is placed (ADAPTIVE 3.1)
+                self._enqueue(cls, leaf_id, lv, seq)
             self._pause("queued")
         except BaseException:
             if job is not None:
                 self._wp.finish(job, ok=False)   # a failed write-path job is counted and no longer holds P back
             raise
         if refresh:
-            self._es.request("POST", f"/{class_index(self.tenant, cls, 'leaf')}/_refresh")
+            self._es.request("POST", f"/{pool_index(self.tenant, cls, pool, 'leaf') if pool else class_index(self.tenant, cls, 'leaf')}/_refresh")
         if claim is not None:
-            self._finish_claim(principal, key, cls)
+            self._finish_claim(principal, key, cls, pool)
         return WriteResult(STORED, leaf_id, lv, seq)
 
     # ---- quarantine (DESIGN 7.3: a bare-name match of an erased identity is held for review, not refused) --------
@@ -289,20 +316,22 @@ class Writer:
             return None if cur["_source"].get("body_digest") == digest else WriteResult(KEY_REUSE)
         raise WriterError("claim contended")
 
-    def _claim(self, principal: str, key: str, body: bytes, cls: str):
+    def _claim(self, principal: str, key: str, body: bytes, cls: str, pool: Optional[str] = None):
         """Return (leaf_id, lv, src_seq) of the claim, or a WriteResult when the key was used with another body
         or the leaf is already complete (the first result is returned)."""
         idx = class_index(self.tenant, cls, "ctl")
         cid, digest = self._claim_id(principal, cls, key), self._ks.digest("idem", body)
+        if pool:
+            cid = f"idem:{pool}:{cid[5:]}"   # the id embeds the pool so the class reader can read it
         refused = self._scope_marker(principal, key, digest, cls)
         if refused is not None:
             return refused
         for _ in range(CAS_TRIES):
-            cur = self._get(idx, cid)
+            cur = self._cget(cls, "ctl", cid, pool)
             if cur is None:
                 leaf_id, seq = new_leaf_id(), self.next_seq()
                 doc = self._base("idem", cls, lin_leaf_ids=[leaf_id], body_digest=digest, leaf_id=leaf_id, lv=1,
-                                 src_seq=seq, state="open")
+                                 src_seq=seq, state="open", **({"pool": pool} if pool else {}))
                 st, _ = self._put(idx, cid, doc, cls=cls, create=True)
                 if st in (200, 201):
                     return leaf_id, 1, seq
@@ -315,21 +344,23 @@ class Writer:
             return src["leaf_id"], int(src["lv"]), int(src["src_seq"])  # resume an open claim
         raise WriterError("claim contended")
 
-    def _finish_claim(self, principal: str, key: str, cls: str) -> None:
+    def _finish_claim(self, principal: str, key: str, cls: str, pool: Optional[str] = None) -> None:
         idx = class_index(self.tenant, cls, "ctl")
         cid = self._claim_id(principal, cls, key)
-        cur = self._get(idx, cid)
+        if pool:
+            cid = f"idem:{pool}:{cid[5:]}"
+        cur = self._cget(cls, "ctl", cid, pool)
         if cur is None or cur["_source"].get("state") == "done":
             return
         doc = dict(cur["_source"], state="done")
         self._put(idx, cid, doc, cls=cls, cas=(cur["_seq_no"], cur["_primary_term"]))
 
     # ---- steps --------------------------------------------------------------------------------------
-    def _append_source(self, cls, leaf_id, lv, seq, text, tokens, source_ref) -> None:
+    def _append_source(self, cls, leaf_id, lv, seq, text, tokens, source_ref, pool=None) -> None:
         with _src_lock(self.tenant, leaf_id, lv):  # check, key and append are one step (retries race otherwise)
-            self._append_source_locked(cls, leaf_id, lv, seq, text, tokens, source_ref)
+            self._append_source_locked(cls, leaf_id, lv, seq, text, tokens, source_ref, pool)
 
-    def _append_source_locked(self, cls, leaf_id, lv, seq, text, tokens, source_ref) -> None:
+    def _append_source_locked(self, cls, leaf_id, lv, seq, text, tokens, source_ref, pool=None) -> None:
         idx, did = tenant_index(self.tenant, "src"), f"{leaf_id}:{lv}"
         have = self._get(idx, did)
         self._pause("src_checked")
@@ -341,7 +372,7 @@ class Writer:
         self._pause("key_made")
         doc = self._base("src", cls, lin_subjects=tokens, lin_leaf_ids=[leaf_id], leaf_id=leaf_id, lv=lv, src_seq=seq,
                          ct=base64.b64encode(ct).decode(), nonce=base64.b64encode(nonce).decode(), key_ref=key_ref,
-                         valid_from=_now(), ingested_at=_now(), source_ref=source_ref or {})
+                         valid_from=_now(), ingested_at=_now(), source_ref=source_ref or {}, **({"pool": pool} if pool else {}))
         self._put(idx, did, doc, cls=cls, create=True)
         stored = self._get(idx, did)  # whoever won the create, the stored ciphertext must open under a live key
         try:
@@ -349,13 +380,16 @@ class Writer:
         except KeystoreError as e:
             raise WriterError("stored source does not open under its key") from e
 
-    def _project(self, cls, leaf_id, lv, seq, text, tokens) -> None:
-        doc = self._base("leaf", cls, lin_subjects=tokens, lin_leaf_ids=[leaf_id], src_seq=seq, text=text,
+    def _project(self, cls, leaf_id, lv, seq, text, tokens, pool=None, prov=None) -> None:
+        extra = dict(prov or {})
+        if pool:
+            extra.update(pool=pool, lv=lv)
+        doc = self._base("leaf", cls, lin_subjects=tokens, **extra, lin_leaf_ids=[leaf_id], src_seq=seq, text=text,
                          title=title.build_title(text, n=self._c.title_terms), entities=entities.extract(text),
                          size_tokens=segment.tokens_of(text, self._c.chars_per_token_bound),
                          embedding=self._embed(text), embed_model=EMBED_MODEL, valid_from=_now(),
                          content_hash=self._ks.digest("content", text.encode()))
-        self._put(class_index(self.tenant, cls, "leaf"), f"{leaf_id}:{lv}", doc, cls=cls)
+        self._put(pool_index(self.tenant, cls, pool, "leaf") if pool else class_index(self.tenant, cls, "leaf"), f"{leaf_id}:{lv}", doc, cls=cls)
 
     def _enqueue(self, cls, leaf_id, lv, seq) -> None:
         doc = self._base("dirty", cls, lin_leaf_ids=[leaf_id], leaf_id=leaf_id, lv=lv, src_seq=seq, state="pending")

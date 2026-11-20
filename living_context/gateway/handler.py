@@ -19,6 +19,8 @@ from typing import Any, Callable, Mapping, Optional
 from ..ids import IdError, KIND_LEAF, Pointer, decode_pointer, encode_pointer
 from ..policy import ClassLattice, Op, decide
 from .admin import ADMIN_OPS
+from .pool_admin import POOL_OPS
+POOL_TOOLS = frozenset({"pool_save", "pool_update", "pool_query", "pool_fetch"})
 from .es import EsClient, EsError
 from ..recall.direct import DirectSearch
 from .indices import class_index
@@ -63,9 +65,11 @@ class EsGate:
 
 class Gateway:
     def __init__(self, es: EsGate, sessions: Sessions, lattices: Mapping[str, ClassLattice],
-                 writers: Optional[Callable[[str], Any]] = None, admin: Any = None):
+                 writers: Optional[Callable[[str], Any]] = None, admin: Any = None,
+                 pools: Optional[Callable[[str], Any]] = None):
         self._es, self._sessions, self._lattices = es, sessions, lattices
         self._writers = writers
+        self._pools = pools   # tenant -> gateway.pool_admin.PoolService (pools, grants, token revoke) and the pool tools
         self._admin = admin   # gateway.admin.Admin: grant, revoke, remove_class, break_glass_revoke
 
     # the single shaping point for every successful answer: nothing from Elasticsearch passes through unfiltered
@@ -99,6 +103,15 @@ class Gateway:
         lattice = self._lattices.get(rec.tenant)
         if lattice is None:
             return UNAVAILABLE
+        if isinstance(op, str) and (op in POOL_OPS or op in POOL_TOOLS):
+            svc = self._pools(rec.tenant) if self._pools else None
+            if svc is None:
+                return UNAVAILABLE
+            try:   # every failure of a pool request is the one typed answer, with no body and no trace
+                return svc.handle(op, p, rec, {k: v for k, v in request.items() if k != "op"}, token=token) if op in POOL_TOOLS \
+                    else svc.handle(op, p, rec, {k: v for k, v in request.items() if k != "op"})
+            except Exception:
+                return UNAVAILABLE
         try:
             if op == "ping":
                 return {"ok": True}

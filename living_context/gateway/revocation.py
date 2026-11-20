@@ -19,7 +19,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from . import epoch_journal
 from .epoch_journal import Journal, JournalFull, RealIO
@@ -67,6 +67,10 @@ class RevocationService:
         self.persist_failures = 0
         self.events: list[str] = []
         self._j: Optional[Journal] = None
+        # pool records (POOLS 2.5): the pool directory and the token table hand the journal their own record kinds. `extra_replay`
+        # is called for every record that is not an epoch record, in order; `extra_snapshot` gives the records compaction keeps.
+        self.extra_replay: Optional[Callable[[dict], None]] = None
+        self.extra_snapshot: Optional[Callable[[], list]] = None
 
     @property
     def journal_path(self) -> Path:
@@ -81,6 +85,8 @@ class RevocationService:
         for r in j.records:
             if r.get("t") in ("revoke", "bump"):
                 self._ep.restore(self.tenant, r["principal"], int(r["epoch"]), r["t"] == "revoke")
+            elif self.extra_replay is not None and str(r.get("t", "")).startswith(("pool_", "token_")):
+                self.extra_replay(r)
 
     def _fault(self, why: str) -> None:
         self.state, self.lane_open, self.fault = FAULT, False, why   # no shutdown record is ever written for it
@@ -164,6 +170,27 @@ class RevocationService:
         the principal can mint a new one that carries the reduced grants. Same order as a revoke: memory, then the journal."""
         return self._flip(principal, False)
 
+    def journalled(self, apply: Callable[[], Any], record: Callable[[Any], dict], *, persist: Optional[Callable[[Any], None]] = None):
+        """A pool-grant removal, a detach or a single-token revoke (POOLS 2.5), in the order of a revoke: (1) `apply` runs under the
+        EXCLUSIVE side of the tenant's send fence, in memory only, which is the denial; (2) after the fence is released the record
+        `record(result)` is appended and fsynced, and (3) `persist(result)` is the best-effort write to the authz copy. Returns
+        (result, Receipt-like dict with `denied_at` and `durable_at`)."""
+        if self.state != OPEN or not self.lane_open:
+            raise Refused("tenant closed")
+        result = self._ep.under_fence(self.tenant, apply)
+        rc = {"denied_at": self._clock(), "durable_at": None, "persisted": None}
+        with self._lock:
+            if self._append(record(result)):
+                rc["durable_at"] = self._clock()
+        if persist is not None:
+            try:
+                persist(result)
+                rc["persisted"] = True
+            except Exception:
+                self.persist_failures += 1
+                rc["persisted"] = False
+        return result, rc
+
     def _flip(self, principal: str, revoke: bool) -> Receipt:
         if self.state != OPEN or not self.lane_open:
             raise Refused("tenant closed")
@@ -205,6 +232,8 @@ class RevocationService:
         sj.append({"t": "start", "at": self._clock(), "compacted": True})
         for principal, epoch, revoked in self._ep.snapshot(self.tenant):
             sj.append({"t": "revoke" if revoked else "bump", "principal": principal, "epoch": epoch})
+        for extra in (self.extra_snapshot() if self.extra_snapshot else []):
+            sj.append(extra)
         self._j = sj
         self.events.append("compacted")
 
@@ -227,6 +256,8 @@ class RevocationService:
                     sj.append({"t": "start", "at": self._clock(), "compacted": True}, sync=sync)
                 for principal, epoch, revoked in self._ep.snapshot(self.tenant):
                     sj.append({"t": "revoke" if revoked else "bump", "principal": principal, "epoch": epoch}, sync=sync)
+                for extra in (self.extra_snapshot() if self.extra_snapshot else []):
+                    sj.append(extra, sync=sync)
                 if self._b["copy_shutdown"] and any(r.get("t") == "shutdown" for r in self._j.records):
                     # BROKEN variant: the previous run's shutdown state is carried into the compacted file, so a crash after it
                     # reads as a clean stop

@@ -28,7 +28,7 @@ PURGE_SETTINGS = {"index.merge.policy.expunge_deletes_allowed": "0"}
 SLOWLOG_OFF = {f"index.{k}.slowlog.threshold.{q}.{lvl}": "-1"
                for k, qs in (("search", ("query", "fetch")), ("indexing", ("index",)))
                for q in qs for lvl in ("warn", "info", "debug", "trace")}
-COMMON = {"tenant": {"type": "keyword"}, "cls": {"type": "keyword"}, "kind": {"type": "keyword"},
+COMMON = {"pool": {"type": "keyword"}, "lin_pools": {"type": "keyword"}, "tenant": {"type": "keyword"}, "cls": {"type": "keyword"}, "kind": {"type": "keyword"},
           "lin_leaves": {"type": "keyword"}, "lin_leaf_ids": {"type": "keyword"}, "lin_nodes": {"type": "keyword"},
           "lin_subjects": {"type": "keyword"}, "lin_queries": {"type": "keyword"}, "derivation": {"type": "keyword"},
           "erasure_rewrite": {"type": "long"}, "created_at": {"type": "date"}, "schema_v": {"type": "short"},
@@ -46,7 +46,10 @@ EXTRA = {
              "hit_confirmations": {"type": "long"}, "half_life_days": {"type": "float"}, "cycle": {"type": "boolean"},
              "valid_from": {"type": "date"}, "valid_to": {"type": "date"}},
     "cache": {"value": {"type": "object", "enabled": False}},
-    "leaf": {"text": {"type": "text", "analyzer": "english"}, "title": {"type": "text"}, "entities": {"type": "keyword"},
+    "leaf": {"writer": {"type": "keyword"}, "writer_actor": {"type": "keyword"}, "writer_session": {"type": "keyword"},
+             "origin": {"type": "keyword"}, "mode": {"type": "keyword"}, "wrote_at": {"type": "date"},
+             "supersedes": {"type": "keyword"}, "lv": {"type": "long"},
+             "text": {"type": "text", "analyzer": "english"}, "title": {"type": "text"}, "entities": {"type": "keyword"},
              "size_tokens": {"type": "integer"}, "content_hash": {"type": "keyword"},
              "embedding": {"type": "dense_vector", "dims": 384, "similarity": "cosine",
                            "index_options": {"type": "int8_hnsw"}}},

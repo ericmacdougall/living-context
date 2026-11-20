@@ -241,3 +241,31 @@ class Verifier:
         if self._roots and canaries.data_marker and not rep.data_control_found:
             raise VerifierError("the data-root grep lost its control marker")
         return rep
+
+
+def pool_residue(es: EsClient, tenant: str, pool: Optional[str] = None, leaf_ids: Sequence[str] = (), *, texts: Sequence[str] = ()) -> dict:
+    """The independent residue check of a deleted pool (POOLS 9.4; its own code, the verifier's own key, no shared path with the
+    executor): the indices of the tenant whose name carries the pool id, the documents of every index that name the pool in `pool` or
+    `lin_pools` or a leaf of it in `lin_leaf_ids`, and a phrase search for each canary text. Everything must be zero after the delete;
+    run it first against a pool that exists (the positive control) so a skipped index cannot read as clean."""
+    es.request("POST", f"/lc-{tenant}-*/_refresh?ignore_unavailable=true")
+    st, rows = es.request("GET", f"/_resolve/index/lc-{tenant}-*")
+    names = [r["name"] for k in ("indices",) for r in (rows.get(k, []) if st == 200 and isinstance(rows, dict) else [])]
+    out = {"indices": sum(1 for n in names if pool and f"-{pool}-" in n), "docs": 0, "by_index": {}, "text": 0}
+    should = [{"term": {"pool": pool}}, {"term": {"lin_pools": pool}}] if pool else []
+    if leaf_ids:
+        should.append({"terms": {"lin_leaf_ids": sorted(leaf_ids)}})
+    if not should:
+        raise VerifierError("nothing to check")
+    st, r = es.request("POST", f"/lc-{tenant}-*/_search?ignore_unavailable=true", {
+        "size": 0, "track_total_hits": True, "query": {"bool": {"should": should, "minimum_should_match": 1}},
+        "aggs": {"by": {"terms": {"field": "_index", "size": 200}}}})
+    if st != 200:
+        raise VerifierError("residue search failed")
+    out["docs"] = r["hits"]["total"]["value"]
+    out["by_index"] = {b["key"]: b["doc_count"] for b in r["aggregations"]["by"]["buckets"]}
+    for t in texts:
+        st, r = es.request("POST", f"/lc-{tenant}-*/_search?ignore_unavailable=true", {
+            "size": 0, "track_total_hits": True, "query": {"match_phrase": {"text": t}}})
+        out["text"] += r["hits"]["total"]["value"] if st == 200 else 0
+    return out

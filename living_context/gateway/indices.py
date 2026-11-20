@@ -17,6 +17,8 @@ import re
 ID = re.compile(r"^[a-z0-9]{4,16}$")
 CLASS_KINDS = ("leaf", "node", "edge", "member", "log", "sq", "note", "cache", "ctl")
 TENANT_KINDS = ("src", "ctl", "authz")
+POOL_KINDS = ("leaf",)   # the indices a pool owns at stage 0 (POOLS 1.2, ADAPTIVE 2.2); the others come with the stages that need them
+POOL_ID = re.compile(r"^[a-z0-9]{16}$")
 REGISTRY = "lc-sys-registry"
 TENANT_CLS = "tenantwide"  # the `cls` of tenant-wide documents; no tenant class may use it
 
@@ -35,6 +37,20 @@ def class_index(tenant: str, cls: str, kind: str) -> str:
     if kind not in CLASS_KINDS:
         raise NameError_("unknown class-scoped kind")
     return f"lc-{check_id(tenant, 'tenant')}-{check_id(cls, 'class')}-{kind}"
+
+
+def check_pool_id(value: str) -> str:
+    if not isinstance(value, str) or not POOL_ID.match(value):
+        raise NameError_("pool id must match [a-z0-9]{16}")
+    return value
+
+
+def pool_index(tenant: str, cls: str, pool: str, kind: str) -> str:
+    """`lc-<t>-<c>-<p>-<kind>`: an index only one pool's content is scored in (POOLS 1.2). Pool ids are 16 characters and class ids
+    are 4 to 16, and a pool name has one more segment than a class name, so it never equals a class-level name."""
+    if kind not in POOL_KINDS:
+        raise NameError_("unknown pool-scoped kind")
+    return f"lc-{check_id(tenant, 'tenant')}-{check_id(cls, 'class')}-{check_pool_id(pool)}-{kind}"
 
 
 def tenant_index(tenant: str, kind: str) -> str:

@@ -27,7 +27,7 @@ from ..keystore.store import Keystore
 from . import purge, scan
 
 DELETE_KINDS = frozenset({"src", "leaf", "member", "edge", "log", "sq", "note", "cache", "quarantine", "dirty", "head",
-                          "idem", "session", "grant", "judge"})
+                          "idem", "session", "grant", "judge", "pgrant", "token", "pool"})
 REWRITE_KINDS = frozenset({"node"})
 KEEP_KINDS = frozenset({"manifest", "tomb", "counter", "idem_scope"})  # ids only, or no content
 
