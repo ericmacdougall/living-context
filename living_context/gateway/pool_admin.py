@@ -261,14 +261,19 @@ class PoolService:
     def token_revoke(self, p: Principal, rec: Record, token_id: Any) -> dict:
         """The harness revokes the token it holds (the bearer); a tenant administrator revokes any token of the tenant by id."""
         if token_id is None:
-            h = rec.hash
+            h = rec.hash if rec is not None and rec.tenant == self.tenant else None
         elif self._is_admin(p) and isinstance(token_id, str):
-            h = self.sessions.find_by_id(token_id)
+            h = self.sessions.find_by_id(self.tenant, token_id)   # tenant-bound: a token of another tenant is never found
         else:
             return UNAVAILABLE
         if h is None:
             return UNAVAILABLE
-        res, rc = self.rev.journalled(lambda: self.sessions.revoke_hash(h), lambda r: {"t": "token_revoke", "hash": r[0], "exp": r[1]})
+        def apply():
+            r = self.sessions.revoke_hash(h, self.tenant)
+            if r is None:
+                raise KeyError("no such token in this tenant")   # nothing is journalled; `handle` answers unavailable
+            return r
+        res, rc = self.rev.journalled(apply, lambda r: {"t": "token_revoke", "hash": r[0], "exp": r[1]})
         return {"ok": True, "denied": True, "in_flight_may_complete": True, "durable": rc["durable_at"] is not None}
 
     def delete(self, p: Principal, pool_id: Any) -> dict:

@@ -115,15 +115,18 @@ class Update(Base):
         a = self.pool("alpha", ops={"query", "save", "update"})
         tok = self.mint("alice", {a: {"query", "save", "update"}})
         first = self.tools.save(tok, {"pool": a, "text": "plan alpha stays", "key": "k0"})
-        real = self.writer.update_head
+        real_commit, real_ht = self.writer.leaf_commit, self.writer.head_transition
         calls = []
 
-        def lose_once(cls, pool, leaf, expect, **kw):
-            calls.append(kw.get("status"))
-            if kw.get("status") == "superseded":
+        def lose(cls, pool, leaf, opid, changes):
+            if changes.get("status") == "superseded":
                 return False                                           # the head moved under the caller
-            return real(cls, pool, leaf, expect, **kw)
-        self.writer.update_head = lose_once
+            return real_commit(cls, pool, leaf, opid, changes)
+
+        def transition(cls, pool, leaf, expect, changes, drop=()):
+            calls.append(changes.get("status"))
+            return real_ht(cls, pool, leaf, expect, changes, drop)
+        self.writer.leaf_commit, self.writer.head_transition = lose, transition
         r = self.tools.update(tok, {"pointer": first["pointer"], "mode": "supersede", "text": "plan beta replaces", "key": "u1"})
         self.assertEqual(r.get("error"), "version_conflict")
         self.refresh()
@@ -319,7 +322,7 @@ class Boot(Base):
             n = 0
 
             def request(inner, method, path, body=None, **kw):
-                if method == "POST" and path.endswith("/_search"):
+                if method == "POST" and "/_search" in path:
                     Flaky.n += 1
                     if Flaky.n == 2:
                         return 429, {}

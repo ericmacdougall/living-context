@@ -88,4 +88,5 @@ class FakeAuthz:
         size = int(body.get("size", 10))
         self.searches = getattr(self, "searches", 0) + 1
         page = list(enumerate(keys))[start:start + size]
-        return 200, {"hits": {"hits": [{"_id": i, "_source": self.docs[i], "sort": [n]} for n, i in page]}}
+        return 200, {"timed_out": False, "_shards": {"total": 1, "successful": 1, "skipped": 0, "failed": 0},   # a complete answer, as ES gives
+                     "hits": {"hits": [{"_id": i, "_source": self.docs[i], "sort": [n]} for n, i in page]}}

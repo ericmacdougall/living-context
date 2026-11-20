@@ -57,6 +57,24 @@ def _src_lock(tenant: str, leaf_id: str, lv: int) -> threading.Lock:
         return _SRC_LOCKS.setdefault((tenant, leaf_id, lv), threading.Lock())
 
 
+_LEAF_LOCKS: dict = {}
+_LEAF_INFLIGHT: dict = {}
+
+
+def _leaf_lock(tenant: str, pool: str, leaf_id: str) -> threading.Lock:
+    """One lock per pool leaf, for the whole process (not per request handler): the claim, the recovery of a stale claim and a retraction
+    of one leaf are serialised here; the head compare-and-set is what makes them correct across processes."""
+    with _SRC_LOCKS_GUARD:
+        return _LEAF_LOCKS.setdefault((tenant, pool, leaf_id), threading.Lock())
+
+
+PENDING = ("pending_op", "pending_kind", "pending_lv", "pending_new")
+# Every Writer entry point that writes a pool's documents (class C4): each takes the shared side of the write gate and checks that the pool
+# still accepts writes before its first write. tests/unit/test_registration.py checks the list against the code.
+POOL_WRITES = ("remember", "head_transition", "record_retraction", "hold_tainted", "record_event", "release_held",
+               "_ensure_projection", "_create_pool_head")
+
+
 class WriterError(Exception):
     """An Elasticsearch step failed (typed; no body or index name is carried)."""
 
@@ -71,6 +89,28 @@ class WriteResult:
     @property
     def ok(self) -> bool:
         return self.status == STORED
+
+
+ORIGINS = ("agent", "import", "human")
+
+
+def origin_of(doc) -> str:
+    """The origin of a stored version (POOLS 3.8), read in ONE place: a missing or unknown value is `unknown`, which is the least
+    trusted for display and never grants an agent the right to correct or retract (class C6: missing provenance is the strict case)."""
+    o = (doc or {}).get("origin")
+    return o if o in ORIGINS else "unknown"
+
+
+def source_prov(src: dict) -> dict:
+    """The provenance a pool source document carries (`prov_json`, written with the version), for a repair or a recovery: the rebuilt
+    projection keeps the version's own writer, mode and origin. A source without it gets origin `unknown` (strict)."""
+    try:
+        prov = json.loads(src["prov_json"]) if isinstance(src.get("prov_json"), str) else None
+    except ValueError:
+        prov = None
+    if not isinstance(prov, dict):
+        return {"origin": "unknown", "mode": "repair"}
+    return dict(prov, origin=origin_of(prov))
 
 
 def _now() -> str:
@@ -160,14 +200,18 @@ class Writer:
     def _pool_ok(self, pool: Optional[str]) -> bool:
         return pool is None or getattr(self, "_pool_active", None) is None or bool(self._pool_active(pool))
 
-    def advance_head(self, cls: str, leaf_id: str, lv: int, pool: Optional[str] = None) -> int:
-        """Create or advance the leaf head `lh:<leaf_id>` (`lh:<pool>:<leaf_id>` in a pool) to at least `lv` by compare-and-set;
-        return the stored version."""
+    def advance_head(self, cls: str, leaf_id: str, lv: int, pool: Optional[str] = None, *, status: str = "live",
+                     extra: Optional[dict] = None) -> int:
+        """Create or advance the leaf head `lh:<leaf_id>` to at least `lv` by compare-and-set; return the stored version. A POOL head
+        (`lh:<pool>:<leaf_id>`) is only CREATED here (with `status`, `live` or `pending` for a supersede's new leaf): an existing pool head
+        is never rewritten, because every later change of a pool head (a new version, a supersede, a retraction) is an
+        expected-version-and-status transition (`head_transition`), never "at least this version, live"."""
         idx = class_index(self.tenant, cls, "ctl")
         hid = f"lh:{pool}:{leaf_id}" if pool else f"lh:{leaf_id}"
         for _ in range(CAS_TRIES):
             cur = self._cget(cls, "ctl", hid, pool)
-            doc = self._base("head", cls, current_lv=lv, status="live", lin_leaf_ids=[leaf_id], **({"pool": pool} if pool else {}))
+            doc = self._base("head", cls, current_lv=lv, status=status if pool else "live", lin_leaf_ids=[leaf_id],
+                             **({"pool": pool} if pool else {}), **(extra or {}))
             if cur is None:
                 st, _ = self._put(idx, hid, doc, cls=cls, create=True)
                 if st in (200, 201):
@@ -175,7 +219,7 @@ class Writer:
                 continue
             self._pause("head_read")
             have = int(cur["_source"]["current_lv"])
-            if have >= lv:
+            if have >= lv or pool:
                 return have
             st, _ = self._put(idx, hid, doc, cls=cls, cas=(cur["_seq_no"], cur["_primary_term"]))
             if st in (200, 201):
@@ -183,36 +227,164 @@ class Writer:
         raise WriterError("head contended")
 
     def update_head(self, cls: str, pool: str, leaf_id: str, expect_lv: int, **fields) -> bool:
-        """Set fields of a pool leaf head by compare-and-set, only while its `current_lv` is still `expect_lv`. False when the head
-        moved on or is gone (the caller reports a version conflict). Taken under the shared side of the write gate, and refused when the
-        pool is no longer active."""
+        """Set fields of a LIVE pool leaf head with no pending claim, only while its `current_lv` is still `expect_lv`."""
+        return self.head_transition(cls, pool, leaf_id, {"current_lv": expect_lv, "status": "live", "pending_op": None}, fields) is not None
+
+    def head_transition(self, cls: str, pool: str, leaf_id: str, expect: dict, changes: dict, drop: Iterable[str] = ()) -> Optional[dict]:
+        """THE compare-and-set of a pool leaf head (class C3): the head must hold every `expect` field (None: absent), then `changes` are
+        set and `drop` fields removed, with `if_seq_no`. Returns the new head, or None when the head is gone, differs from `expect`, or the
+        pool no longer accepts writes. Under the shared side of the write gate (POOLS 9.4)."""
         with self._gate.shared():
             if not self._pool_ok(pool):
-                return False
-            return self._update_head(cls, pool, leaf_id, expect_lv, **fields)
+                return None
+            return self._update_head(cls, pool, leaf_id, expect, changes, drop)
 
-    def _update_head(self, cls: str, pool: str, leaf_id: str, expect_lv: int, **fields) -> bool:
+    def _update_head(self, cls: str, pool: str, leaf_id: str, expect: dict, changes: dict, drop: Iterable[str] = ()) -> Optional[dict]:
         idx, hid = class_index(self.tenant, cls, "ctl"), f"lh:{pool}:{leaf_id}"
         for _ in range(CAS_TRIES):
             cur = self._cget(cls, "ctl", hid, pool)
-            if cur is None or int(cur["_source"]["current_lv"]) != expect_lv:
-                return False
-            doc = dict(cur["_source"], **fields)
+            if cur is None:
+                return None
+            src = cur["_source"]
+            for k, v in expect.items():
+                have = src.get(k)
+                if (int(have) if k == "current_lv" and have is not None else have) != v:
+                    return None
+            doc = {k: v for k, v in src.items() if k not in set(drop)}
+            doc.update(changes)
             st, _ = self._put(idx, hid, doc, cls=cls, cas=(cur["_seq_no"], cur["_primary_term"]))
             if st in (200, 201):
-                return True
+                return doc
         raise WriterError("head contended")
+
+    # ---- leaf mutations: one claim on the head, shared by correct, supersede and retract (POOLS 3.3, 3.5; class C3) ----------------
+    def _inflight(self, pool: str, leaf_id: str) -> set:
+        with _SRC_LOCKS_GUARD:
+            return _LEAF_INFLIGHT.setdefault((self.tenant, pool, leaf_id), set())
+
+    def leaf_head(self, cls: str, pool: str, leaf_id: str) -> Optional[dict]:
+        cur = self._cget(cls, "ctl", f"lh:{pool}:{leaf_id}", pool)
+        return None if cur is None else dict(cur["_source"])
+
+    def _settle(self, cls: str, pool: str, leaf_id: str) -> Optional[dict]:
+        """Under the leaf lock: a pending claim that no operation of THIS process holds is the trace of a crashed process (one gateway
+        process per tenant is enforced by the journal lock), so it is finished or undone before anything else touches the leaf."""
+        head = self.leaf_head(cls, pool, leaf_id)
+        if head is not None and head.get("pending_op") and head["pending_op"] not in self._inflight(pool, leaf_id):
+            self.recover_claim(cls, pool, leaf_id, head)
+            head = self.leaf_head(cls, pool, leaf_id)
+        return head
+
+    def leaf_claim(self, cls: str, pool: str, leaf_id: str, cur: int, kind: str, *, lv: Optional[int] = None,
+                   new: Optional[str] = None) -> Optional[str]:
+        """Claim the head of a live leaf at version `cur` for one change (`correct` to version `lv`, or `supersede` by the new leaf
+        `new`). Returns the claim id, or None when the head is not live at `cur` with no claim (a version conflict)."""
+        opid = new_leaf_id()
+        with _leaf_lock(self.tenant, pool, leaf_id):
+            self._settle(cls, pool, leaf_id)
+            got = self.head_transition(cls, pool, leaf_id, {"current_lv": cur, "status": "live", "pending_op": None},
+                                       {"pending_op": opid, "pending_kind": kind, "pending_lv": lv or cur, "pending_new": new or ""})
+            if got is None:
+                return None
+            self._inflight(pool, leaf_id).add(opid)
+        return opid
+
+    def leaf_commit(self, cls: str, pool: str, leaf_id: str, opid: str, changes: dict) -> bool:
+        """Apply the claimed change: only while the head is still live and still carries this claim."""
+        return self.head_transition(cls, pool, leaf_id, {"status": "live", "pending_op": opid}, changes, drop=PENDING) is not None
+
+    def leaf_release(self, cls: str, pool: str, leaf_id: str, opid: str, *, abandon: bool) -> None:
+        """End of the claim in this process; `abandon` also clears it on the head (the change did not happen)."""
+        try:
+            if abandon:
+                self.head_transition(cls, pool, leaf_id, {"pending_op": opid}, {}, drop=PENDING)
+        finally:
+            self._inflight(pool, leaf_id).discard(opid)
+
+    def leaf_retract(self, cls: str, pool: str, leaf_id: str, cur: int, reason: str) -> bool:
+        """Retract a live leaf at version `cur` with no pending claim (one head compare-and-set). False: the head changed or a change
+        of the leaf is in flight (the caller answers a version conflict for that pointer)."""
+        with _leaf_lock(self.tenant, pool, leaf_id):
+            self._settle(cls, pool, leaf_id)
+            return self.update_head(cls, pool, leaf_id, cur, status="retracted", retract_reason=reason)
+
+    def _source_doc(self, leaf_id: str, lv: int) -> Optional[dict]:
+        got = self._get(tenant_index(self.tenant, "src"), f"{leaf_id}:{lv}")
+        return None if got is None else got["_source"]
+
+    def _ensure_projection(self, cls: str, pool: str, leaf_id: str, lv: int, src: dict) -> bool:
+        """The projection of a durable pool source, re-built from the source (text and provenance) when it is missing. Under the write
+        gate, refused for a pool that no longer accepts writes."""
+        with self._gate.shared():
+            if not self._pool_ok(pool):
+                return False
+            if self._get(pool_index(self.tenant, cls, pool, "leaf"), f"{leaf_id}:{lv}") is not None:
+                return True
+            try:
+                text = self._ks.decrypt(leaf_id, lv, base64.b64decode(src["ct"]), base64.b64decode(src["nonce"])).decode()
+            except KeystoreError:
+                return False
+            self._project(cls, leaf_id, lv, int(src["src_seq"]), text, list(src.get("lin_subjects", [])), pool, source_prov(src))
+            return True
+
+    def _create_pool_head(self, cls: str, pool: str, leaf_id: str, lv: int, status: str, extra: Optional[dict] = None) -> bool:
+        """Create a missing pool head (a repair or a recovery); never rewrites one. Under the write gate."""
+        with self._gate.shared():
+            if not self._pool_ok(pool):
+                return False
+            self.advance_head(cls, leaf_id, lv, pool, status=status, extra=extra)
+            return True
+
+    def recover_claim(self, cls: str, pool: str, leaf_id: str, head: dict) -> None:
+        """Finish or undo a claim left by a crashed process. Rolled FORWARD when the change's source is durable (its projection is rebuilt
+        from it, with its own provenance); rolled BACK otherwise (the claim is cleared; a supersede's new head is aborted)."""
+        opid, kind = head.get("pending_op"), head.get("pending_kind")
+        if kind == "correct":
+            lv = int(head.get("pending_lv") or 0)
+            src = self._source_doc(leaf_id, lv)
+            if src is not None and self._ensure_projection(cls, pool, leaf_id, lv, src):
+                self.head_transition(cls, pool, leaf_id, {"pending_op": opid}, {"current_lv": lv}, drop=PENDING)
+                return
+            self.head_transition(cls, pool, leaf_id, {"pending_op": opid}, {}, drop=PENDING)
+            return
+        if kind == "supersede":
+            new = head.get("pending_new") or ""
+            src = self._source_doc(new, 1) if new else None
+            if src is not None and self._ensure_projection(cls, pool, new, 1, src):
+                self._create_pool_head(cls, pool, new, 1, "pending", {"supersedes": leaf_id})
+                if self.head_transition(cls, pool, leaf_id, {"pending_op": opid},
+                                        {"status": "superseded", "superseded_by": new}, drop=PENDING) is not None:
+                    self.head_transition(cls, pool, new, {"status": "pending"}, {"status": "live"})
+                return
+            self.head_transition(cls, pool, leaf_id, {"pending_op": opid}, {}, drop=PENDING)
+            if new:
+                self.head_transition(cls, pool, new, {"status": "pending"}, {"status": "aborted"})
+            return
+        self.head_transition(cls, pool, leaf_id, {"pending_op": opid}, {}, drop=PENDING)   # an unknown claim: undone
+
+    def settle_new_head(self, cls: str, pool: str, leaf_id: str, head: dict) -> None:
+        """A supersede's new head still `pending`: live once the old head points at it, aborted when the old head no longer can."""
+        old = head.get("supersedes") or ""
+        with _leaf_lock(self.tenant, pool, old):
+            oh = self._settle(cls, pool, old) if old else None
+            if oh is not None and oh.get("status") == "superseded" and oh.get("superseded_by") == leaf_id:
+                self.head_transition(cls, pool, leaf_id, {"status": "pending"}, {"status": "live"})
+            elif oh is None or not (oh.get("pending_op") and oh.get("pending_new") == leaf_id):
+                self.head_transition(cls, pool, leaf_id, {"status": "pending"}, {"status": "aborted"})
 
     # ---- the write ---------------------------------------------------------------------------------
     def remember(self, principal: str, cls: str, text: str, *, subjects_declared: Iterable[str] = (),
                  key: Optional[str] = None, source_ref: Optional[dict] = None, refresh: bool = True,
                  _admitted: bool = False, _version: Optional[tuple] = None, pool: Optional[str] = None,
-                 prov: Optional[dict] = None) -> WriteResult:
+                 prov: Optional[dict] = None, _head: Optional[str] = "live", head_extra: Optional[dict] = None) -> WriteResult:
         """A commit: takes the shared side of the tenant's write gate (an erasure's closure-to-boundary holds it
-        exclusively), and the guard check runs inside it so a tombstone published meanwhile is seen."""
+        exclusively), and the guard check runs inside it so a tombstone published meanwhile is seen. For a pool, `_head` is the status a
+        NEW leaf's head is created with (`pending` for a supersede), or None for a new version of an existing leaf (its head moves only
+        through the caller's claim, `leaf_commit`)."""
         with self._gate.shared():
             return self._remember(principal, cls, text, subjects_declared=subjects_declared, key=key,
-                                  source_ref=source_ref, refresh=refresh, _admitted=_admitted, _version=_version, pool=pool, prov=prov)
+                                  source_ref=source_ref, refresh=refresh, _admitted=_admitted, _version=_version, pool=pool, prov=prov,
+                                  _head=_head, head_extra=head_extra)
 
     def relabel_write(self, principal: str, leaf_id: str, lv: int, new_cls: str, text: str, **kw) -> WriteResult:
         """The new-class copy of a relabelled leaf (DESIGN 14.1): the same leaf id with a new `lv`, written after the old-class
@@ -222,7 +394,7 @@ class Writer:
     def _remember(self, principal: str, cls: str, text: str, *, subjects_declared: Iterable[str] = (),
                   key: Optional[str] = None, source_ref: Optional[dict] = None, refresh: bool = True,
                   _admitted: bool = False, _version: Optional[tuple] = None, pool: Optional[str] = None,
-                  prov: Optional[dict] = None) -> WriteResult:
+                  prov: Optional[dict] = None, _head: Optional[str] = "live", head_extra: Optional[dict] = None) -> WriteResult:
         if cls == TENANT_CLS or (pool is not None and self._reader is None) or not self._pool_ok(pool):
             return WriteResult(REFUSED)
         if not isinstance(text, str) or not text.strip():
@@ -250,11 +422,12 @@ class Writer:
         try:
             self._pause("allocated")
             tokens = sorted({self._ks.subject_token(s) for s in declared + subjects.identifiers(text)} | ({principal} if pool else set()))   # the writer is in a pool leaf's lineage (POOLS 3.8)
-            self._append_source(cls, leaf_id, lv, seq, text, tokens, source_ref, pool)
+            self._append_source(cls, leaf_id, lv, seq, text, tokens, source_ref, pool, prov)
             self._pause("source")
             self._project(cls, leaf_id, lv, seq, text, tokens, pool, prov)
             self._pause("projection")
-            self.advance_head(cls, leaf_id, lv, pool)
+            if pool is None or _head is not None:
+                self.advance_head(cls, leaf_id, lv, pool, status=_head or "live", extra=head_extra)
             self._pause("head")
             if pool is None:   # a pool at stage 0 has no tree: nothing is placed (ADAPTIVE 3.1)
                 self._enqueue(cls, leaf_id, lv, seq)
@@ -359,13 +532,18 @@ class Writer:
         text = json.loads(self._ks.decrypt(hid, 1, base64.b64decode(s["ct"]), base64.b64decode(s["nonce"])))["text"]
         return text, self._ks.digest("content", text.encode())
 
-    def record_event(self, cls: str, pool: str, name: str, principal: str, subjects: Iterable[str], **fields) -> None:
+    def record_event(self, cls: str, pool: str, name: str, principal: str, subjects: Iterable[str], *, event_id: Optional[str] = None,
+                     **fields) -> None:
         """A gateway event row (POOLS 2.8, 3.1): an append-only `event` document in the class control index (read only through the class
         reader), lineage by pool and subjects, no text (hashes and ids only), so the pool delete and every erasure reach it and no signal
-        counts it as a recall."""
-        doc = self._base("event", cls, lin_subjects=sorted(set(subjects) | {principal}), lin_pools=[pool], pool=pool, event=name,
-                         actor_token=principal, **fields)
-        self._put(class_index(self.tenant, cls, "ctl"), f"ev:{pool}:{name}:{new_leaf_id()}", doc, cls=cls, create=True)
+        counts it as a recall. Under the write gate and refused for a pool going away (POOLS 9.4). `event_id` gives a stable identity (a
+        retry writes the same row once)."""
+        with self._gate.shared():
+            if not self._pool_ok(pool):
+                raise WriterError("pool not active")
+            doc = self._base("event", cls, lin_subjects=sorted(set(subjects) | {principal}), lin_pools=[pool], pool=pool, event=name,
+                             actor_token=principal, **fields)
+            self._put(class_index(self.tenant, cls, "ctl"), f"ev:{pool}:{name}:{event_id or new_leaf_id()}", doc, cls=cls, create=True)
 
     def release_held(self, taint_cls: str, pool: str, pool_cls: str, hid: str, decision: str, release_prov: Optional[dict] = None,
                      expect_hash: Optional[str] = None) -> WriteResult:
@@ -373,6 +551,12 @@ class Writer:
         not change origin) and strips the held ciphertext; `discard` strips it. Either way the key is destroyed. An admit binds to the
         content hash the human was shown, claims the hold (`held` to `releasing` by compare-and-set) before writing, and writes the leaf
         under a key derived from the hold id, so two concurrent admits, a double click and a retry after a crash write one leaf."""
+        with self._gate.shared():   # every write of a release under the write gate, refused for a pool going away (POOLS 9.4)
+            if not self._pool_ok(pool):
+                return WriteResult(REFUSED)
+            return self._release_held(taint_cls, pool, pool_cls, hid, decision, release_prov, expect_hash)
+
+    def _release_held(self, taint_cls, pool, pool_cls, hid, decision, release_prov, expect_hash) -> WriteResult:
         idx = class_index(self.tenant, taint_cls, "ctl")
         cur = self._cget(taint_cls, "ctl", f"th:{pool}:{hid}", pool)
         state = None if cur is None else cur["_source"].get("state")
@@ -390,8 +574,8 @@ class Writer:
                 st, _ = self._put(idx, f"th:{pool}:{hid}", dict(s, state="releasing"), cls=taint_cls, cas=(cur["_seq_no"], cur["_primary_term"]))
                 if st not in (200, 201):
                     return WriteResult(REFUSED)   # another admit claimed it first
-            res = self.remember(s["principal"], pool_cls, held["text"], pool=pool, key=f"release:{hid}",
-                                prov=dict(s["prov"], **(release_prov or {})))
+            res = self._remember(s["principal"], pool_cls, held["text"], pool=pool, key=f"release:{hid}",
+                                 prov=dict(s["prov"], **(release_prov or {})))
             if not res.ok:
                 return res
             cur = self._cget(taint_cls, "ctl", f"th:{pool}:{hid}", pool)
@@ -466,15 +650,23 @@ class Writer:
         self._put(idx, cid, doc, cls=cls, cas=(cur["_seq_no"], cur["_primary_term"]))
 
     # ---- steps --------------------------------------------------------------------------------------
-    def _append_source(self, cls, leaf_id, lv, seq, text, tokens, source_ref, pool=None) -> None:
+    def _append_source(self, cls, leaf_id, lv, seq, text, tokens, source_ref, pool=None, prov=None) -> None:
         with _src_lock(self.tenant, leaf_id, lv):  # check, key and append are one step (retries race otherwise)
-            self._append_source_locked(cls, leaf_id, lv, seq, text, tokens, source_ref, pool)
+            self._append_source_locked(cls, leaf_id, lv, seq, text, tokens, source_ref, pool, prov)
 
-    def _append_source_locked(self, cls, leaf_id, lv, seq, text, tokens, source_ref, pool=None) -> None:
+    def _append_source_locked(self, cls, leaf_id, lv, seq, text, tokens, source_ref, pool=None, prov=None) -> None:
         idx, did = tenant_index(self.tenant, "src"), f"{leaf_id}:{lv}"
         have = self._get(idx, did)
         self._pause("src_checked")
         if have is not None:
+            if pool is not None:   # a resume must be the SAME text: a version is never shared by two texts (class C3)
+                s = have["_source"]
+                try:
+                    same = self._ks.decrypt(leaf_id, lv, base64.b64decode(s["ct"]), base64.b64decode(s["nonce"])) == text.encode()
+                except KeystoreError:
+                    same = False
+                if not same:
+                    raise WriterError("version already written with another text")
             return  # resumed after the append
         if self._ks.has_key(leaf_id, lv):  # a key made before a crash that never reached the append
             self._ks.destroy_exact_version(leaf_id, lv)   # this version only: the live earlier versions of the leaf keep their keys
@@ -482,7 +674,8 @@ class Writer:
         self._pause("key_made")
         doc = self._base("src", cls, lin_subjects=tokens, lin_leaf_ids=[leaf_id], leaf_id=leaf_id, lv=lv, src_seq=seq,
                          ct=base64.b64encode(ct).decode(), nonce=base64.b64encode(nonce).decode(), key_ref=key_ref,
-                         valid_from=_now(), ingested_at=_now(), source_ref=source_ref or {}, **({"pool": pool} if pool else {}))
+                         valid_from=_now(), ingested_at=_now(), source_ref=source_ref or {},
+                         **({"pool": pool, "prov_json": json.dumps(prov or {}, sort_keys=True)} if pool else {}))
         self._put(idx, did, doc, cls=cls, create=True)
         stored = self._get(idx, did)  # whoever won the create, the stored ciphertext must open under a live key
         try:
@@ -507,24 +700,36 @@ class Writer:
 
     # ---- orphan repair ------------------------------------------------------------------------------
     def _repair_pool_source(self, s: dict, doc_id: str, out: dict) -> None:
-        """Finish a pool write: the leaf is re-projected into the pool's own index and its head (`lh:<pool>:<leaf>`) recreated. A pool has
-        no placement before stage 1, so no queue record is written. Provenance that the source does not hold comes back as the least
-        trusted origin. A pool whose index is gone (deleted) is left alone."""
-        cls, pool, leaf_id, lv, seq = s["cls"], s["pool"], s["leaf_id"], int(s["lv"]), int(s["src_seq"])
-        idx = pool_index(self.tenant, cls, pool, "leaf")
-        if self._get(idx, doc_id) is not None:
-            return
+        """Finish a pool write: the leaf is re-projected into the pool's own index from its source, WITH the provenance the source holds
+        (`source_prov`: writer, mode, origin; none held is origin `unknown`, the strict case), a missing head is created (a supersede's new
+        leaf as `pending`), and a claim or a pending head left by a crash is finished or undone (`recover_claim`, `settle_new_head`). A
+        pool has no placement before stage 1, so no queue record is written. A pool that no longer accepts writes is left alone."""
+        cls, pool, leaf_id, lv = s["cls"], s["pool"], s["leaf_id"], int(s["lv"])
         try:
-            text = self._ks.decrypt(leaf_id, lv, base64.b64decode(s["ct"]), base64.b64decode(s["nonce"])).decode()
-        except KeystoreError:
-            out["erased_skipped"] += 1
-            return
-        try:
-            self._project(cls, leaf_id, lv, seq, text, list(s.get("lin_subjects", [])), pool, {"origin": "agent", "mode": "repair"})
-            self.advance_head(cls, leaf_id, lv, pool)
+            head = self.leaf_head(cls, pool, leaf_id)
+            if head is None and lv == 1:
+                prov = source_prov(s)
+                sup = prov.get("supersedes") if prov.get("mode") == "supersede" else None
+                if not self._ensure_projection(cls, pool, leaf_id, lv, s):
+                    out["erased_skipped"] += 1
+                    return
+                self._create_pool_head(cls, pool, leaf_id, 1, "pending" if sup else "live", {"supersedes": sup} if sup else None)
+                out["reprojected"] += 1
+            elif head is not None and lv <= int(head.get("current_lv", 0)):
+                if self._get(pool_index(self.tenant, cls, pool, "leaf"), doc_id) is None:
+                    if self._ensure_projection(cls, pool, leaf_id, lv, s):
+                        out["reprojected"] += 1
+                    else:
+                        out["erased_skipped"] += 1
+            head = self.leaf_head(cls, pool, leaf_id)
+            if head is not None and head.get("pending_op"):
+                with _leaf_lock(self.tenant, pool, leaf_id):
+                    self._settle(cls, pool, leaf_id)
+            head = self.leaf_head(cls, pool, leaf_id)
+            if head is not None and head.get("status") == "pending":
+                self.settle_new_head(cls, pool, leaf_id, head)
         except WriterError:
             return
-        out["reprojected"] += 1
 
     def repair(self, classes: Iterable[str]) -> dict:
         """Finish or undo partial writes. Source documents without a projection are re-projected from the

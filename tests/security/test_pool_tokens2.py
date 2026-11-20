@@ -140,7 +140,7 @@ class Delegation(Base):
 
     def test_broken_delegation_variants_accept_what_the_real_code_refuses(self):
         for flag, scope_of, ttl in (("broken_scope_not_attenuated", lambda a, b: {b: q("save")}, 60),
-                                    ("broken_ttl_not_capped", lambda a, b: {a: q("query")}, 10**6)):
+                                    ("broken_ttl_not_capped", lambda a, b: {a: q("query")}, 7200)):   # past the parent, inside max_age
             w = World(tempfile.mkdtemp(), sess_kw={flag: True}).start()
             a, b = w.pool("alpha", ops={"query", "save", "update"}), w.pool("beta", ops={"query", "save"})
             r = w.mint("alice", {a: q("query", "save"), b: q("query")})
@@ -157,7 +157,7 @@ class Delegation(Base):
         with self.assertRaises(TokenError) as e:
             w.mint("alice", {self.a: q("query")}, conv="over")
         self.assertEqual(e.exception.code, "rate_limited")
-        w.sessions.revoke_hash(w.sessions.resolve(toks[0]).hash)   # a loop of mint and revoke cannot grow the records
+        w.sessions.revoke_hash(w.sessions.resolve(toks[0]).hash, T)   # a loop of mint and revoke cannot grow the records
         with self.assertRaises(TokenError):
             w.mint("alice", {self.a: q("query")}, conv="over2")
         w.clock.t += w.consts.token_ttl_s + 1

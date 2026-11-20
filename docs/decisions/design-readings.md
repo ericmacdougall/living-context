@@ -262,7 +262,32 @@ Each entry names the passages, the reading the build follows and the test that k
   eraser removes the pool's own authz record and manifest last, so a crash at any step leaves a pool in `deleting` that a second delete finishes.
   Restore replay of the pool-scope tombstone is still not built.
 - DESIGN 20 names one gateway process per tenant. Reading kept: the epoch journal takes a non-blocking POSIX lock (`lockf`) beside it, so a
-  second process stays closed; a restart inside one process is not refused. Updates of one pool leaf are serialized inside the process for the
-  same reason (a stated single-process limit); a crash between the two writes of a `supersede` is an open window.
+  second process stays closed; a restart inside one process is not refused. Updates of one pool leaf are serialized by a process-wide lock per
+  leaf and by a durable claim on the leaf head (`pending_op`, set by an expected-field compare-and-swap); see the delta repair below.
 - The receipts of ungrant, detach and token revoke say `denied` for new calls and carry `in_flight_may_complete`: the hand-off check is
   epoch-only, and a response already handed off for that pool or token can still go out (the paused-sender hook for pool grants is not built).
+
+## Pools delta repair (goodqa#16441): readings
+
+- The supersede crash window of the reading above is closed (class C3). An update first claims the leaf head (`Writer.leaf_claim`: a CAS that
+  sets `pending_op`, `pending_kind`, `pending_lv`, `pending_new`); a supersede's new head is created `pending`, never live; the claim is
+  committed by one CAS on the old head. A claim left by a crash is settled on the next touch of the leaf or by `repair`: rolled forward when the
+  new source version is durable (the write's text is kept, ASSUMPTION: an unacknowledged write rolls forward), otherwise rolled back (the new
+  head becomes `aborted`). A retract or a second update that meets a claim held by a live writer answers `version_conflict`; it never waits.
+- A pool head is created once and every later change is a CAS on named fields (`Writer.head_transition`). `advance_head` never rewrites a
+  live head.
+- The `human` actor of a scoped token comes only from the identity adapter: the adapter declares the `human_presence` capability and its
+  `presence(tenant, proof)` says whether the proof carries a fresh user-presence assertion. A request field never sets it. ASSUMPTION: the
+  presence format belongs to each adapter; the test adapter uses a proof suffix.
+- A token is obtained over the socket only by a `mint` line (tenant, base64 proof, request); `{"session": "plain"}` asks for an unscoped
+  session. Lifetimes must be finite and positive; JSON constants (`NaN`, `Infinity`) and floats that overflow are refused at parse.
+- Revocation by id is tenant bound: an administrator finds and revokes only tokens of its own tenant.
+- The composition root (`gateway/app.py`) does not wire the class administrator operations (stated limit).
+- Pool delete destroys the keys of every key-holding document of the pool (`pool_scope.KEY_KINDS`: sources, quarantine) before it deletes any
+  document; a key with no document left is harmless (ASSUMPTION). A hold release writes its approval event, with the hold id as a stable event
+  id, before the leaf, so a crash between the two leaves an event without a leaf, which the retry completes, and never a leaf without an event.
+- Provenance is kept in the pool source (`prov_json`), so a repair re-projects the stored origin. A version with no recorded origin reads
+  as `unknown` (`writer.origin_of`, the one place origin is read): it ranks below `agent`, its title is wrapped like an agent's, the
+  envelope carries `origin="unknown"`, and it never lets an agent correct or retract.
+- Still open (ASSUMPTION, unchanged): the hand-off check of pool grants and token liveness is epoch-only; a response already handed off can go
+  out after an ungrant or a revoke (`in_flight_may_complete`).

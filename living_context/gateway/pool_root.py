@@ -2,8 +2,9 @@
 the pointer keys and the taint state, and to read the pool state back before admission opens (POOLS 2.5, 11).
 
 Order, as `pool_boot` requires: the pool, grant and token records are read back from the authz copy (a failed or partial read raises, so the
-tenant does not start), THEN the epoch journal is started (it replays on top, so a removal the copy still holds stays removed), THEN removals
-are confirmed against the complete read. The result is a `PoolRouter` for `Gateway(pools=...)`; the Gateway's `mint` and the scoped
+tenant does not start), THEN the epoch journal is started (it replays on top, so a removal the copy still holds stays removed) and must
+OPEN (a torn or unterminated journal, or one held by another process, refuses the start: `PoolStartRefused`), THEN removals are confirmed
+against the complete read. While the runtime serves, `PoolRouter.admit` (the journal's admission) gates every pool and token operation. The result is a `PoolRouter` for `Gateway(pools=...)`; the Gateway's `mint` and the scoped
 operations are the only way to obtain or change a scoped token."""
 from __future__ import annotations
 
@@ -20,9 +21,14 @@ from .handler import EsGate
 from .pointers import PointerKeys
 from .pool_admin import PoolService
 from .pool_tools import PoolRouter, PoolTools
-from .revocation import RevocationService
+from .revocation import OPEN, RevocationService
 from .session_state import SessionStates, es_load, es_persist
 from .sessions import Sessions
+
+
+class PoolStartRefused(RuntimeError):
+    """The tenant's pools do not start: the authz read was not complete, or the epoch journal did not open (torn, unterminated, held
+    by another process). No runtime exists, so nothing can mint a scoped token or reach a pool from the state read so far."""
 
 
 @dataclass
@@ -43,8 +49,12 @@ def start_pools(tenant: str, *, gate: EsGate, sessions: Sessions, directory: pl.
     svc = PoolService(tenant, directory, sessions, revocation, lattice, principal_token, create_index=create_index,
                       ctl_client=lambda cls: gate.client(tenant, "ingest"), authz_client=lambda: gate.client(tenant, "authz"),
                       reader=reader, grants=grants, eraser=eraser)
-    loaded = pool_boot.load(lambda: gate.client(tenant, "authz"), tenant, directory, sessions, svc)
-    revocation.start()
+    try:
+        loaded = pool_boot.load(lambda: gate.client(tenant, "authz"), tenant, directory, sessions, svc)
+    except Exception as e:   # a failed or partial read (reads.IncompleteRead included): the tenant does not start
+        raise PoolStartRefused("authz read incomplete") from e
+    if revocation.start() != OPEN:   # the journal refused before replaying its removals: the state read so far is not authoritative
+        raise PoolStartRefused("epoch journal did not open")
     svc.confirm_against_authz(loaded["persisted"], complete=loaded["complete"])
     states = SessionStates({tenant: lattice}, es_persist(lambda: gate.client(tenant, "ingest"), tenant),
                            es_load(lambda: gate.client(tenant, "ingest"), tenant))

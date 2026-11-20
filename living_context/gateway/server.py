@@ -88,14 +88,24 @@ class Server:
                 try:
                     with self.adm.parse_semaphore:  # one semaphore around parsing only (LAB-R5)
                         msg = admission.parse(raw, max_structures=1000)
-                    token, req = msg["token"], msg["request"]
+                    mint = msg.get("mint") if isinstance(msg, dict) and set(msg) == {"mint"} else None
+                    token, req = (None, None) if mint is not None else (msg["token"], msg["request"])
                 except (admission.Refused, KeyError, TypeError):
                     self._plain(conn, REFUSED_LINE)
                     continue
-                rec = self.sessions.resolve(token)
-                if rec is None:
-                    self._plain(conn, UNAVAILABLE_LINE)
-                    continue
+                if mint is not None:
+                    # the socket's mint (POOLS 2.3, 2.6): verified by the tenant's identity adapter; the connection is still
+                    # unauthenticated (bounded globally and by the idle deadline) until the minted token binds it to its tenant
+                    resp, tok = self.handler.mint_line(mint)
+                    rec = self.sessions.resolve(tok) if tok else None
+                    if rec is None:
+                        self._plain(conn, UNAVAILABLE_LINE)
+                        continue
+                else:
+                    rec = self.sessions.resolve(token)
+                    if rec is None:
+                        self._plain(conn, UNAVAILABLE_LINE)
+                        continue
                 if tenant is None:
                     try:
                         self.adm.open_connection(rec.tenant)
@@ -110,6 +120,9 @@ class Server:
                 elif rec.tenant != tenant:
                     self._plain(conn, REFUSED_LINE)
                     return
+                if mint is not None:
+                    self._fenced(conn, (json.dumps(resp, sort_keys=True) + "\n").encode(), rec)
+                    continue
                 try:
                     op = req.get("op") if isinstance(req, dict) else None
                     # the lane is granted only to a resolved session whose role admits the operation (DESIGN 4.4, 15)

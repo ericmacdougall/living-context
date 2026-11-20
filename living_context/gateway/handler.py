@@ -12,6 +12,8 @@ Rules (DESIGN 3, 7.1, 8.7; probe P2 mitigations, main's decision):
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
 from typing import Any, Callable, Mapping, Optional
@@ -88,25 +90,50 @@ class Gateway:
             return None
         return {"pointer": ptr, "title": src.get("title", ""), "size": src.get("size_tokens", 0)}
 
+    def _runtime(self, tenant: str):
+        """The tenant's pool runtime, only while its epoch journal admits (POOLS 2.5; DESIGN 4.4: a journal fault closes the tenant).
+        The ONE admission point of every pool operation, token operation and scoped mint; a closed tenant is the one `unavailable`."""
+        rt = self._pools(tenant) if self._pools else None
+        if rt is None or not rt.admit():
+            return None
+        return rt
+
     def mint(self, tenant: str, proof: bytes, request: Any) -> dict:
-        """The one way to obtain a scoped token over the socket: an authentication proof (verified by the tenant's identity adapter) and a
-        request naming the conversation, the scope (pool id to operations), an optional default save pool and a lifetime. The `human` flag
-        is never read from the request: a token is `agent` unless the harness's own adapter says a human is present, and no request field
-        can say so. Every failure is the one `unavailable` answer."""
+        """A scoped token from an authentication proof (verified by the tenant's identity adapter) and a request naming the conversation,
+        the scope (pool id to operations), an optional default save pool and a lifetime. The actor is `human` only when the tenant's
+        identity adapter says the proof carries a fresh user-presence assertion (POOLS 2.3); no request field can say so. Every failure is
+        the one `unavailable` answer."""
         from .sessions import TokenError
         try:
+            if self._runtime(tenant) is None:
+                return UNAVAILABLE
             if not isinstance(request, dict) or not isinstance(request.get("scope"), dict) or not isinstance(proof, bytes):
                 return UNAVAILABLE
             scope = {k: frozenset(v) for k, v in request["scope"].items() if isinstance(k, str) and isinstance(v, list)}
             if len(scope) != len(request["scope"]):
                 return UNAVAILABLE
-            ttl = request.get("ttl_s")
             tok = self._sessions.mint_scoped(tenant, proof, conversation=request.get("conversation"), scope=scope,
-                                             default_save_pool=request.get("default_save_pool"),
-                                             ttl_s=float(ttl) if isinstance(ttl, (int, float)) and not isinstance(ttl, bool) else None)
+                                             default_save_pool=request.get("default_save_pool"), ttl_s=request.get("ttl_s"), human=None)
             return {"ok": True, "token": tok}
         except (TokenError, ValueError, TypeError):
             return UNAVAILABLE
+
+    def mint_line(self, m: Any):
+        """The socket's `mint` line (DESIGN 3, POOLS 2.3): `{"tenant", "proof" (base64), "request"}`. A request `{"session": "plain"}`
+        mints a plain session (DESIGN 5.10); any other request is a scoped mint. Returns (answer, token or None)."""
+        if not isinstance(m, dict) or not isinstance(m.get("tenant"), str) or not isinstance(m.get("proof"), str) \
+                or not isinstance(m.get("request"), dict):
+            return UNAVAILABLE, None
+        try:
+            proof = base64.b64decode(m["proof"], validate=True)
+        except (binascii.Error, ValueError):
+            return UNAVAILABLE, None
+        req = m["request"]
+        if req == {"session": "plain"}:
+            tok = self._sessions.mint(m["tenant"], proof)
+            return ({"ok": True, "token": tok}, tok) if tok else (UNAVAILABLE, None)
+        out = self.mint(m["tenant"], proof, req)
+        return out, out.get("token")
 
     def _token_op(self, op: str, token: str, rec, request: dict) -> dict:
         from .sessions import TokenError
@@ -114,10 +141,9 @@ class Gateway:
             if op == "token_renew":
                 return {"ok": True, "exp": self._sessions.renew(token)}
             scope = request.get("scope")
-            ttl = request.get("ttl_s")
-            if not isinstance(scope, dict) or not isinstance(ttl, (int, float)) or isinstance(ttl, bool):
+            if not isinstance(scope, dict) or not all(isinstance(v, list) for v in scope.values()):
                 return UNAVAILABLE
-            return {"ok": True, "token": self._sessions.delegate(token, {k: frozenset(v) for k, v in scope.items()}, float(ttl))}
+            return {"ok": True, "token": self._sessions.delegate(token, {k: frozenset(v) for k, v in scope.items()}, request.get("ttl_s"))}
         except (TokenError, ValueError, TypeError):
             return UNAVAILABLE
 
@@ -142,9 +168,9 @@ class Gateway:
         if lattice is None:
             return UNAVAILABLE
         if op in ("token_renew", "token_delegate"):
-            return self._token_op(op, token, rec, request)
+            return self._token_op(op, token, rec, request) if self._runtime(rec.tenant) is not None else UNAVAILABLE
         if isinstance(op, str) and (op in POOL_OPS or op in POOL_TOOLS):
-            svc = self._pools(rec.tenant) if self._pools else None
+            svc = self._runtime(rec.tenant)
             if svc is None:
                 return UNAVAILABLE
             try:   # every failure of a pool request is the one typed answer, with no body and no trace
