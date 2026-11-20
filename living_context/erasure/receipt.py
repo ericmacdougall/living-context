@@ -23,7 +23,7 @@ def recount(es: EsClient, tenant: str, subject: str, leaf_ids: Iterable[str]) ->
                 if h.kind not in KEEP_KINDS | REWRITE_KINDS])
 
 
-def full_receipt(rc: Receipt, *, residue: int, verifier_steps: list, consts: Optional[Constants] = None, hold_delay_s: float = 0.0,
+def full_receipt(rc: Receipt, *, residue: int, verifier_steps: list, consts: Optional[Constants] = None, hold_delay_s: Optional[float] = None,
                  trust_closure: bool = False) -> dict:
     c = consts or Constants()
     if trust_closure:      # BROKEN variant: the receipt says what the executor did, not what is left (no recount)
@@ -36,7 +36,7 @@ def full_receipt(rc: Receipt, *, residue: int, verifier_steps: list, consts: Opt
             "keys_destroyed": rc.keys_destroyed, "boundary_s": round(rc.boundary_s, 3), "b_erase_s": B_ERASE_S,
             "within_b_erase": rc.boundary_s <= B_ERASE_S, "purge_ok": rc.purge_ok,
             "verifier": {"steps": [list(s) for s in verifier_steps], "probes": sum(s[1] for s in verifier_steps)},
-            "retention": {"r_keys_days": c.r_keys_days, "r_logs_days": c.r_logs_days}, "hold_delay_s": hold_delay_s}
+            "retention": {"r_keys_days": c.r_keys_days, "r_logs_days": c.r_logs_days}, "hold_delay_s": rc.hold_delay_s if hold_delay_s is None else hold_delay_s}
 
 
 def requester_copy(full: dict, read_set: Iterable[str], *, broken_per_class: bool = False) -> dict:

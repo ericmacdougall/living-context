@@ -270,11 +270,12 @@ class VerifierAndRestore(VersionsBase):
             docs.append((h["_index"], h["_id"], h["_source"]))
         return docs
 
-    def check_restore(self, replay=True, **kw):
+    def check_restore(self, replay=True, snapshot_journal=False, **kw):
         self.plant()
         v = self.verifier()
         before = v.positive_control(self.canaries)
         snap = self.dump()
+        journal_then = TombstoneJournal(self.dir / "jthen" / "t.log", self.dir / "rthen" / "t.log")   # the journal as the snapshot held it
         keystore_copy = self.dir / "ks-older.db"
         for suffix in ("", "-wal", "-shm", "-journal"):
             src = Path(str(self.root / "ks.db") + suffix)
@@ -291,7 +292,7 @@ class VerifierAndRestore(VersionsBase):
         self.assertGreater(v.probe(self.canaries).total, 0, "the premise: the older snapshot resurrected the content")
         self.assertTrue(any(old_ks.has_key(lid, 1) for lid in self.canaries.leaf_ids), "the premise: the older keystore holds the keys")
         ex = self.executor(ks=old_ks, **kw)
-        res = restore_replay(ex, self.journal, lambda: v.residue(self.canaries, before), replay=replay)
+        res = restore_replay(ex, journal_then if snapshot_journal else self.journal, lambda: v.residue(self.canaries, before), replay=replay)
         self.assertTrue(res.enabled, f"the tenant was not enabled: {res.reason}")
         for lid in self.canaries.leaf_ids:
             self.assertFalse(old_ks.has_key(lid, 1), "a key named by a tombstone survived the restore")
@@ -311,6 +312,17 @@ class VerifierAndRestore(VersionsBase):
         with self.assertRaises(AssertionError) as cm:
             self.check_restore(broken_skip_authz=True)
         self.assertIn("the tenant was not enabled", str(cm.exception))
+
+    def test_broken_tombstones_kept_only_inside_the_snapshot_resurrect_the_content(self):
+        # the journal is the newest copy and lives outside the snapshot; one restored with the snapshot knows no erasure
+        with self.assertRaises(AssertionError) as cm:
+            self.check_restore(snapshot_journal=True)
+        self.assertIn("the tenant was not enabled", str(cm.exception))
+
+    def test_broken_keystore_restore_that_keeps_the_keys_named_by_newer_tombstones_is_red(self):
+        with self.assertRaises(AssertionError) as cm:
+            self.check_restore(broken_replay_keeps_keys=True)
+        self.assertIn("a key named by a tombstone survived the restore", str(cm.exception))
 
 
 if __name__ == "__main__":

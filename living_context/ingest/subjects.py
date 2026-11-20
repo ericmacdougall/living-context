@@ -59,6 +59,23 @@ class Guard:
         if bare_name:
             self._erased_bare.add(self._t.bare(bare_name))
 
+    def erase_tokens(self, ids: Iterable[str] = (), bare: Iterable[str] = ()) -> None:
+        self._erased_ids |= set(ids)
+        self._erased_bare |= set(bare)
+
+    def load_journal(self, records: Iterable[dict]) -> int:
+        """Rebuild the erased-identifier and bare-name sets from the tombstone journal (a restart, a restore): the guard is
+        in memory only, so without this a re-ingest of an erased identifier would be accepted again (E3). Returns the number
+        of records that named tokens."""
+        n = 0
+        for r in records:
+            sc = r.get("scope", {})
+            ids, bare = sc.get("erased_ids", []), sc.get("erased_bare", [])
+            if ids or bare:
+                self.erase_tokens(ids, bare)
+                n += 1
+        return n
+
     def token_erased(self, token: str) -> bool:
         return token in self._erased_ids or token in self._erased_bare
 

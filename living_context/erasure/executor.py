@@ -61,6 +61,7 @@ class Receipt:
     purge_left: dict = field(default_factory=dict)
     purge_ok: bool = True
     recount: int = -1
+    hold_delay_s: float = 0.0   # a legal hold queued the request for this long (DESIGN 14.1)
 
 
 class Executor:
@@ -69,7 +70,9 @@ class Executor:
                  pause: Optional[Callable[[str], None]] = None, transitive: bool = True, destroy_only_keys: bool = False,
                  purge_deadline_s: float = purge.DEFAULT_DEADLINE_S, purge_interval_s: float = 3.0,
                  broken_delete_foreign_log_rows: bool = False, es_log: Optional[Callable[[], EsClient]] = None,
-                 broken_skip_authz: bool = False, broken_relabel_keeps_old_copy: bool = False, broken_relabel_all_classes: bool = False):
+                 broken_skip_authz: bool = False, broken_relabel_keeps_old_copy: bool = False, broken_relabel_all_classes: bool = False,
+                 broken_no_identifier_hmacs: bool = False, broken_publish_before_closure: bool = False, broken_replay_keeps_keys: bool = False,
+                 broken_no_query_net: bool = False, broken_current_generation_only: bool = False, broken_string_closure: str = ""):
         self._er, self._st, self.tenant, self._ks = es_erase, es_struct, tenant, keystore
         self._j, self._gate, self._fence, self.state = journal, gate, fence, state
         self._pause = pause or (lambda s: None)
@@ -79,17 +82,26 @@ class Executor:
         self._del_foreign = broken_delete_foreign_log_rows  # BROKEN variant: another actor's history is deleted too
         self._skip_authz = broken_skip_authz   # BROKEN variant: the closure replay does not cover the authz index
         self._relabel_keeps = broken_relabel_keeps_old_copy   # BROKEN variant: the relabel publishes the tombstone and erases nothing
+        self._no_hmacs = broken_no_identifier_hmacs
+        self._early = broken_publish_before_closure
+        self._no_query_net, self._cur_only, self._string = broken_no_query_net, broken_current_generation_only, broken_string_closure
+        self._keep_keys = broken_replay_keeps_keys   # BROKEN variant: a restore's replay leaves the keys named by newer tombstones
         self._relabel_all = broken_relabel_all_classes       # BROKEN variant: the relabel closure ignores the class
 
     # ---- closure ---------------------------------------------------------------------------------------------
-    def closure(self, subject: str) -> tuple[dict, set]:
-        """Return ({(index, id): Hit}, erased leaf ids). Subject, then leaf ids, then upward through lin_nodes."""
+    def closure(self, subject: str, item_leaves: Iterable[str] = ()) -> tuple[dict, set]:
+        """Return ({(index, id): Hit}, erased leaf ids). Subject (or the named items), then leaf ids, then upward through
+        lin_nodes. An item erasure (DESIGN 14.1) names leaf ids and no subject."""
         er = self._er()
-        hits = {(h.index, h.id): h for h in scan.find(er, self.tenant, subjects=[subject])}
-        leaves = {lid for h in hits.values() if h.kind in ("src", "leaf") for lid in h.lin_leaf_ids}
+        hits = {(h.index, h.id): h for h in scan.find(er, self.tenant, subjects=[subject] if subject else [])}
+        leaves = {lid for h in hits.values() if h.kind in ("src", "leaf") for lid in h.lin_leaf_ids} | set(item_leaves)
         if leaves:
             for h in scan.find(er, self.tenant, leaf_ids=leaves):
                 hits[(h.index, h.id)] = h
+        sids = self._own_search_ids(hits, subject) if subject and not self._no_query_net else set()
+        if sids:   # the second net (DESIGN 14.2, E9): everything an erased search shaped
+            for h in scan.find(er, self.tenant, queries=sids):
+                hits.setdefault((h.index, h.id), h)
         if self._transitive:
             frontier = {h.id for h in hits.values() if h.kind == "node"}
             while frontier:
@@ -100,20 +112,62 @@ class Executor:
                         if h.kind == "node":
                             nxt.add(h.id)
                 frontier = nxt
+        if self._cur_only:   # BROKEN variant: only the newest version of each node is erased, the retained generations keep theirs
+            top = {}
+            for h in hits.values():
+                if h.kind == "node":
+                    stem, _, v = h.id.rpartition(":")
+                    top[stem] = max(top.get(stem, 0), int(v or 0))
+            hits = {k: h for k, h in hits.items() if h.kind != "node" or int(h.id.rpartition(":")[2] or 0) == top[h.id.rpartition(":")[0]]}
+        if self._string:     # BROKEN variant: the closure is a string search over the bodies, not the lineage
+            hits = {(h.index, h.id): h for h in scan.find_text(er, self.tenant, self._string)}
         if self._skip_authz:
             hits = {k: h for k, h in hits.items() if not h.index.startswith(f"lc-{self.tenant}-authz")}
         return hits, leaves
 
+    def _scope(self, subject: str, leaves: list, redact: list, identifiers: Iterable[str], bare_tokens: Iterable[str]) -> dict:
+        scope = {"subject": subject, "leaf_ids": leaves, "redact": redact}
+        if not self._no_hmacs:   # BROKEN variant: the journal records no erased-identifier HMACs
+            scope["erased_ids"] = sorted(({subject} if subject else set()) | set(identifiers))
+            scope["erased_bare"] = sorted(set(bare_tokens))
+        return scope
+
+    @staticmethod
+    def _own_search_ids(hits: dict, subject: str) -> set:
+        """Search ids of the rows and stored queries that are the subject's own (the actor, or the query mentions the subject):
+        a row that only offered an item of the subject is another actor's history and shapes nothing that must go."""
+        out = set()
+        for h in hits.values():
+            if h.kind in ("log", "sq") and h.search_id:
+                own = (set(h.lin_subjects) - set(h.item_subjects)) | {h.actor}
+                if subject in own:
+                    out.add(h.search_id)
+        return out
+
     # ---- the request ------------------------------------------------------------------------------------------
-    def erase_subject(self, subject: str, *, identifiers: Iterable[str] = (), apply_guard: Callable[[], None] = lambda: None) -> Receipt:
+    def erase_item(self, leaf_ids: Iterable[str], *, apply_guard: Callable[[], None] = lambda: None) -> Receipt:
+        """Erase one or more items (DESIGN 14.1): every version of the named leaves and everything derived from them."""
+        return self.erase_subject("", item_leaves=leaf_ids, apply_guard=apply_guard)
+
+    def erase_subject(self, subject: str, *, identifiers: Iterable[str] = (), bare_tokens: Iterable[str] = (),
+                      item_leaves: Iterable[str] = (), apply_guard: Callable[[], None] = lambda: None) -> Receipt:
+        """`identifiers` and `bare_tokens` are the erased identifier and bare-name HMAC tokens: they go into the journal
+        record so a restart or a restore rebuilds the guard that refuses re-ingest (E3; the journal holds HMACs, no content)."""
         t0 = time.monotonic()
         er, rc = self._er(), Receipt()
         with self._gate.exclusive():
             er.request("POST", f"/lc-{self.tenant}-*/_refresh")
-            hits, leaves = self.closure(subject)
+            hits, leaves = self.closure(subject, item_leaves)
             self._pause("closure")
-            redact = sorted({h.id for h in hits.values()} | leaves)
-            seq = self._j.append({"subject": subject, "leaf_ids": sorted(leaves), "redact": redact})
+            pub = hits
+            if self._early:   # BROKEN variant: the boundary publishes a redact set from a closure that is not complete yet
+                keep, self._transitive = self._transitive, False
+                try:
+                    pub, _ = self.closure(subject, item_leaves)
+                finally:
+                    self._transitive = keep
+            redact = sorted({h.id for h in pub.values()} | leaves)
+            seq = self._j.append(self._scope(subject, sorted(leaves), redact, identifiers, bare_tokens))
             tomb = {"tenant": self.tenant, "cls": "tenantwide", "kind": "tomb", "lin_leaves": [], "lin_leaf_ids": [],
                     "lin_nodes": [], "lin_subjects": [], "lin_queries": [], "derivation": "erase", "erasure_rewrite": 0,
                     "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "schema_v": 1, "seq": seq}
@@ -137,7 +191,7 @@ class Executor:
         leaves = set(leaf_ids)
         with self._gate.exclusive():
             er.request("POST", f"/lc-{self.tenant}-*/_refresh")
-            hits, found = self.closure(subject)
+            hits, found = self.closure(subject, leaves)
             leaves |= found
             if leaves:
                 for h in scan.find(er, self.tenant, leaf_ids=leaves):
@@ -152,7 +206,7 @@ class Executor:
                 self.state.apply(seq, redact, leaves)
                 apply_guard()
             rc.seq, rc.boundary_s = seq, time.monotonic() - t0
-        return self._physical(hits, leaves, subject, seq, rc, run_purge=run_purge)
+        return self._physical(hits, leaves, subject, seq, rc, run_purge=run_purge, replaying=True)
 
     # ---- class relabel (DESIGN 14.1, review F19c) -----------------------------------------------------------------------
     def class_closure(self, leaf_ids: Iterable[str], cls: str) -> tuple[dict, dict]:
@@ -214,7 +268,7 @@ class Executor:
             hits = {k: h for k, h in hits.items() if self._relabel_all or self._within(h, lv_max)}
             redact = sorted({h.id for h in hits.values()})
             self._record_and_publish(seq, redact, set(), rc, t0, lambda: None)
-        return self._physical(hits, set(leaf_ids), "", seq, rc, run_purge=run_purge, cls=old_cls, lv_max=lv_max)
+        return self._physical(hits, set(leaf_ids), "", seq, rc, run_purge=run_purge, cls=old_cls, lv_max=lv_max, replaying=True)
 
     def _record_and_publish(self, seq: int, redact: list, leaves: set, rc: Receipt, t0: float, apply_guard) -> None:
         er = self._er()
@@ -229,17 +283,19 @@ class Executor:
         rc.seq, rc.boundary_s = seq, time.monotonic() - t0
 
     def _physical(self, hits: dict, leaves: set, subject: str, seq: int, rc: Receipt, *, run_purge: bool = True,
-                  cls: Optional[str] = None, lv_max: Optional[dict] = None) -> Receipt:
+                  cls: Optional[str] = None, lv_max: Optional[dict] = None, replaying: bool = False) -> Receipt:
         er = self._er()
         rc.closure = {}
         for h in hits.values():
             rc.closure[h.kind] = rc.closure.get(h.kind, 0) + 1
             key = (h.kind, scan.index_class(self.tenant, h.index))
             rc.by_class[key] = rc.by_class.get(key, 0) + 1
-        if cls is not None:   # a relabel destroys the keys of the old versions only
+        if replaying and self._keep_keys:
+            pass
+        elif cls is not None:   # a relabel destroys the keys of the old versions only
             rc.keys_destroyed = len(self._ks.destroy_versions((lid, (lv_max or {}).get(lid, 0)) for lid in leaves))
         else:
-            rc.keys_destroyed = len(self._ks.destroy(subject_token=subject))
+            rc.keys_destroyed = len(self._ks.destroy(subject_token=subject)) if subject else 0
             rc.keys_destroyed += len(self._ks.destroy(leaf_ids=leaves))
         if self._keys_only:  # BROKEN variant: the keys are gone, the plaintext projections stay
             rc.recount = len(scan.find(er, self.tenant, subjects=[subject] if subject else [], leaf_ids=leaves if cls else ()))
@@ -304,7 +360,7 @@ class Executor:
         s = doc["_source"]
         item_subjects = set(s.get("item_subjects", []))
         own = (set(s.get("lin_subjects", [])) - item_subjects) | {s.get("actor", "")}
-        if subject in own:
+        if subject and subject in own:
             rc.deleted += scan.delete(self._er(), [h])
             return True
         s.update(pointer={}, lin_leaf_ids=[], item_subjects=[], lin_subjects=sorted(own - {""}), erasure_rewrite=seq)

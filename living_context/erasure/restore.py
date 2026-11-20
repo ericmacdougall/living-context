@@ -22,10 +22,12 @@ class RestoreResult:
     reason: str = ""
 
 
-def restore_replay(executor: Executor, journal, verify: Callable[[], Report], *, replay: bool = True) -> RestoreResult:
+def restore_replay(executor: Executor, journal, verify: Callable[[], Report], *, replay: bool = True, guard=None) -> RestoreResult:
     """`verify` runs the verifier's residue checks against the restored indices; `replay=False` is the BROKEN variant of a restore
     that serves without re-applying the journal."""
     t0, out = time.monotonic(), RestoreResult()
+    if guard is not None:   # the guard that refuses re-ingest is rebuilt from the journal before anything else runs
+        guard.load_journal(journal.records())
     if replay:
         for rec in journal.records():
             scope = rec["scope"]

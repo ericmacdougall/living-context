@@ -24,16 +24,17 @@ from .check import Canaries, Report, Verifier, VerifierError
 def _canaries(d: dict) -> Canaries:
     return Canaries(short=d.get("short", ""), long=d.get("long", ""), vector=d.get("vector", ()),
                     subject_token=d.get("subject_token", ""), leaf_ids=d.get("leaf_ids", ()), principal=d.get("principal", ""),
-                    log_marker=d.get("log_marker", ""))
+                    log_marker=d.get("log_marker", ""), data_marker=d.get("data_marker", ""))
 
 
 def _dump(rep: Report) -> dict:
     return {"steps": [list(s) for s in rep.steps], "probes": rep.probes, "found": dict(rep.found), "total": rep.total,
-            "log_control_found": rep.log_control_found}
+            "log_control_found": rep.log_control_found, "data_control_found": rep.data_control_found}
 
 
 def _load(d: dict) -> Report:
-    return Report(steps=[tuple(s) for s in d["steps"]], found=dict(d["found"]), log_control_found=bool(d.get("log_control_found")))
+    return Report(steps=[tuple(s) for s in d["steps"]], found=dict(d["found"]), log_control_found=bool(d.get("log_control_found")),
+                  data_control_found=bool(d.get("data_control_found")))
 
 
 def main(argv=None) -> int:
@@ -45,12 +46,14 @@ def main(argv=None) -> int:
     ap.add_argument("--tenant", required=True)
     ap.add_argument("--canaries", required=True, help="JSON file of the planted canaries")
     ap.add_argument("--log", action="append", default=[], help="a plaintext log file to grep (repeatable)")
+    ap.add_argument("--data-root", action="append", default=[],
+                    help="a directory the gateway, workers or model port write under (outside Elasticsearch's data directory): raw grep (repeatable)")
     ap.add_argument("--control", help="residue: the control report written by the control phase")
     ap.add_argument("--out", help="control: where to write the report")
     a = ap.parse_args(argv)
     try:
         es = EsClient(a.url, a.ca, a.key_file, scheme="apikey")
-        v = Verifier(es, a.tenant, log_paths=[Path(p) for p in a.log])
+        v = Verifier(es, a.tenant, log_paths=[Path(p) for p in a.log], data_roots=[Path(p) for p in a.data_root])
         canaries = _canaries(json.loads(Path(a.canaries).read_text()))
         if a.phase == "control":
             rep = v.positive_control(canaries)

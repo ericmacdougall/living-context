@@ -79,12 +79,14 @@ def _now() -> str:
 class Writer:
     def __init__(self, es: Callable[[], EsClient], keystore: Keystore, tenant: str, guard: subjects.Guard, *,
                  consts: Optional[Constants] = None, embed: Callable[[str], list] = embed_stub.embed,
-                 pause: Optional[Callable[[str], None]] = None, use_cas: bool = True, gate=None, write_path=None):
+                 pause: Optional[Callable[[str], None]] = None, use_cas: bool = True, gate=None, write_path=None,
+                 broken_quarantine_key_unlinked: bool = False):
         self._wp = write_path  # a structure.watermark.WritePath: a job opens at allocation and stays open until the link job finishes
         self._es_fn, self._ks, self.tenant, self._guard = es, keystore, tenant, guard
         self._c = consts or Constants()
         self._embed, self._pause, self._use_cas = embed, pause or (lambda step: None), use_cas
         self._gate = gate or NoGate()
+        self._unlinked = broken_quarantine_key_unlinked   # BROKEN variant: the held blob is sealed under a key no subject token names
 
     # ---- plumbing -------------------------------------------------------------------------------
     @property
@@ -230,7 +232,7 @@ class Writer:
         qid = new_leaf_id()
         tokens = sorted(set(self._guard.tokens_in("\n".join(declared + [text]))))
         blob = json.dumps({"text": text, "subjects": declared, "ref": source_ref}, sort_keys=True).encode()
-        ct, nonce, key_ref = self._ks.encrypt(qid, 1, blob, tokens)
+        ct, nonce, key_ref = self._ks.encrypt(qid, 1, blob, [] if self._unlinked else tokens)
         doc = self._base("quarantine", cls, lin_subjects=tokens or [self._ks.digest("quarantine", qid.encode())[:16]],
                          lin_leaf_ids=[qid], qid=qid, principal=principal, state="held", ct=base64.b64encode(ct).decode(),
                          nonce=base64.b64encode(nonce).decode(), key_ref=key_ref)

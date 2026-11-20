@@ -39,6 +39,7 @@ class Canaries:
     leaf_ids: Sequence[str] = ()
     principal: str = ""
     log_marker: str = ""          # the control marker: never an erased canary, must always be found in the logs
+    data_marker: str = ""         # the control marker in a file under the data root: must always be found there
 
 
 @dataclass
@@ -46,6 +47,7 @@ class Report:
     steps: list = field(default_factory=list)       # (step name, probes run, found)
     found: dict = field(default_factory=dict)       # method -> count
     log_control_found: bool = False
+    data_control_found: bool = False
 
     @property
     def probes(self) -> int:
@@ -60,10 +62,31 @@ def _phrase(s: str) -> str:
     return '"' + ESC.sub(r"\\\1", s) + '"'
 
 
+def grep_data_roots(roots: Iterable[Path], needles: Iterable[str]) -> dict:
+    """Number of files under the roots whose raw bytes hold each needle. Every file is read (a symbolic link is not followed), so a
+    root that cannot be read is an error and never a clean result."""
+    needles = [n for n in needles if n]
+    found = {n: 0 for n in needles}
+    raw = {n: n.encode() for n in needles}
+    for root in roots:
+        root = Path(root)
+        if not root.is_dir():
+            raise VerifierError("data root is not a directory")
+        for f in sorted(root.rglob("*")):
+            if f.is_symlink() or not f.is_file():
+                continue
+            data = f.read_bytes()
+            for n in needles:
+                found[n] += raw[n] in data
+    return found
+
+
 class Verifier:
-    def __init__(self, es: EsClient, tenant: str, *, log_paths: Iterable[Path] = (), segment_dir: Optional[Path] = None):
+    def __init__(self, es: EsClient, tenant: str, *, log_paths: Iterable[Path] = (), segment_dir: Optional[Path] = None,
+                 data_roots: Iterable[Path] = ()):
         self._es, self.tenant = es, tenant
         self._logs, self._seg = [Path(p) for p in log_paths], segment_dir
+        self._roots = [Path(p) for p in data_roots]
 
     def _search(self, index: str, body: dict) -> list:
         st, r = self._es.request("POST", f"/{index}/_search?ignore_unavailable=true&allow_no_indices=true", body)
@@ -84,10 +107,13 @@ class Verifier:
 
     def _knn(self, vector: Sequence[float]) -> int:
         n = 0
+        self.knn_best = 0.0   # the best score seen, for the error message of a blind control
         for f in VECTOR_FIELDS:
             hits = self._search(self._all, {"size": 20, "_source": False, "knn": {"field": f, "query_vector": list(vector),
-                                                                                  "k": 20, "num_candidates": 200}})
+                                                                                  "k": 20, "num_candidates": 200,
+                                                                                  "rescore_vector": {"oversample": 3.0}}})
             n += sum(1 for h in hits if self._near(h["_score"]))
+            self.knn_best = max([self.knn_best] + [h["_score"] for h in hits])
         return n
 
     @staticmethod
@@ -122,6 +148,11 @@ class Verifier:
                 found[n] += text.count(n)
         return found
 
+    def _data_root(self, needles: Iterable[str]) -> dict:
+        """E1: a raw-bytes grep of every file the gateway, its workers and the model port write under the run's data root
+        (outside Elasticsearch's own data directory). A model-output store outside the indices is found here, not by lineage."""
+        return grep_data_roots(self._roots, needles)
+
     def segment_grep(self, needle: str) -> int:
         """NOT a verifier: counts files under the segment directory that hold the bytes of `needle`. Compressed stored fields hide
         a long value from it (LAB-R6); the tests show it missing the long canary."""
@@ -153,16 +184,23 @@ class Verifier:
             g = self._logs_grep(erased + ([canaries.log_marker] if canaries.log_marker else []))
             rep.log_control_found = bool(canaries.log_marker) and g.get(canaries.log_marker, 0) > 0
             step("logs", len(erased), sum(g[n] for n in erased))
+        if self._roots:
+            g = self._data_root([n for n in (canaries.short, canaries.data_marker) if n])
+            rep.data_control_found = bool(canaries.data_marker) and g.get(canaries.data_marker, 0) > 0
+            step("data_root", 1 if canaries.short else 0, g.get(canaries.short, 0))
         return rep
 
     def positive_control(self, canaries: Canaries) -> Report:
         """Before the erasure: every method must find its canary. Raises if one is blind (the verifier is then worthless)."""
         rep = self.probe(canaries)
         for name, probes, found in rep.steps:
-            if probes and name != "logs" and found == 0:
-                raise VerifierError(f"positive control failed: {name} found nothing")
+            if probes and name not in ("logs", "data_root") and found == 0:   # those two are proved by their control markers
+                raise VerifierError(f"positive control failed: {name} found nothing" +
+                                    (f" (best score {getattr(self, 'knn_best', 0):.4f})" if name == "knn" else ""))
         if self._logs and canaries.log_marker and not rep.log_control_found:
             raise VerifierError("positive control failed: the log grep did not find its control marker")
+        if self._roots and canaries.data_marker and not rep.data_control_found:
+            raise VerifierError("positive control failed: the data-root grep did not find its control marker")
         return rep
 
     def residue(self, canaries: Canaries, before: Report) -> Report:
@@ -174,4 +212,6 @@ class Verifier:
             raise VerifierError("no checks were run")
         if self._logs and not rep.log_control_found:
             raise VerifierError("the log grep lost its control marker")
+        if self._roots and canaries.data_marker and not rep.data_control_found:
+            raise VerifierError("the data-root grep lost its control marker")
         return rep
