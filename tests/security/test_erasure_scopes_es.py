@@ -8,13 +8,18 @@ Each check has a broken variant that must turn it red for its stated reason:
   * E3   the key of a held (quarantined) blob is named by the subject's tokens (broken: sealed under an unlinked key);
   * E1   every retained generation (broken: only the newest node version is erased);
   * E2   a node that paraphrases the subject is found by lineage (broken: the closure is a string search);
-  * E9   what an erased search shaped is removed through the second net (broken: closure over the subject's own lineage only)."""
+  * E9   what an erased search shaped is removed through the second net (broken: closure over the subject's own lineage only);
+  * E0/E1 the verifier's percolate, query-only and query-shaped probes (broken: a closure without the second net leaves a shaped edge;
+    a stored query that only its percolator words reach is found by the percolate probe alone), and a closure without the authz
+    index is red at erase time, not only at restore."""
 import collections
+import dataclasses
 import datetime
 import unittest
 
 from living_context.erasure import scan
 from living_context.erasure.hold import HoldRegistry, release_hold, request_erasure
+from living_context.erasure.executor import Held
 from living_context.erasure.receipt import full_receipt, recount
 from living_context.ingest.subjects import Guard, HELD, OK, REFUSED, TokenSource
 from living_context.ingest.writer import Writer
@@ -55,16 +60,17 @@ class Scopes(V.VerifierAndRestore):
         path = self.dir / "holds" / "holds.json"
         reg = HoldRegistry(path, clock=lambda: t[0], honour_holds=honour)
         reg.place(subject=self.subject)
-        ex = self.executor()
-        out = request_erasure(ex, reg, self.subject, apply_guard=self.guard_fn())
+        ex = self.executor(holds=reg)
+        out = request_erasure(ex, self.subject, apply_guard=self.guard_fn())
         self.assertTrue(out.queued, "an erasure ran under a legal hold")
         self.assertEqual((self.state.seq, self.journal.last_seq), (0, 0))
         self.assertGreater(v.probe(self.canaries).total, 0, "a held scope's content was touched")
         reg2 = HoldRegistry(path, clock=lambda: t[0])   # a gateway restart: the queue is durable
+        ex = self.executor(holds=reg2)
         self.assertEqual(len(reg2.queued()), 1)
         t[0] += 7200
-        self.assertEqual(release_hold(ex, reg2, subject="another-subject"), [], "releasing another scope ran the erasure")
-        outs = release_hold(ex, reg2, subject=self.subject, apply_guard=self.guard_fn())
+        self.assertEqual(release_hold(ex, subject="another-subject"), [], "releasing another scope ran the erasure")
+        outs = release_hold(ex, subject=self.subject, apply_guard=self.guard_fn())
         self.assertEqual(len(outs), 1)
         rc = outs[0].receipt
         after = v.residue(self.canaries, before)
@@ -86,18 +92,19 @@ class Scopes(V.VerifierAndRestore):
         self.plant()
         a, b = list(self.canaries.leaf_ids)
         v = self.verifier()
-        ex = self.executor()
         reg = HoldRegistry(self.dir / "holds2" / "h.json", honour_holds=honour)
+        ex = self.executor(holds=reg)
         reg.place(leaf_ids=[a])   # a hold on one leaf, not on the person
-        out = request_erasure(ex, reg, self.subject, apply_guard=self.guard_fn())
+        out = request_erasure(ex, self.subject, apply_guard=self.guard_fn())
         self.assertTrue(out.queued, "an erasure ran although its closure reaches a leaf under a legal hold")
         self.assertEqual((self.state.seq, self.journal.last_seq), (0, 0))
         reg2 = HoldRegistry(self.dir / "holds3" / "h.json", honour_holds=honour)
         reg2.place(subject=self.subject)   # a hold on the person: an item of theirs is covered too
-        out = request_erasure(ex, reg2, "", leaf_ids=[b])
+        ex = self.executor(holds=reg2)
+        out = request_erasure(ex, "", leaf_ids=[b])
         self.assertTrue(out.queued, "an item erasure ran although its leaf belongs to a person under a legal hold")
         self.assertGreater(v.probe(self.canaries).total, 0, "held content was touched")
-        self.assertEqual(release_hold(ex, reg2, leaf_ids=["unrelated"]), [], "releasing another scope ran the erasure")
+        self.assertEqual(release_hold(ex, leaf_ids=["unrelated"]), [], "releasing another scope ran the erasure")
 
     def test_a_hold_on_a_leaf_or_on_a_person_covers_what_the_closure_reaches(self):
         self.check_hold_closure()
@@ -106,6 +113,66 @@ class Scopes(V.VerifierAndRestore):
         with self.assertRaises(AssertionError) as cm:
             self.check_hold_closure(honour=False)
         self.assertIn("legal hold", str(cm.exception))
+
+
+    # ---- the hold check cannot be skipped from a public entry point (DESIGN 14.1; ASSUMPTION: it covers all three scopes) ----
+    def check_direct_entries(self, **kw):
+        self.plant()
+        a, b = list(self.canaries.leaf_ids)
+        v = self.verifier()
+        reg = HoldRegistry(self.dir / "holds4" / "h.json")
+        reg.place(subject=self.subject)
+        reg.place(leaf_ids=[a])
+        ex = self.executor(holds=reg, **kw)
+        for name, call in (("erase_subject", lambda: ex.erase_subject(self.subject, apply_guard=self.guard_fn())),
+                           ("erase_item", lambda: ex.erase_item([a])),
+                           ("erase_item of a held person's leaf", lambda: ex.erase_item([b]))):
+            with self.assertRaises(Held, msg=f"{name} ran under a legal hold"):
+                call()
+            self.assertEqual((self.state.seq, self.journal.last_seq), (0, 0), f"{name} published under a hold")
+            self.assertGreater(v.probe(self.canaries).total, 0, f"{name} touched held content")
+
+    def test_every_public_erasure_entry_point_refuses_under_a_hold(self):
+        self.check_direct_entries()
+
+    def test_broken_executor_that_skips_the_hold_check_is_red(self):
+        with self.assertRaises(AssertionError) as cm:
+            self.check_direct_entries(broken_skip_holds=True)
+        self.assertIn("ran under a legal hold", str(cm.exception))
+
+    # ---- a queued request leaves the queue only after its receipt ---------------------------------------------------------
+    def check_crash_safe_release(self, broken=False):
+        self.plant()
+        v = self.verifier()
+        before = v.positive_control(self.canaries)
+        path = self.dir / "holds5" / "h.json"
+        reg = HoldRegistry(path)
+        reg.place(subject=self.subject)
+        self.assertTrue(request_erasure(self.executor(holds=reg), self.subject, apply_guard=self.guard_fn()).queued)
+        boom = {"armed": True}
+
+        def pause(stage):   # a failure after the tombstone is published and before the physical erasure and the receipt
+            if stage == "boundary" and boom["armed"]:
+                boom["armed"] = False
+                raise RuntimeError("injected failure between the queue and the receipt")
+
+        with self.assertRaises(RuntimeError):
+            release_hold(self.executor(holds=reg, pause=pause), subject=self.subject, apply_guard=self.guard_fn(),
+                         _broken_pop_first=broken)
+        survivor = HoldRegistry(path).queued()   # the gateway restarts
+        self.assertEqual(len(survivor), 1, "the queued erasure was lost by a failure after it left the queue")
+        outs = release_hold(self.executor(holds=HoldRegistry(path)), subject=self.subject, apply_guard=self.guard_fn())
+        self.assertEqual(len(outs), 1)
+        self.assertEqual(v.residue(self.canaries, before).total, 0)
+        self.assertEqual(HoldRegistry(path).queued(), [])
+
+    def test_a_failure_between_the_queue_and_the_receipt_loses_no_request(self):
+        self.check_crash_safe_release()
+
+    def test_broken_release_that_pops_the_queue_before_running_is_red(self):
+        with self.assertRaises(AssertionError) as cm:
+            self.check_crash_safe_release(broken=True)
+        self.assertIn("was lost", str(cm.exception))
 
     # ---- an item erasure --------------------------------------------------------------------------------------------------
     def check_item(self, **kw):
@@ -257,6 +324,68 @@ class Scopes(V.VerifierAndRestore):
         with self.assertRaises(AssertionError) as cm:
             self.check_queries(broken_no_query_net=True)
         self.assertIn("shaped by an erased search survived", str(cm.exception))
+
+    # ---- E0/E1: the verifier's percolate, query-only and query-shaped canaries (BUILD-PLAN Step 14) --------------------------
+    def plant_query_canaries(self, *, reachable=True):
+        """A person who appears only in another actor's query: a stored query (its percolator words match the canary document), a
+        row, and an edge and a member shaped by that search. `reachable=False` plants a stored query that carries the canary only
+        in its percolator and names no subject (a defect of subject detection): no lineage reaches it."""
+        self.plant()
+        qtok = self.ks.subject_token(f"qonly{self.uniq}@example.com")
+        sid, word = f"qsrch{self.uniq}", f"qcanary{self.uniq}"
+        actor = f"asker{self.uniq}"
+        q = {"match": {"text": {"query": word}}}
+        if reachable:
+            self.doc("sq", sid, kind="sq", lin_subjects=[actor, qtok], search_id=sid, text=f"what does {word} do", q=q, derivation="protocol")
+            self.doc("log", f"qrow{self.uniq}", kind="log", lin_subjects=[actor, qtok], actor=actor, search_id=sid, item_subjects=[],
+                     pointer={}, derivation="protocol")
+        else:
+            self.doc("sq", sid, kind="sq", lin_subjects=[actor], search_id=sid, text="", q=q, derivation="protocol")
+        self.doc("edge", f"qco{self.uniq}", kind="edge", type="co_used", evidence=[sid], edge_id=f"qco{self.uniq}", derivation="edge")
+        self.doc("member", f"qmb{self.uniq}", kind="member", shaped_by=sid, parent_id="p", child_id="c", derivation="placement")
+        self.canaries = dataclasses.replace(self.canaries, percolate_text=f"{word} asks about the orchard", query_subject_token=qtok,
+                                            search_ids=[sid])
+        return qtok
+
+    def check_query_canaries(self, **kw):
+        qtok = self.plant_query_canaries()
+        v = self.verifier()
+        before = v.positive_control(self.canaries)   # raises if any of the three new probes is blind
+        for step in ("percolate", "query_only", "query_shaped"):
+            self.assertGreater(before.found[step], 0, f"the {step} probe is blind before the erasure")
+        self.executor(**kw).erase_subject(qtok, apply_guard=self.guard_fn())
+        after = v.residue(self.canaries, before)
+        for step in ("percolate", "query_only", "query_shaped"):
+            self.assertEqual(after.found[step], 0, f"residue after erasure: the {step} probe still finds {after.found[step]}")
+        return after
+
+    def test_the_verifier_finds_the_percolate_query_only_and_query_shaped_canaries_and_none_remains_after_erasure(self):
+        after = self.check_query_canaries()
+        self.assertEqual([n for n, p, _ in after.steps if n in ("percolate", "query_only", "query_shaped")],
+                         ["percolate", "query_only", "query_shaped"])
+        self.assertTrue(all(p == 1 for n, p, _ in after.steps if n in ("percolate", "query_only", "query_shaped")))
+
+    def test_broken_closure_without_the_second_net_leaves_a_shaped_artefact_the_verifier_finds(self):
+        with self.assertRaises(AssertionError) as cm:
+            self.check_query_canaries(broken_no_query_net=True)
+        self.assertIn("query_shaped probe still finds", str(cm.exception))
+
+    def test_a_stored_query_reached_only_by_its_percolator_words_is_found_by_the_percolate_probe_alone(self):
+        qtok = self.plant_query_canaries(reachable=False)
+        # only the percolate canary is asked of this verifier: no lineage names the query-only subject or the search
+        self.canaries = dataclasses.replace(self.canaries, query_subject_token="", search_ids=())
+        v = self.verifier()
+        before = v.positive_control(self.canaries)
+        self.assertGreater(before.found["percolate"], 0)
+        self.assertEqual(v._text(f"qcanary{self.uniq}"), 0, "premise: the text probe cannot see a percolator-only stored query")
+        self.executor().erase_subject(qtok, apply_guard=self.guard_fn())
+        after = v.residue(self.canaries, before)
+        self.assertGreater(after.found["percolate"], 0, "the percolate probe missed a stored query that still matches the canary")
+
+    def test_broken_closure_without_the_authz_index_is_red_at_erase_time(self):
+        with self.assertRaises(AssertionError) as cm:
+            self.check_erasure(broken_skip_authz=True)
+        self.assertIn("'authz': 1", str(cm.exception))
 
     # ---- E1: files outside the indices ------------------------------------------------------------------------------------
     def test_a_model_output_file_under_the_data_root_is_counted_as_residue(self):

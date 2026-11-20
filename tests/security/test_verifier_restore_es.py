@@ -17,6 +17,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from living_context.erasure.hold import HoldRegistry
 from living_context.embed import stub as embed_stub
 from living_context.erasure.executor import Executor, State
 from living_context.erasure.receipt import full_receipt, recount, requester_copy
@@ -49,7 +50,7 @@ class VerifierAndRestore(VersionsBase):
 
     def executor(self, ks=None, **kw):
         return Executor(lambda: self.gate.client(self.T, "erase"), self.structure(), self.T, ks or self.ks, self.journal, self.wgate,
-                        self.fence, self.state, purge_deadline_s=2, purge_interval_s=1, es_log=lambda: self.gate.client(self.T, "log"), **kw)
+                        self.fence, self.state, holds=kw.pop("holds", None) or HoldRegistry(), purge_deadline_s=2, purge_interval_s=1, es_log=lambda: self.gate.client(self.T, "log"), **kw)
 
     def verifier(self, **kw):
         # the verifier's own client: a separate EsClient object (in production, its own read-only key file)

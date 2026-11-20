@@ -70,14 +70,15 @@ class Receipt:
 
 class Executor:
     def __init__(self, es_erase: Callable[[], EsClient], es_struct: Callable[[], EsClient], tenant: str, keystore: Keystore,
-                 journal: TombstoneJournal, gate: WriteGate, fence: SendFence, state: State, *,
+                 journal: TombstoneJournal, gate: WriteGate, fence: SendFence, state: State, *, holds,
                  pause: Optional[Callable[[str], None]] = None, transitive: bool = True, destroy_only_keys: bool = False,
                  purge_deadline_s: float = purge.DEFAULT_DEADLINE_S, purge_interval_s: float = 3.0,
                  broken_delete_foreign_log_rows: bool = False, es_log: Optional[Callable[[], EsClient]] = None,
                  broken_skip_authz: bool = False, broken_relabel_keeps_old_copy: bool = False, broken_relabel_all_classes: bool = False,
                  broken_no_identifier_hmacs: bool = False, broken_publish_before_closure: bool = False, broken_replay_keeps_keys: bool = False,
-                 broken_no_query_net: bool = False, broken_current_generation_only: bool = False, broken_string_closure: str = ""):
+                 broken_no_query_net: bool = False, broken_skip_holds: bool = False, broken_current_generation_only: bool = False, broken_string_closure: str = ""):
         self._er, self._st, self.tenant, self._ks = es_erase, es_struct, tenant, keystore
+        self.holds, self._skip_holds = holds, broken_skip_holds   # BROKEN variant: the hold check is skipped
         self._j, self._gate, self._fence, self.state = journal, gate, fence, state
         self._pause = pause or (lambda s: None)
         self._transitive, self._keys_only = transitive, destroy_only_keys
@@ -149,14 +150,14 @@ class Executor:
         return out
 
     # ---- the request ------------------------------------------------------------------------------------------
-    def erase_item(self, leaf_ids: Iterable[str], *, holds=None, apply_guard: Callable[[], None] = lambda: None) -> Receipt:
+    def erase_item(self, leaf_ids: Iterable[str], *, apply_guard: Callable[[], None] = lambda: None) -> Receipt:
         """Erase one or more items (DESIGN 14.1): every version of the named leaves and everything derived from them."""
-        return self.erase_subject("", item_leaves=leaf_ids, holds=holds, apply_guard=apply_guard)
+        return self.erase_subject("", item_leaves=leaf_ids, apply_guard=apply_guard)
 
     def erase_subject(self, subject: str, *, identifiers: Iterable[str] = (), bare_tokens: Iterable[str] = (),
-                      item_leaves: Iterable[str] = (), holds=None, apply_guard: Callable[[], None] = lambda: None) -> Receipt:
-        """`holds` (a `HoldRegistry`) is checked against the closure under the write gate, before anything is published: a hold on a
-        leaf the closure reaches, or on a subject of a leaf it reaches, raises `Held`. `identifiers` and `bare_tokens` are the erased identifier and bare-name HMAC tokens: they go into the journal
+                      item_leaves: Iterable[str] = (), apply_guard: Callable[[], None] = lambda: None) -> Receipt:
+        """The executor's holds (a `HoldRegistry`, required at construction) are checked against the closure under the write gate,
+        before anything is published: a hold on a leaf the closure reaches, or on a subject of a leaf it reaches, raises `Held`. `identifiers` and `bare_tokens` are the erased identifier and bare-name HMAC tokens: they go into the journal
         record so a restart or a restore rebuilds the guard that refuses re-ingest (E3; the journal holds HMACs, no content)."""
         t0 = time.monotonic()
         er, rc = self._er(), Receipt()
@@ -164,10 +165,7 @@ class Executor:
             er.request("POST", f"/lc-{self.tenant}-*/_refresh")
             hits, leaves = self.closure(subject, item_leaves)
             self._pause("closure")
-            if holds is not None:
-                toks = {t for h in hits.values() if h.kind in ("src", "leaf") for t in h.lin_subjects}
-                if holds.covered(subject, leaves, toks):
-                    raise Held()
+            self._check_holds(subject, leaves, hits)
             pub = hits
             if self._early:   # BROKEN variant: the boundary publishes a redact set from a closure that is not complete yet
                 keep, self._transitive = self._transitive, False
@@ -189,6 +187,14 @@ class Executor:
             rc.seq, rc.boundary_s = seq, time.monotonic() - t0
         self._pause("boundary")
         return self._physical(hits, leaves, subject, seq, rc)
+
+    def _check_holds(self, subject: str, leaves: Iterable[str], hits: dict) -> None:
+        """Every public entry point that starts an erasure calls this under the gate, before the journal append."""
+        if self._skip_holds:
+            return
+        toks = {t for h in hits.values() if h.kind in ("src", "leaf") for t in h.lin_subjects}
+        if self.holds.covered(subject, leaves, toks):
+            raise Held()
 
     def replay(self, subject: str, leaf_ids: Iterable[str], seq: int, *, apply_guard: Callable[[], None] = lambda: None,
                run_purge: bool = True) -> Receipt:
@@ -260,6 +266,7 @@ class Executor:
         with self._gate.exclusive():
             er.request("POST", f"/lc-{self.tenant}-*/_refresh")
             hits, lv_max = self.class_closure(leaf_ids, old_cls)
+            self._check_holds("", leaf_ids, hits)
             redact = sorted({h.id for h in hits.values()})
             seq = self._j.append({"subject": "", "leaf_ids": leaf_ids, "cls": old_cls, "lv_max": lv_max, "redact": redact})
             self._record_and_publish(seq, redact, set(), rc, t0, apply_guard)

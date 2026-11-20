@@ -16,6 +16,7 @@ import time
 import unittest
 from pathlib import Path
 
+from living_context.erasure.hold import HoldRegistry
 from living_context.erasure.executor import Executor, State
 from living_context.gateway import fence as fmod
 from living_context.gateway.fence import Aborted, SendFence
@@ -51,7 +52,7 @@ class EraseSendFence(VersionsBase):
 
     def executor(self):
         return Executor(lambda: self.gate.client(self.T, "erase"), self.structure(), self.T, self.ks, self.journal, self.wgate,
-                        self.fence, self.state, purge_deadline_s=2, purge_interval_s=1, es_log=lambda: self.gate.client(self.T, "log"))
+                        self.fence, self.state, holds=HoldRegistry(), purge_deadline_s=2, purge_interval_s=1, es_log=lambda: self.gate.client(self.T, "log"))
 
     def run_senders(self, *, use_fence=True, capped=True, recheck=True):
         w = self.world()

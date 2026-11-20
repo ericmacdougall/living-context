@@ -7,7 +7,8 @@ credential (an `EsClient` constructed by the caller from the verifier's own key 
 Canaries are planted by the tests through the real writer: a short unique string, a long one (over 2 KB, so Elasticsearch stores it
 compressed), a canary vector, a canary subject token, a canary principal in the authz index and a canary line in plaintext logs.
 `positive_control` must find every canary by every method (text search, kNN with the canary vector, get by id, lineage query,
-authz read, log grep with its control marker) before an absence counts; `residue` then runs the same probes after the erasure and
+authz read, percolation of the canary document against the stored queries, a person named only in query text, what those
+searches shaped, log grep with its control marker) before an absence counts; `residue` then runs the same probes after the erasure and
 counts what it finds. Both reports carry the step list and the number of probes run; a step that cannot run is an error, never a
 skip (LAB-R8). A raw-file grep over segment files is NOT a check (stored fields are compressed): `segment_grep` exists only so the
 tests can show that such a verifier misses the long canary.
@@ -40,6 +41,9 @@ class Canaries:
     principal: str = ""
     log_marker: str = ""          # the control marker: never an erased canary, must always be found in the logs
     data_marker: str = ""         # the control marker in a file under the data root: must always be found there
+    percolate_text: str = ""      # a canary document: percolated against the stored queries, which must match none after erasure
+    query_subject_token: str = "" # a person who appears only in query text (another person's query mentions them)
+    search_ids: Sequence[str] = ()  # the searches that mention the query-only subject: what they shaped (edges, members) is residue
 
 
 @dataclass
@@ -136,6 +140,22 @@ class Verifier:
             return 0
         return len(self._search(self._all, {"size": 100, "_source": False, "query": {"bool": {"should": should, "minimum_should_match": 1}}}))
 
+    def _percolate(self, text: str) -> int:
+        """Percolate the canary document against every stored-query index of the tenant (DESIGN 14.7, E0/E1): the stored queries
+        that still match it. A stored query is a lexical percolator query, so it is found by its words, not by a text field."""
+        return len(self._search(f"lc-{self.tenant}-*-sq", {"size": 100, "_source": False,
+                                                           "query": {"percolate": {"field": "q", "document": {"text": text}}}}))
+
+    def _query_only(self, token: str) -> int:
+        """Rows, stored queries and anything else that names a person only because a query mentioned them."""
+        return len(self._search(self._all, {"size": 100, "_source": False, "query": {"term": {"lin_subjects": token}}}))
+
+    def _query_shaped(self, search_ids: Sequence[str]) -> int:
+        """Artefacts shaped by those searches: an edge that cites them as evidence, a member placed by them, lineage by query."""
+        ids = list(search_ids)
+        return len(self._search(self._all, {"size": 100, "_source": False, "query": {"bool": {"minimum_should_match": 1, "should": [
+            {"terms": {"evidence": ids}}, {"terms": {"shaped_by": ids}}, {"terms": {"lin_queries": ids}}, {"terms": {"search_id": ids}}]}}}))
+
     def _authz(self, principal: str) -> int:
         return len(self._search(f"lc-{self.tenant}-authz", {"size": 100, "_source": False, "query": {"query_string": {
             "query": _phrase(principal), "default_field": "*", "lenient": True}}})) if principal else 0
@@ -179,6 +199,12 @@ class Verifier:
         step("get_by_id", 1 if canaries.leaf_ids else 0, self._by_id(canaries.leaf_ids))
         step("lineage", 1, self._lineage(canaries))
         step("authz", 1 if canaries.principal else 0, self._authz(canaries.principal))
+        if canaries.percolate_text:
+            step("percolate", 1, self._percolate(canaries.percolate_text))
+        if canaries.query_subject_token:
+            step("query_only", 1, self._query_only(canaries.query_subject_token))
+        if canaries.search_ids:
+            step("query_shaped", 1, self._query_shaped(canaries.search_ids))
         if self._logs:
             erased = [n for n in (canaries.short, canaries.long) if n]
             g = self._logs_grep(erased + ([canaries.log_marker] if canaries.log_marker else []))

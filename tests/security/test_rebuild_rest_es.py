@@ -14,6 +14,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from living_context.erasure.hold import HoldRegistry
 from living_context.config import Constants
 from living_context.erasure.executor import Executor, State
 from living_context.gateway.fence import SendFence
@@ -44,7 +45,7 @@ class RebuildRest(VersionsBase):
 
     def executor(self):
         return Executor(lambda: self.gate.client(self.T, "erase"), self.structure(), self.T, self.ks, self.journal, self.wgate,
-                        self.fence, self.state, purge_deadline_s=2, purge_interval_s=1, es_log=lambda: self.gate.client(self.T, "log"))
+                        self.fence, self.state, holds=HoldRegistry(), purge_deadline_s=2, purge_interval_s=1, es_log=lambda: self.gate.client(self.T, "log"))
 
     # ---- helpers ------------------------------------------------------------------------------------------------------
     def top_refs(self, gen=None):
@@ -138,7 +139,7 @@ class RebuildRest(VersionsBase):
         self.assertFalse(gone & set(homes))
 
     # ---- a pending-new node in a taller tree --------------------------------------------------------------------------
-    def test_a_leaf_that_cleared_no_node_joins_a_tree_taller_than_one_level(self):
+    def check_tall_tree_pending_new(self, **kw):
         w = self.world()
         w.bootstrap(topics=8, per=4)
         self.assertGreaterEqual(max(self.doc("node", r)["level"] for r in self.top_refs()), 2, "the premise: a tall tree")
@@ -146,14 +147,24 @@ class RebuildRest(VersionsBase):
         res = self.add_text(w, NOVEL)
         st, r = self.admin.request("POST", f"/lc-{self.T}-base-member/_search", {"query": {"term": {"child_id": f"{res.leaf_id}:{res.lv}"}}})
         self.assertEqual([h["_source"]["parent_id"] for h in r["hits"]["hits"]], ["pendingnew"], "the premise: it cleared no node")
-        rb = w.rebuilder()
+        rb = w.rebuilder(**kw)
         out = rb.run()
         self.assertEqual(out.status, "published", out)
+        roots = {self.doc("node", r)["level"] for r in self.top_refs()}
+        self.assertTrue(min(roots) >= 2, f"a new level-1 node was left beside the upper nodes (root levels {sorted(roots)}): it was not adopted")
         homes, _ = self.l1_homes()
         self.assertEqual(homes[res.leaf_id], 1, "the new leaf is not in the tree once")
         self.assertEqual({k for k in before}, {k for k in homes} - {res.leaf_id}, "a leaf was lost or duplicated")
         self.assertTrue(all(v == 1 for v in homes.values()))
         self.assertIn(res.leaf_id, self.tree_only_ids(NOVEL), "tree-only recall does not reach the adopted leaf")
+
+    def test_a_leaf_that_cleared_no_node_joins_a_tree_taller_than_one_level(self):
+        self.check_tall_tree_pending_new()
+
+    def test_broken_rebuild_without_adoption_leaves_a_level_one_root_beside_the_upper_nodes(self):
+        with self.assertRaises(AssertionError) as cm:
+            self.check_tall_tree_pending_new(no_adoption=True)
+        self.assertIn("was not adopted", str(cm.exception))
 
     # ---- merge of an under-full node, collapse of a single-child chain ---------------------------------------------------
     def check_merge(self, **kw):
@@ -191,7 +202,7 @@ class RebuildRest(VersionsBase):
             self.check_merge(merge_drops_members=True)
         self.assertIn("lost or duplicated by the merge", str(cm.exception))
 
-    def test_a_single_child_chain_collapses_and_the_tree_stays_placeable(self):
+    def check_collapse(self, **kw):
         c2 = Constants(f_target=2, f_max=3, f_min=2, expand_hops=1)
         w = self.world(consts=c2)
         w.bootstrap(topics=5, per=2)
@@ -205,16 +216,16 @@ class RebuildRest(VersionsBase):
         text = self.admin.request("GET", f"/lc-{self.T}-base-leaf/_doc/{leaf}:1")[1]["_source"]["text"]
         topic = "abcdefghijklmnopqrstuvwxyz".index(text.split("topic")[-1][0])
         w.add(topic, 1, place=True)
-        rb = w.rebuilder()
+        rb = w.rebuilder(**kw)
         out = rb.run()
         self.assertEqual(out.status, "published", out)
-        self.assertEqual(rb.collapses, 1)
         homes, _ = self.l1_homes()
         self.assertEqual(set(homes) - set(homes0) and len(set(homes) - set(homes0)), 1)
         self.assertTrue(all(v == 1 for v in homes.values()))
         new_top = {r: self.doc("node", r) for r in self.top_refs()}
         self.assertNotIn(single[0], new_top)
         self.assertTrue(any(d["level"] == 1 for d in new_top.values()), "the lone child did not take the node's place")
+        self.assertEqual(rb.collapses, 1)
         self.assertEqual(self.l1_homes(gen0)[0], homes0, "the collapse changed an earlier generation")
         fw = self.doc("ctl", f"fw:topic:{self.head()['gen']}:{single[0].split(':')[0]}")
         self.assertTrue(fw and fw["new_ids"], "no forwarding record for the collapsed node")
@@ -222,6 +233,14 @@ class RebuildRest(VersionsBase):
         again = w.add(topic, 1, place=True)[0]
         self.assertEqual(w.rebuilder().run().status, "published")
         self.assertEqual(self.l1_homes()[0][again.leaf_id], 1)
+
+    def test_a_single_child_chain_collapses_and_the_tree_stays_placeable(self):
+        self.check_collapse()
+
+    def test_broken_rebuild_that_keeps_a_single_child_chain_is_red(self):
+        with self.assertRaises(AssertionError) as cm:
+            self.check_collapse(no_collapse=True)
+        self.assertIn("did not take the node's place", str(cm.exception))
 
     # ---- the evaluation-only pin ------------------------------------------------------------------------------------------
     def overflow_world(self, pins_by_text=None, **kw):

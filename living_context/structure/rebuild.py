@@ -88,7 +88,8 @@ class Rebuilder:
                  # the BROKEN variants of the tests:
                  refresh_before_flip: bool = True, use_cas: bool = True, publish_w_past_failed: bool = False,
                  reuse_node_ids: bool = False, ancestry_limit: Optional[int] = None, check_tombstones: bool = True,
-                 merge_drops_members: bool = False, ignore_pins: bool = False):
+                 merge_drops_members: bool = False, ignore_pins: bool = False,
+                 no_adoption: bool = False, no_collapse: bool = False):
         self._es_fn, self._leaf_fn, self._port = es, leaf_es, port
         self.tenant, self.cls, self.family, self._wp = tenant, cls, family, wp
         self._c = consts or Constants()
@@ -99,6 +100,7 @@ class Rebuilder:
         self._gate, self._state = gate or NoGate(), state      # state: the erasure executor's State (published tombstones, redact set)
         self._pins = {} if ignore_pins else dict(pins or {})   # evaluation only (EXPERIMENT 3.6): leaf id -> the donor sibling it stays with
         self._check_tombs, self._merge_drops = check_tombstones, merge_drops_members
+        self._no_adopt, self._no_collapse = no_adoption, no_collapse   # BROKEN variants: no pending-new adoption in a tall tree; no collapse
         self.merges = self.collapses = self.merge_skipped = 0
         self.pub = Publisher(es, tenant, cls, family=family, refresh_before_flip=refresh_before_flip, use_cas=use_cas)
         self.calls = 0
@@ -376,7 +378,7 @@ class Rebuilder:
         top_level = max((nodes[r].level for r in top), default=1)
         # a new level-1 node of a tree taller than one level joins the most similar level-2 node (the next batch rebalances it)
         adopt: dict[str, list[Node]] = {}
-        if top_level > 1 and level_nodes.get(2) and new_top_nodes:
+        if top_level > 1 and level_nodes.get(2) and new_top_nodes and not self._no_adopt:
             for nn in new_top_nodes:
                 best = sorted(level_nodes[2], key=lambda u: (-embed_stub.cosine(nn.summary_embedding, u.summary_embedding), u.node_id))[0]
                 adopt.setdefault(best.ref, []).append(nn)
@@ -392,7 +394,7 @@ class Rebuilder:
                 kids += adopt.get(u.ref, [])
                 if level == 2:
                     kids = merge_underfull(kids)
-                if len(kids) == 1 and level >= 2:   # collapse a single-child chain: the child takes the node's place
+                if len(kids) == 1 and level >= 2 and not self._no_collapse:   # collapse a single-child chain: the child takes the node's place
                     changed[u.ref] = list(kids)
                     forward[u.node_id] = [kids[0].node_id]
                     self.collapses += 1

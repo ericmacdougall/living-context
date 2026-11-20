@@ -10,6 +10,7 @@ import threading
 import unittest
 from pathlib import Path
 
+from living_context.erasure.hold import HoldRegistry
 from living_context.config import Constants
 from living_context.erasure import scan
 from living_context.erasure.executor import Executor, State
@@ -119,7 +120,7 @@ class ErasureOnElasticsearch(unittest.TestCase):
     def executor(self, **kw):
         er = lambda: self.gate.client(T, "erase")
         return Executor(er, lambda: self.gate.client(T, "structure"), T, self.ks, self.journal, self.wgate, self.fence,
-                        self.state, purge_deadline_s=kw.pop("purge_deadline_s", 90), es_log=lambda: self.gate.client(T, "log"), **kw)
+                        self.state, holds=kw.pop("holds", None) or HoldRegistry(), purge_deadline_s=kw.pop("purge_deadline_s", 90), es_log=lambda: self.gate.client(T, "log"), **kw)
 
     def guard_fn(self):
         return lambda: self.guard.erase_identifier(self.email)

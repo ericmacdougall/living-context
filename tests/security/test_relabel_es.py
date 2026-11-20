@@ -11,6 +11,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from living_context.erasure.executor import Held
+from living_context.erasure.hold import HoldRegistry, release_hold, request_relabel
 from living_context.erasure.executor import Executor, State
 from living_context.erasure.restore import restore_replay
 from living_context.gateway.es import EsClient
@@ -62,7 +64,7 @@ class Relabel(VersionsBase):
 
     def executor(self, **kw):
         return Executor(lambda: self.gate.client(self.T, "erase"), self.structure(), self.T, self.ks, self.journal, self.wgate,
-                        self.fence, self.state, purge_deadline_s=2, purge_interval_s=1,
+                        self.fence, self.state, holds=kw.pop("holds", None) or HoldRegistry(), purge_deadline_s=2, purge_interval_s=1,
                         es_log=lambda: self.gate.client(self.T, "log"), **kw)
 
     def n_docs(self, index, query):
@@ -127,6 +129,32 @@ class Relabel(VersionsBase):
         with self.assertRaises(AssertionError) as cm:
             self.check_relabel(broken_relabel_keeps_old_copy=True)
         self.assertRegex(str(cm.exception), "old-class copy was left|key was left")
+
+    # ---- a legal hold covers a relabel too (DESIGN 14.1 "legal hold wins"; ASSUMPTION in design-readings) ----------------
+    def check_relabel_under_hold(self, **kw):
+        w, res = self.plant()
+        reg = HoldRegistry()
+        reg.place(leaf_ids=[res.leaf_id])
+        ex = self.executor(holds=reg, **kw)
+        with self.assertRaises(Held, msg="relabel_erase ran under a legal hold"):
+            ex.relabel_erase([res.leaf_id], "base")
+        self.assertEqual((self.state.seq, self.journal.last_seq), (0, 0), "a tombstone was published under a hold")
+        self.assertGreater(self.old_copy_docs(res.leaf_id), 0, "the held old copy was touched")
+        out = request_relabel(ex, [res.leaf_id], "base")
+        self.assertTrue(out.queued)
+        self.assertEqual(len(reg.queued()), 1)
+        outs = release_hold(ex, leaf_ids=[res.leaf_id])   # the hold is lifted: the relabel's erasure runs from the queue
+        self.assertEqual(len(outs), 1)
+        self.assertEqual(self.old_copy_docs(res.leaf_id), 0)
+        self.assertEqual(reg.queued(), [])
+
+    def test_a_relabel_under_a_hold_is_refused_queued_and_runs_on_release(self):
+        self.check_relabel_under_hold()
+
+    def test_broken_relabel_that_skips_the_hold_check_is_red(self):
+        with self.assertRaises(AssertionError) as cm:
+            self.check_relabel_under_hold(broken_skip_holds=True)
+        self.assertIn("ran under a legal hold", str(cm.exception))
 
     # ---- the restore's replay -------------------------------------------------------------------------------------------
     def replay_after_resurrection(self, **kw):
