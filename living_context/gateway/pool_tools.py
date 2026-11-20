@@ -70,6 +70,7 @@ class PoolTools:
         self._saves: dict[tuple, list] = {}
         self._retracts: dict[tuple, list] = {}
         self._update_keys: dict[tuple, tuple] = {}
+        self._leaf_locks: dict[tuple, threading.Lock] = {}
         self.plan: list[str] = []    # every index an operation named, for the request-plan assertions
 
     # ---- routing ---------------------------------------------------------------------------------------------------------
@@ -190,6 +191,12 @@ class PoolTools:
         body = hashlib.sha256(json.dumps([mode, pool.id, s.id, req["text"], if_lv]).encode()).hexdigest()
         ik = (rec.tenant, rec.principal_token, rec.conversation, key)
         with self._lock:
+            lk = self._leaf_locks.setdefault((pool.id, s.id), threading.Lock())
+        with lk:   # one update of a leaf at a time (one gateway process, DESIGN 20): the head is read, claimed and advanced as one step
+            return self._update_locked(rec, pool, s, mode, req, if_lv, body, ik)
+
+    def _update_locked(self, rec, pool, s, mode, req, if_lv, body, ik) -> dict:
+        with self._lock:
             first = self._update_keys.get(ik)
         if first is not None:
             return first[1] if first[0] == body else err("invalid")
@@ -226,6 +233,8 @@ class PoolTools:
             if res.status != wmod.STORED:
                 return self._answer(res, pool.id)
             if not self.w.update_head(pool.cls, pool.id, s.id, cur, status="superseded", superseded_by=res.leaf_id):
+                # a lost supersede leaves no live duplicate: the new leaf's own head is taken out of retrieval
+                self.w.update_head(pool.cls, pool.id, res.leaf_id, res.lv, status="aborted")
                 return err("version_conflict", current=self._seal(pool.id, s.id, cur))
             out = {"ok": True, "pointer": self._seal(pool.id, res.leaf_id, res.lv), "pool": pool.id,
                    "old": {"status": "superseded", "newer": self._seal(pool.id, res.leaf_id, res.lv)}}
