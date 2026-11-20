@@ -248,3 +248,21 @@ Each entry names the passages, the reading the build follows and the test that k
 - Retraction (POOLS 3.5): built are the direct retraction (agent of an agent-origin leaf, human of any), the held request for an agent retracting a
   human or import leaf, the append-only records, the rate bounds and the `retracted` resolution for a token that could read the item. Not built: the
   review queue listing of requests, restore, release to erasure, `RETRACT_POOL_RATE` persistence across restart (counters are in gateway memory).
+
+## Review fixes of the pools foundation: readings (ASSUMPTION, listed by the pools owner)
+
+- POOLS 2.6 says delegation is attenuation only and 3.1 says tools are pool scoped, but the pre-existing handler routed every operation for any
+  resolved token. Reading kept: a token with a scope reaches only the pool tools, `pool_list`, `pool_describe`, `ping`, `token_renew`,
+  `token_delegate` and its own `token_revoke`; everything else is `unavailable` before any handler runs (default-deny with an allow-list).
+- POOLS 2.8 and 3.1 ask for a gateway event on a hold release. The `log` indices are written with the log key, which the writer does not hold.
+  Reading kept: an append-only `event` document in the class control index (hashes and ids only, lineage by pool and subjects), reached by the
+  pool delete and by every erasure; it is not a recall row and no adaptation signal counts it.
+- POOLS 9.4 says a commit sees the pool-scope tombstone and aborts. Reading kept: the pool state flips to `deleting` (journalled) before the
+  eraser takes the write gate, and every pool commit, hold, retraction and head update checks that state under the shared side of the gate; the
+  eraser removes the pool's own authz record and manifest last, so a crash at any step leaves a pool in `deleting` that a second delete finishes.
+  Restore replay of the pool-scope tombstone is still not built.
+- DESIGN 20 names one gateway process per tenant. Reading kept: the epoch journal takes a non-blocking POSIX lock (`lockf`) beside it, so a
+  second process stays closed; a restart inside one process is not refused. Updates of one pool leaf are serialized inside the process for the
+  same reason (a stated single-process limit); a crash between the two writes of a `supersede` is an open window.
+- The receipts of ungrant, detach and token revoke say `denied` for new calls and carry `in_flight_may_complete`: the hand-off check is
+  epoch-only, and a response already handed off for that pool or token can still go out (the paused-sender hook for pool grants is not built).
