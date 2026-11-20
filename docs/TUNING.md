@@ -227,13 +227,16 @@ probes.
 
 - Build: 133 + 399 + 1,334 = 1,866 (at 20,000 as the upper size), up to 3,732 with
   the retry allowance of DESIGN 18.1.
-- Recalls: 3 sizes x 80 questions x 67 = 16,080.
+- Recalls: 3 sizes x 80 questions x 67 = 16,080. This is an upper figure: the
+  counter caps each recall at `r_max` (56, 72 and 53 at the three sizes), so
+  recalls cannot exceed 80 x (56 + 72 + 53) = 14,480.
 - P1 total: 17,946 to 19,812 calls. Level-1 input tokens: about 1,750 level-1 calls
   at about 15,000 tokens, about 26 million.
 - Its recorded outputs (fused and direct lists, per item) give D4's escalation gain
   and D7's real-tree side by analysis at 0 calls. It also measures calls per recall
-  at each size; if the first size exceeds 67 by more than a quarter, the stage stops
-  and is re-counted for the owner.
+  at each size. Stop rule: if more than 10% of the first size's recalls end with
+  holders cut by the per-recall cap (`esc_reason = budget`), the cap is truncating
+  the owner's fan-out, and the stage stops and is re-counted for the owner.
 
 P6. Held-out check on the DEV held-out part, once, after the defaults are frozen.
 The trees are question-independent (probes are never stored), so P1's trees are
@@ -323,7 +326,7 @@ is set when it is proposed, from P1's measured variance; it is not counted here.
 
 | Id | Question | Default in force |
 |---|---|---|
-| Q8 | Approve P1, the first paid tuning stage, at 17,946 to 19,812 model calls (cap 19,812, stop and re-count if calls per recall exceed 67 by a quarter), and later P6 at 8,040? | not run until approved; recommended yes for P1, P6 asked again with P1's results |
+| Q8 | Approve P1, the first paid tuning stage, at 17,946 to 19,812 model calls (cap 19,812; stop and re-count if more than 10% of the first size's recalls are cut by the per-recall cap), and later P6 at 8,040? | not run until approved; recommended yes for P1, P6 asked again with P1's results |
 | Q9 | Approve the downloads, file by file, after licence, size and format are checked (section 3)? | none downloaded; recommended one candidate at a time, starting with the retrieval sets for D3 and D4 |
 
 The margins and bounds of section 6 are design decisions, not owner questions.
