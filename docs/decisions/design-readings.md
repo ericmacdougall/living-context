@@ -286,5 +286,8 @@ Each entry names the passages, the reading the build follows and the test that k
 - Pool delete destroys the keys of every key-holding document of the pool (`pool_scope.KEY_KINDS`: sources, quarantine) before it deletes any
   document; a key with no document left is harmless (ASSUMPTION). A hold release writes its approval event, with the hold id as a stable event
   id, before the leaf, so a crash between the two leaves an event without a leaf, which the retry completes, and never a leaf without an event.
+- Provenance is kept in the pool source (`prov_json`), so a repair re-projects the stored origin. A version with no recorded origin reads
+  as `unknown` (`writer.origin_of`, the one place origin is read): it ranks below `agent`, its title is wrapped like an agent's, the
+  envelope carries `origin="unknown"`, and it never lets an agent correct or retract.
 - Still open (ASSUMPTION, unchanged): the hand-off check of pool grants and token liveness is epoch-only; a response already handed off can go
   out after an ungrant or a revoke (`in_flight_may_complete`).
