@@ -18,6 +18,7 @@ from typing import Any, Callable, Mapping, Optional
 
 from ..ids import IdError, KIND_LEAF, Pointer, decode_pointer, encode_pointer
 from ..policy import ClassLattice, Op, decide
+from .admin import ADMIN_OPS
 from .es import EsClient, EsError
 from ..recall.direct import DirectSearch
 from .indices import class_index
@@ -35,24 +36,37 @@ class EsGate:
     def __init__(self, url: str, ca_path: str, keys: Mapping[str, Mapping[str, str]]):
         self._url, self._ca, self._keys = url, ca_path, keys
         self._clients: dict[tuple[str, str], EsClient] = {}
+        self._dropped: set[str] = set()
 
     def client(self, tenant: str, role: str) -> EsClient:
+        if tenant in self._dropped:
+            raise EsError("tenant keys dropped")
         k = (tenant, role)
         if k not in self._clients:
             self._clients[k] = EsClient(self._url, self._ca, self._keys[tenant][role], scheme="apikey")
         return self._clients[k]
 
     def drop_tenant(self, tenant: str) -> None:
-        """Tenant-wide revocation: forget every client of the tenant at once (DESIGN 4.4)."""
+        """Tenant-wide revocation (offboarding, key compromise): forget every client of the tenant at once and refuse to build a new
+        one until `reload` names new keys (DESIGN 4.4). The gateway is the only client, so this alone stops every gateway path."""
+        self._dropped.add(tenant)
         for k in [k for k in self._clients if k[0] == tenant]:
             del self._clients[k]
+
+    def reload(self, tenant: str, keys: Mapping[str, str]) -> None:
+        """After a rotation (`keyowner.rotate`): new key files for the tenant, old clients forgotten, the tenant usable again."""
+        self._keys = {**self._keys, tenant: dict(keys)}
+        for k in [k for k in self._clients if k[0] == tenant]:
+            del self._clients[k]
+        self._dropped.discard(tenant)
 
 
 class Gateway:
     def __init__(self, es: EsGate, sessions: Sessions, lattices: Mapping[str, ClassLattice],
-                 writers: Optional[Callable[[str], Any]] = None):
+                 writers: Optional[Callable[[str], Any]] = None, admin: Any = None):
         self._es, self._sessions, self._lattices = es, sessions, lattices
         self._writers = writers
+        self._admin = admin   # gateway.admin.Admin: grant, revoke, remove_class, break_glass_revoke
 
     # the single shaping point for every successful answer: nothing from Elasticsearch passes through unfiltered
     def _shape_hit(self, tenant: str, cls: str, hit: Mapping[str, Any]) -> Optional[dict]:
@@ -74,11 +88,18 @@ class Gateway:
         if not isinstance(request, dict) or FORBIDDEN_BODY_FIELDS & set(request):
             return REFUSED
         p = self._sessions.principal(rec)
+        op = request.get("op")
+        if op in ADMIN_OPS:   # the operator's break-glass comes from the platform tenant, which has no lattice
+            if self._admin is None:
+                return REFUSED
+            try:
+                return self._admin.handle(op, rec.tenant, p, {k: v for k, v in request.items() if k != "op"})
+            except Exception:  # a closed tenant (journal fault) is the one retryable answer
+                return UNAVAILABLE
         lattice = self._lattices.get(rec.tenant)
         if lattice is None:
             return UNAVAILABLE
         try:
-            op = request.get("op")
             if op == "ping":
                 return {"ok": True}
             if op == "search":

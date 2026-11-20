@@ -105,7 +105,10 @@ class ProvisionRefused(Exception):
 
 def provision_tenant(admin: EsClient, tenant: str, classes: list[str], *, key_dir: Path, data_root: Path,
                      consts: Constants | None = None, replicas: int = 0, max_shards_per_node: int = 1000,
-                     journal_size: int | None = None, key_expiry: str = "7d") -> dict[str, Any]:
+                     journal_size: int | None = None, key_expiry: str = "7d",
+                     key_owner: EsClient | None = None) -> dict[str, Any]:
+    """`key_owner`: the tenant key owner's client (DESIGN 4.3). When given, the tenant's API keys are created by it, so the owner holds
+    them all and can rotate and invalidate them later without the bootstrap credential (`gateway/keyowner.py`)."""
     c = consts or Constants()
     check_id(tenant, "tenant")
     if not classes or len(classes) > c.max_classes:
@@ -138,7 +141,7 @@ def provision_tenant(admin: EsClient, tenant: str, classes: list[str], *, key_di
     j, _ = epoch_journal.provision(jdir, journal_size or c.j_size)
     keys: dict[str, str] = {}
     for role, rd in roles_for(tenant, classes).items():
-        st, body = admin.request("POST", "/_security/api_key", {
+        st, body = (key_owner or admin).request("POST", "/_security/api_key", {
             "name": f"lc-{tenant}-{role}", "expiration": key_expiry, "role_descriptors": {"r": rd}})
         if st != 200:
             raise ProvisionRefused(f"key creation failed ({st})")

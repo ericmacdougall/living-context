@@ -166,6 +166,49 @@ class FenceTests(unittest.TestCase):
             conn.close()
             cli.close()
 
+    def check_revoke_latency(self, blocking):
+        """R1: a client that never reads while a large response is being handed over must not hold up the revoke."""
+        s, ep, ff = make()
+        rec = s.resolve(s.mint("tenaaa", b"proof-alice"))
+        conn, cli = self.pair()   # the peer never reads
+        f, stop = ff("tenaaa"), threading.Event()
+        chk = lambda: ep.current("tenaaa", rec.principal_token, rec.epoch)
+        data = b"x" * (64 << 20)
+
+        def sender():
+            off = 0
+            while not stop.is_set() and off < len(data):
+                try:
+                    if blocking:
+                        off += fence.handoff(conn, data, f, chk, blocking_timeout=3.0) or len(data)
+                    else:
+                        n = fence.handoff(conn, data[off:off + (1 << 20)], f, chk)
+                        off += n
+                        if n == 0:
+                            time.sleep(0.01)
+                except fence.Aborted:
+                    return
+
+        t = threading.Thread(target=sender)
+        t.start()
+        time.sleep(0.6)
+        t0 = time.time()
+        ep.bump("tenaaa", rec.principal_token)
+        took = time.time() - t0
+        stop.set()
+        t.join(10)
+        conn.close()
+        cli.close()
+        self.assertLess(took, 1.0, f"the revoke waited {took:.1f} s for a blocking socket write inside the fence")
+
+    def test_a_slow_reading_client_does_not_hold_up_a_revoke(self):
+        self.check_revoke_latency(blocking=False)
+
+    def test_broken_blocking_socket_write_inside_the_fence_is_red(self):
+        with self.assertRaises(AssertionError) as cm:
+            self.check_revoke_latency(blocking=True)
+        self.assertIn("blocking socket write inside the fence", str(cm.exception))
+
 
 class JournalSkeleton(unittest.TestCase):
     def test_preallocated_files_append_replay_and_torn_detection(self):

@@ -147,19 +147,28 @@ class RevocationService:
             return False
 
     def revoke(self, principal: str) -> Receipt:
+        return self._flip(principal, True)
+
+    def bump(self, principal: str) -> Receipt:
+        """An epoch bump without a revoke (class-grant removal, DESIGN 4.4): every session of the principal ends at its next check,
+        the principal can mint a new one that carries the reduced grants. Same order as a revoke: memory, then the journal."""
+        return self._flip(principal, False)
+
+    def _flip(self, principal: str, revoke: bool) -> Receipt:
         if self.state != OPEN or not self.lane_open:
             raise Refused("tenant closed")
+        kind = "revoke" if revoke else "bump"
         if self._b["persist"] and self._persist:     # BROKEN: the revoke needs the Elasticsearch write first
             self._persist(principal, self._ep.epoch(self.tenant, principal) + 1)
         if self._b["wait"]:                           # BROKEN: denial after the journal fsync
             with self._lock:
-                self._append({"t": "revoke", "principal": principal, "epoch": self._ep.epoch(self.tenant, principal) + 1})
-        den = self._ep.bump(self.tenant, principal, revoke=True)
+                self._append({"t": kind, "principal": principal, "epoch": self._ep.epoch(self.tenant, principal) + 1})
+        den = self._ep.bump(self.tenant, principal, revoke=revoke)
         epoch = self._ep.epoch(self.tenant, principal)
         rc = Receipt(principal, epoch, den.denied_at)
         if not self._b["wait"]:
             with self._lock:
-                if self._append({"t": "revoke", "principal": principal, "epoch": epoch}):
+                if self._append({"t": kind, "principal": principal, "epoch": epoch}):
                     rc.durable_at = self._clock()
         if self._persist and not self._b["persist"]:
             try:

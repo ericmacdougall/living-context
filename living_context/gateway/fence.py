@@ -76,11 +76,13 @@ class Aborted(Exception):
 
 
 def handoff(sock: socket.socket, data: bytes, fence: SendFence, check: Callable[[], bool], *,
-            before_write: Optional[Callable[[], None]] = None, capped: bool = True) -> int:
+            before_write: Optional[Callable[[], None]] = None, capped: bool = True,
+            blocking_timeout: Optional[float] = None) -> int:
     """One hand-off. Returns the bytes written (0 when the kernel queue is full or the data empty).
     Raises Aborted if `check()` fails (epoch flipped, boundary published). `before_write` is the
     test hook that pauses a sender between its final check and its socket write (E8 (d), R1).
-    `capped=False` is the broken variant that writes the whole buffer."""
+    `capped=False` is the broken variant that writes the whole buffer; `blocking_timeout` is the broken variant that writes it with a
+    blocking call while holding the shared side (a slow reader then holds up every revoke and erasure boundary)."""
     with fence.shared():
         if not check():
             raise Aborted()
@@ -88,6 +90,15 @@ def handoff(sock: socket.socket, data: bytes, fence: SendFence, check: Callable[
             before_write()
         if not data:
             return 0
+        if blocking_timeout is not None:
+            sock.settimeout(blocking_timeout)
+            try:
+                sock.sendall(data)
+                return len(data)
+            except OSError:
+                return 0
+            finally:
+                sock.setblocking(False)
         room = SEND_BOUND - queued(sock) if capped else len(data)
         if room <= 0:
             return 0
