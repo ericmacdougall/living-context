@@ -12,8 +12,10 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from evalkit import claude_cli as cc, fixture, dataset as ds, run_h1, run_s2
+from evalkit.eval_tenant import EvalTenant
 from evalkit.s2_ports import Journal
 from living_context.embed import e5, stub
 
@@ -193,6 +195,55 @@ class S2Body(unittest.TestCase):
             self.assertEqual(comp["A1_minus_A0"]["n"], 4)
             self.assertEqual(comp["A1_minus_A0_plus_LEN"]["n"], 4)
             self.assertEqual(comp["SHUFFLED_control"]["n"], 2)
+
+
+    def test_a_run_that_died_after_ingest_before_any_call_resumes_without_ingesting_and_under_a_corrected_commit(self):
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(EvalTenant, "build_and_publish", side_effect=KeyboardInterrupt):   # the process dies after ingest, before a call
+                with self.assertRaises(KeyboardInterrupt):
+                    self.go(d, Runner())
+            self.assertTrue((Path(d) / "tenant_state.json").exists())
+            self.assertFalse(any((Path(d) / f).exists() for f in ("counter", "calls.jsonl", "journal.jsonl", "BUILT.json")))
+            ra = args(d, resume=True, commit="def5678")
+            self.assertEqual([w for w in run_h1.check_prereqs(ra, embed=StandIn()) if "30 pilot" not in w], [])   # no charged call: a new commit is allowed
+            r = Runner()
+            with mock.patch.object(EvalTenant, "ingest", side_effect=AssertionError("must not ingest again")):
+                self.assertEqual(run_s2.run(ra, run_h1.pick_questions, embedder=StandIn(), runner=r, loader=loader), 0)
+            self.assertEqual(self.state(d)["state"], "COMPLETE")
+            self.assertEqual(self.state(d)["counter"], r.n)
+            stamp = json.loads((Path(d) / "STAMP.json").read_text())
+            self.assertEqual((stamp["commit"], stamp["earlier_commits"]), ("def5678", ["abc1234"]))
+
+    def test_a_new_commit_is_refused_once_a_call_was_charged(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(self.go(d, Runner(stop_at=5, stop_file=Path(d) / "STOP")), 3)
+            (Path(d) / "STOP").unlink()
+            why = run_h1.check_prereqs(args(d, resume=True, commit="def5678"), embed=StandIn())
+            self.assertTrue(any("commit differs" in w for w in why), why)
+
+    def test_leaves_read_back_from_the_index_equal_the_ones_ingest_built(self):
+        """A float32-valued vector (what the real embedder returns for a leaf of one window) comes back bit-identical; a float64 one comes
+        back rounded to float32, which is all the index keeps."""
+        import numpy as np
+        f32 = lambda t: np.asarray(stub.embed(t), dtype=np.float32).astype(np.float64).tolist()
+        for name, emb in (("s2readbacka", f32), ("s2readbackb", stub.embed)):
+            with tempfile.TemporaryDirectory() as d:
+                kw = dict(consts=None, embed=emb, query_embed=emb)
+                et = EvalTenant(URL, CA, PW, name, Path(d) / "t", **kw)
+                n = et.ingest([(HASHES[sid], t) for q in FX.questions for sid, t in q.sessions][:6])
+                et.save_state(Path(d) / "state.json")
+                again = EvalTenant(URL, CA, PW, name, Path(d) / "t", attach=True, **kw)
+                self.assertEqual(again.load_state(Path(d) / "state.json"), n)
+                self.assertEqual(again.load_leaves(n), n)
+                key = lambda r: (r.leaf_id, r.lv, r.text, r.title, r.size_tokens, r.subjects, r.src_seq)
+                self.assertEqual([key(r) for r in again.leaves], [key(r) for r in et.leaves])
+                for a, b in zip(again.leaves, et.leaves):          # same ids, versions, texts, titles, sizes, order; vectors as stated above
+                    want = b.embedding if emb is f32 else np.asarray(b.embedding, dtype=np.float32).astype(np.float64).tolist()
+                    self.assertEqual(a.embedding, want)
+                if emb is stub.embed:
+                    with self.assertRaises(RuntimeError):
+                        again.load_leaves(n + 1)
+                et.close(); again.close()
 
 
 if __name__ == "__main__":

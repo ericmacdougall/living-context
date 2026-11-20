@@ -51,6 +51,12 @@ def run(a, pick_questions, *, embedder=None, runner=None, loader=None) -> int:
         stamp.write_text(json.dumps({"stage": a.stage, "commit": a.commit, "cap": a.approved_cap, "approval_ref": a.approval_ref,
                                      "n_questions": a.n_questions, "a0_fields": a.a0_fields, "shuffled_n": int(getattr(a, "shuffled_n", 0) or 0), "embedder": e5.MODEL_ID,
                                      "started": time.time()}, sort_keys=True))
+    else:
+        old = json.loads(stamp.read_text())
+        if old.get("commit") != a.commit:        # `check_prereqs` allows this only for a run that never charged a call
+            old["earlier_commits"] = list(old.get("earlier_commits", [])) + [old.get("commit")]
+            old["commit"], old["restamped"] = a.commit, time.time()
+            stamp.write_text(json.dumps(old, sort_keys=True))
     if loader:
         dev, hashes, clusters = loader(a)
     else:
@@ -71,16 +77,20 @@ def run(a, pick_questions, *, embedder=None, runner=None, loader=None) -> int:
     fields = A0_FIELDS_TEXT if a.a0_fields == "text" else A0_FIELDS_STRONG
     built = run_dir / "BUILT.json"
     resumed_built = built.exists()
+    ingested = (run_dir / "tenant_state.json").exists()      # written right after a complete ingest
     et = EvalTenant(a.es_url, a.es_ca, a.es_pw_file, a.tenant, run_dir / "tenant", consts=consts, embed=pport.for_tenant(a.tenant),
-                    query_embed=qport.for_tenant(a.tenant), a0_fields=fields, attach=resumed_built)
+                    query_embed=qport.for_tenant(a.tenant), a0_fields=fields, attach=resumed_built or ingested)
     t0 = time.time()
-    if resumed_built:
-        # the tenant, its leaves and the published tree are intact (ids included): attach, do not ingest or build again
+    if resumed_built or ingested:
+        # the tenant and its leaves are intact (ids included): attach, do not ingest again; a tenant not yet built also gets its leaf
+        # list read back from the index (same order, text and vectors as ingest wrote), then is built below
         n_leaves = et.load_state(run_dir / "tenant_state.json")
         if et.leaf_count_in_es() != n_leaves:
             print("REFUSED: the tenant no longer holds the leaves of the earlier run; start a new run", flush=True)
             return 2
-        print("attached to the built tenant: %d leaves" % n_leaves, flush=True)
+        if not resumed_built:
+            et.load_leaves(n_leaves)
+        print("attached to the %s tenant: %d leaves" % ("built" if resumed_built else "ingested", n_leaves), flush=True)
     else:
         n_leaves = et.ingest(list(sessions.items()))
         et.save_state(run_dir / "tenant_state.json")

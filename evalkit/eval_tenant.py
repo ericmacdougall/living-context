@@ -10,6 +10,7 @@ Credentials are passed by PATH only (the files are read by the Elasticsearch cli
 from __future__ import annotations
 
 from pathlib import Path
+import numpy as np
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from living_context.config import Constants
@@ -123,6 +124,38 @@ class EvalTenant:
         self.leaf_session, self.session_tokens, self.max_seq = d["leaf_session"], d["session_tokens"], d["max_seq"]
         self._seen = set(self.session_tokens)
         return int(d["leaves"])
+
+    def load_leaves(self, expected: int) -> int:
+        """Rebuilds `self.leaves` (the tree builder's input) from the leaf index of an ingested tenant, in write order (the source
+        sequence). Text, title and size are what ingest held; a vector is the float32 the index stores, widened to float64: identical to
+        the one ingest held when that was float32-valued (a leaf of one embedding window), and rounded to float32 (relative error about
+        6e-8) for a leaf embedded in several windows, whose mean ingest held in float64. Used by a
+        resumed run whose ingest finished but whose build never started."""
+        out: List[LeafRec] = []
+        after = None
+        while True:
+            body = {"size": 500, "sort": [{"src_seq": "asc"}], "query": {"match_all": {}},
+                    "_source": ["text", "title", "size_tokens", "embedding", "src_seq"]}
+            if after is not None:
+                body["search_after"] = after
+            st, r = self.admin.request("POST", f"/lc-{self.tenant}-{CLS}-leaf/_search", body)
+            if st != 200:
+                raise RuntimeError("could not read the leaves back (status %s)" % st)
+            hits = r["hits"]["hits"]
+            if not hits:
+                break
+            for h in hits:
+                s = h["_source"]
+                lid, lv = h["_id"].rsplit(":", 1)
+                if lid not in self.leaf_session:
+                    raise RuntimeError("a leaf in the index is not in the saved state")
+                vec = np.asarray(s["embedding"], dtype=np.float32).astype(np.float64).tolist()     # the index keeps float32
+                out.append(LeafRec(lid, int(lv), s["text"], s["title"], vec, int(s["size_tokens"]), (), int(s["src_seq"])))
+            after = hits[-1]["sort"]
+        if len(out) != expected or len({l.leaf_id for l in out}) != expected:
+            raise RuntimeError("the leaf index holds %d leaves, the saved state %d" % (len(out), expected))
+        self.leaves = out
+        return len(out)
 
     @property
     def world(self) -> World:

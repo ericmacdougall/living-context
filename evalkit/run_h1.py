@@ -74,8 +74,12 @@ def check_prereqs(a, *, embed=embed_stub.embed) -> List[str]:
             old = json.loads(stamp.read_text())
         except ValueError:
             old = {}
+        rd = Path(a.run_dir)
+        charged = any((rd / f).exists() for f in ("counter", "calls.jsonl", "journal.jsonl"))
         for k, now in (("commit", a.commit), ("cap", a.approved_cap), ("n_questions", a.n_questions), ("a0_fields", getattr(a, "a0_fields", "strong")),
                          ("shuffled_n", int(getattr(a, "shuffled_n", 0) or 0))):
+            if k == "commit" and not charged:
+                continue      # a run that never charged a call may continue under a corrected commit; the stamp records the earlier one
             if old.get(k, 0 if k == "shuffled_n" else None) != now:
                 why.append("--resume must continue the same run: %s differs from the stamp (a new cap needs a new approval and a new run)" % k)
     if a.stage in ("S2", "S3") and (Path(a.run_dir) / "STOP").exists():

@@ -50,6 +50,10 @@ python -m evalkit.run_h1 --stage S2 --dataset <dataset> --es-url <es-url> --es-c
   `--a0-fields`; anything else is refused (a different cap needs a new approval and a new run). A resumed run attaches to the built
   tenant, skips completed questions, answers every already-paid call from the journal and charges only new work. One call that was
   charged but whose answer was lost when the process died is not repeated: it counts as a failed call (`lost_in_flight`).
+- A run that died after its ingest but before its first call (no counter, call log or journal; `tenant_state.json` present) resumes
+  by attaching to the ingested tenant and reading its leaves back from the index, with no second ingest. Only such a run, which has
+  charged nothing, may be resumed under a corrected commit; the stamp then records the earlier commit. Once a call was charged, the
+  commit must match the stamp.
 - Exit codes: 0 complete, 3 stopped, 4 cap reached, 5 a build call failed after its retries, 75 paused by throttling, 2 refused to
   start. 3, 4 and 75 keep a resumable state (4 resumes only under the same cap, so it ends the stage).
 

@@ -44,10 +44,16 @@ class Guards(unittest.TestCase):
         d = tempfile.mkdtemp()
         Path(d, "STAMP.json").write_text(json.dumps({"commit": "abc1234", "cap": 6000, "n_questions": 30, "a0_fields": "strong"}))
         self.assertEqual(run_h1.check_prereqs(args(run_dir=d, resume=True), embed=real_embed), [])
+        # a run that never charged a call may continue under a corrected commit; every other stamped value must match
+        self.assertEqual(run_h1.check_prereqs(args(run_dir=d, resume=True, commit="zzz"), embed=real_embed), [])
+        Path(d, "counter").write_text("1")                                  # one charged call: the commit must match too
         for kw, word in ((dict(commit="zzz"), "commit"), (dict(approved_cap=9000), "cap"), (dict(a0_fields="text"), "a0_fields")):
             why = " ".join(run_h1.check_prereqs(args(run_dir=d, resume=True, **kw), embed=real_embed))
             self.assertIn("differs from the stamp", why)
             self.assertIn(word, why)
+        Path(d, "counter").unlink()
+        for kw, word in ((dict(approved_cap=9000), "cap"), (dict(a0_fields="text"), "a0_fields")):    # never relaxed, charged or not
+            self.assertIn(word, " ".join(run_h1.check_prereqs(args(run_dir=d, resume=True, **kw), embed=real_embed)))
 
     def test_a_stop_file_blocks_start_and_resume(self):
         d = tempfile.mkdtemp()
