@@ -322,7 +322,7 @@ class Boot(Base):
             n = 0
 
             def request(inner, method, path, body=None, **kw):
-                if method == "POST" and path.endswith("/_search"):
+                if method == "POST" and "/_search" in path:
                     Flaky.n += 1
                     if Flaky.n == 2:
                         return 429, {}

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 
-ORIGINS = ("agent", "human", "import")
+ORIGINS = ("agent", "human", "import", "unknown")   # unknown: a legacy item without provenance, treated as the least trusted
 VIAS = ("recall", "injection", "fetch")
 _ATTR = re.compile(r"^[a-z0-9 _-]{0,32}$")
 _PTR = re.compile(r"^[a-z2-7]{1,400}$")

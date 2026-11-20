@@ -323,7 +323,7 @@ class Sessions:
             raise TokenError("unavailable")
         if parent.parent and not self._bt["depth"]:
             raise TokenError("scope_widened")   # a child cannot delegate
-        ttl = self.lifetime(ttl_s, self._c.token_ttl_s)
+        ttl = self.lifetime(ttl_s, math.inf)    # finite and positive; never clipped, so a longer child is refused below
         now = self._clock()
         child_scope: dict = {}
         for pid, ops in scope.items():

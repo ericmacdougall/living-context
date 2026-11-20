@@ -140,7 +140,7 @@ class Delegation(Base):
 
     def test_broken_delegation_variants_accept_what_the_real_code_refuses(self):
         for flag, scope_of, ttl in (("broken_scope_not_attenuated", lambda a, b: {b: q("save")}, 60),
-                                    ("broken_ttl_not_capped", lambda a, b: {a: q("query")}, 10**6)):
+                                    ("broken_ttl_not_capped", lambda a, b: {a: q("query")}, 7200)):   # past the parent, inside max_age
             w = World(tempfile.mkdtemp(), sess_kw={flag: True}).start()
             a, b = w.pool("alpha", ops={"query", "save", "update"}), w.pool("beta", ops={"query", "save"})
             r = w.mint("alice", {a: q("query", "save"), b: q("query")})
