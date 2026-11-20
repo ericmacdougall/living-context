@@ -148,6 +148,17 @@ Each entry names the passages, the reading the build follows and the test that k
 
 - The kNN probe asks for `rescore_vector` with an oversample of 3, so candidates are scored on the full-precision vectors. Without it,
   2 of 30 fresh positive-control runs on the test cluster saw the best score of the canary's own copy at about 0.95, under the 0.99 threshold
-  (int8-quantised HNSW over very small segments), and the control raised `knn found nothing`; with it, 40 of 40 runs found the copy.
+  (int8-quantised HNSW over very small segments), and the control raised `knn found nothing`; with it, 40 of 40 runs found the copy (the rescored best score printed in a run was 1.0000).
   A miss of that kind in a residue run would be a false "clean", so the probe must not depend on the quantisation of a small segment.
   The control raises loudly when it is blind; the residue run is valid only against a control of the same shape.
+
+## Holds against the closure, and what a signature binds (DESIGN 14.1, 4.4; ASSUMPTION, listed by the Step 14 and 15 close-out)
+
+- A hold is matched against the closure under the write gate, before the journal append: a hold on a leaf the closure reaches, or on a
+  subject token of a leaf it reaches, queues the request (nothing is published, deleted or rewritten). A hold on a person therefore also
+  stops the erasure of one of their items, and a hold on one leaf stops the erasure of a subject whose closure contains it. The
+  erasure of another person whose closure merely contains a held person's mention is queued too (the safe direction: a hold wins).
+- A first administrator's signature on a two-administrator operation counts for the same action on the same target only (revoke,
+  removal of one class, or a re-grant with those roles and sets); a re-grant that takes a role or a class from an administrator or a
+  revoker is such an operation, and one that takes something from anyone else ends that principal's sessions (an epoch bump).
+- Removing a class grant is a tenant administrator's call; a revoker has the single revoke call (4.3).
