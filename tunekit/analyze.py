@@ -134,14 +134,26 @@ def signal_tables(cells: List[dict], resamples: int) -> List[dict]:
             continue
         g[(d["_run"], c.growth, c.level, c.n)].append(d)
     out = []
+    pooled: Dict[tuple, List[dict]] = defaultdict(list)
     for (run, growth, level, n), ds in sorted(g.items(), key=lambda kv: (kv[0][1], kv[0][2], kv[0][3])):
         rows = load_rows(Path(run), [d["cell"] for d in ds])
+        for r in rows:
+            r["n_leaves"] = n
+        pooled[(growth, level)] += rows
+        pooled[(growth, "all")] += rows
         for which in ("point", "set"):
             sub = [r for r in rows if (r["kind"] == "set") == (which == "set")]
             if not sub:
                 continue
             p = signals.predictive_power(sub, resamples=resamples)
             out.append({"questions": which, "growth": growth, "level": level, "n_leaves": n, "seeds": len(ds), **p})
+    for (growth, level), rows in sorted(pooled.items(), key=lambda kv: (kv[0][0], str(kv[0][1]))):
+        for which in ("point", "set"):
+            sub = [r for r in rows if (r["kind"] == "set") == (which == "set")]
+            if not sub:
+                continue
+            p = signals.predictive_power(sub, resamples=resamples)
+            out.append({"questions": which, "growth": growth, "level": level, "n_leaves": "all sizes", "seeds": "pooled", **p})
     return out
 
 
