@@ -901,6 +901,7 @@ the tier code.
 | Adaptive state holds scalars derived from the pool | Counts and timestamps only; not content; recomputed from live data |
 | A tree has upkeep costs | After adoption each batch rebuild calls the model per level-1 node with pending members (DESIGN 7.6) |
 | One principal can still help meet the difficulty gate | Its share is capped at `U_PRINC`; the cost it can cause is the transition bound and the backoff |
+| After a failed attempt and a mass erasure, re-proposal waits for regrowth | The next attempt needs `RHO_RETRY` times the size at the last outcome, and `N_BACK` does not waive it; this keeps the spend bound of 5.4 |
 
 ## 13. Conflicts with DESIGN, and the edit that resolves each
 
