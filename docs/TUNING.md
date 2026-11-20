@@ -1,6 +1,6 @@
 # living-context: tuning the adaptive and pool defaults (plan)
 
-Status: plan, revision 2, not yet run, and no paid stage in it is approved. It is
+Status: plan, revision 3, not yet run, and no paid stage in it is approved. It is
 not a pre-registration of any confirmatory claim; the registered experiment
 ([EXPERIMENT.md](EXPERIMENT.md)) is unchanged, and this plan never touches its
 held-out test split or its fresh set. Companion files: [ADAPTIVE.md](ADAPTIVE.md)
@@ -35,18 +35,18 @@ development portions.
 | Id | Default (file) | Trades off | Tuned against | Data | Class |
 |---|---|---|---|---|---|
 | D1 | `N_FLOOR = F_MAX x F_TARGET` (ADAPTIVE 4.3) | a "tree" with no upper level vs flat | derived, not tuned; verified: at or below it a bulk build has no upper level | SYN | zero-call |
-| D2 | memory gate `N_UP1`, `T_UP1`, `S_UP1`, `E_UP1` (ADAPTIVE 4.3); `N_BACK` is absolute and not tuned | model calls of a tree vs recall lost by staying flat | the smallest grid size `N*` at which tree minus flat recall@10 has a lower bound above 0 (4.3) | DEV for the level, SYN for the shape | paid |
+| D2 | memory gate `N_UP1`, `T_UP1`, `S_UP1`, `E_UP1` (ADAPTIVE 4.3), per-writer caps `S_PRINC`, `E_PRINC` (ADAPTIVE 4.1); `N_BACK` is absolute and not tuned | model calls of a tree vs recall lost by staying flat | the smallest grid size `N*` at which tree minus flat recall@10 has a lower bound above 0 (4.3) | DEV for the level, SYN for the shape | paid |
 | D3 | difficulty gate `W_UNITS`, `R_MIN`, `H_UP1`, `TAU_RE`, unit caps `U_SESS`, `U_PRINC`, `F_FAIL_MAX` (ADAPTIVE 4.1, 4.3) | a tree built too early vs too late; dilution vs flooding | AUROC lower bound of `hard(unit)` against "flat missed a gold item in its top 10" | SYN, DEV, DL | zero-call |
 | D4 | per-query rule `A_MIN`, `G_MIN`, `S_MAX`, `EPS_ESC` (ADAPTIVE 6.2) | full-path calls saved vs recall lost on queries called easy | non-inferiority of rule-gated against always-full recall@10; share kept flat | features on SYN and DEV flat arms; gain from P1's recorded outputs | zero-call, plus analysis of P1 |
-| D5 | hysteresis and backoff `E_CONSEC`, `EVAL_PERIOD`, `A_EVERY`, `D_DWELL`, `D_DWELL1`, `COOL_BASE`, `COOL_MAX`, `RHO_DOWN`, `RHO_RETRY`, `E_ABORT_MAX`, `T_PAR`, `LEASE_BEAT` (ADAPTIVE 4.4, 5.6) | reaction delay vs false moves and repeated attempts | delay from threshold crossing to move; false moves on stationary traces; attempts and spend on growth traces with failing probations | SYN traces | zero-call |
+| D5 | hysteresis and backoff `E_CONSEC`, `EVAL_PERIOD`, `A_EVERY`, `D_DWELL`, `D_DWELL1`, `COOL_BASE`, `COOL_MAX`, `RHO_DOWN`, `RHO_RETRY`, `E_ABORT_MAX`, `T_PAR`, `LEASE_BEAT`, the down-move fence wait `J_WAIT` (ADAPTIVE 4.4, 5.6) | reaction delay vs false moves and repeated attempts | delay from threshold crossing to move; false moves on stationary traces; attempts and spend on growth traces with failing probations | SYN traces | zero-call |
 | D6 | stage 2 trigger `R2_MIN`, `H_UP2`, `M_UP2` (ADAPTIVE 4.3) | loop and typing cost vs repair of misses | stage 2 entered only with opened-share bounds held and persistent demand; the value of stage 2 is the loop's own experiment and is not decided here | SYN | zero-call |
-| D7 | probation `N_PROB`, `G_KEEP` (ADAPTIVE 5.3) | rolling back a useful tree vs keeping a useless one | rollback rate of a random-router tree; keep rate of trees that help | stub on SYN; P1's recorded outputs with gold items as opens | zero-call, plus analysis of P1 |
+| D7 | probation `N_PROB`, `G_KEEP`, `P_MIN`, `D_PROB`, `EPS_IL` (ADAPTIVE 5.3) | rolling back a useful tree vs keeping a useless one; probation latency and spend vs evidence | rollback rate of a random-router tree and keep rate of trees that help, both credited by opens through the team-draft interleave | stub on SYN; P1's recorded outputs with gold items as opens | zero-call, plus analysis of P1 |
 | D8 | rollover `B_SHARD_TARGET`, `AGE_ROLL` (ADAPTIVE 4.5) | shard count vs latency | p95 search latency, indexing rate and shard count against document count on the host | SYN documents | zero-call |
 | D9 | pool selection `P_ALL`, `P_MAX`, `TAU_CARD` (POOLS 4.2) | pools queried per recall vs the answer's pool being skipped | answer-pool hit rate (Wilson lower bound) | SYN layouts above `P_ALL`; DL multi-session sets | zero-call |
-| D10 | merge `K_POOL`, `K_TOTAL`, `R_CAP` (POOLS 5.1, 5.3) | breadth across pools vs depth in one; calls per recall | merged recall@10 against a per-pool oracle; small-pool starvation rate | SYN, DEV, DL | zero-call |
+| D10 | merge `K_POOL`, `K_TOTAL`, `R_CAP`, the flat floor `D_FLOOR` (POOLS 5.1, 5.3) | breadth across pools vs depth in one; calls per recall | merged recall@10 against a per-pool oracle; small-pool starvation rate | SYN, DEV, DL | zero-call |
 | D11 | injection triggers `TAU_SHIFT`, `SHIFT_WINDOW`, `MIN_TURN_TOKENS`, `I_RANK` (POOLS 6.2) | missed topic shifts vs spurious injections | trigger recall and precision against planted shifts | SYN conversations (G7) | zero-call |
 | D12 | injection bounds `I_PER_TURN`, `I_TOKENS`, `I_COOLDOWN`, `I_SESSION` (POOLS 6.3) | usefulness vs prompt noise | tokens per turn and session, repeat rate (must be 0), relevant share | SYN | zero-call |
-| D13 | `TOKEN_TTL`, `max_age`, `TOK_LIVE_MAX`, `SAVE_MAX`, `SAVE_RATE`, `RETRACT_MAX`, `RETRACT_RATE`, `R_SESSION` (POOLS 2.3, 2.6, 3, 5.3) | convenience vs exposure and cost | set by the security review and measured agent usage (renewals per session, save sizes); never tuned on retrieval data | SYN usage scripts | zero-call |
+| D13 | `TOKEN_TTL`, `max_age`, `TOK_LIVE_MAX`, `SAVE_MAX`, `SAVE_RATE`, `RETRACT_MAX`, `RETRACT_RATE`, `RETRACT_POOL_RATE`, `R_SESSION`, `R_PRINC`, `MINT_RATE`, `CONV_IDLE` (POOLS 2.3, 2.6, 2.8, 3, 3.5, 5.3) | convenience vs exposure and cost | set by the security review and measured agent usage (renewals per session, save sizes); never tuned on retrieval data | SYN usage scripts | zero-call |
 
 Every default has a criterion: D2 to D12 in section 6 (AT-1 to AT-9), D1 by its
 derivation check (Z3), D13 by the security review, which records the value and the
@@ -166,7 +166,8 @@ Statistics follow EXPERIMENT 7 and 11: clustered paired bootstrap over questions
 for single rates. Interval half-width for a paired recall difference at the standard
 deviation of EXPERIMENT 7.2 (about 0.45, an upper figure because most paired
 differences are 0): `1.96 x 0.45 / sqrt(n)`, so 0.10 at n = 80, 0.14 at n = 40,
-0.020 at n = 2,000, and 0.014 at n = 4,000. A non-inferiority margin of 0.02 has
+0.050 at n = 312 (`(1.96 x 0.45 / 0.05)^2 = 311.2`, rounded up), 0.020 at n =
+2,000, and 0.014 at n = 4,000. A non-inferiority margin of 0.02 has
 power 0.8 at a true difference of 0 only at n of about 4,000.
 
 General rules, fixed before any run:
@@ -183,12 +184,12 @@ General rules, fixed before any run:
 
 | Default | Rule | Sample size |
 |---|---|---|
-| D2 | grid 2,000, 6,000 and the full development pool (about 18,900 leaves; the cost below is computed at 20,000); `N*` = the smallest grid size where tree minus flat recall@10 on the DEV tuning part has a lower bound above 0; `N_UP1 = N* / 1.5` (ASSUMPTION: the lead time of a transition); if no size qualifies, `N_UP1` = the largest tested size, reported NOT ESTABLISHED, so without evidence the shipped default builds trees late, not early. `T_UP1`, `S_UP1`, `E_UP1` are the same quantities measured at `N_UP1`. A denser grid near `N*` is a later stage once P1 shows where it lies | about 80 DEV questions per size (half-width 0.10: the measured direction at 6,000, about +0.10 to +0.13, is near the edge, so NOT ESTABLISHED is a likely outcome and is stated in advance) |
-| D3 | `H_UP1`, `TAU_RE` at the operating point with AUROC lower bound at least 0.65 (ASSUMPTION); a feature with lower bound not above 0.55 is dropped; `U_SESS`, `U_PRINC` from G8 so that one scripted principal moves `hard_rate` by at most 0.25 | at least 1,000 synthetic units per size; all DEV and DL questions with gold, at least 30 positives |
+| D2 | grid 2,000, 6,000 and the full development pool (about 18,900 leaves; the cost below is computed at 20,000); `N*` = the smallest grid size where tree minus flat recall@10 on the DEV tuning part has a lower bound above 0; `N_UP1 = N* / 1.5` (ASSUMPTION: the lead time of a transition); if no size qualifies, `N_UP1` = the largest tested size, reported NOT ESTABLISHED, so without evidence the shipped default builds trees late, not early. `T_UP1`, `S_UP1`, `E_UP1` are the same quantities measured at `N_UP1`. A denser grid near `N*` is a later stage once P1 shows where it lies | about 80 DEV questions per size (half-width 0.10: the measured direction at 6,000, about +0.10 to +0.13, is near the edge, so NOT ESTABLISHED is a likely outcome and is stated in advance; resolving it needs about 312 questions per size, costed in Q8). `S_PRINC`, `E_PRINC` are not tuned for recall: each is fixed at a quarter of `S_UP1`, `E_UP1` (half of `RHO_DOWN` times them), so one writer cannot hold a pool above its down threshold |
+| D3 | `H_UP1`, `TAU_RE` at the operating point with AUROC lower bound at least 0.65 (ASSUMPTION); a feature with lower bound not above 0.55 is dropped; `U_SESS` from G8; `U_PRINC` such that `U_PRINC / W_UNITS` stays strictly below every threshold a unit share feeds (the lowest is `RHO_DOWN x H_UP2`, 0.075 by default), verified on G8 by one scripted principal with many root tokens and conversations moving `hard_rate` by at most `U_PRINC / W_UNITS` | at least 1,000 synthetic units per size; all DEV and DL questions with gold, at least 30 positives |
 | D4 | the largest flat-sufficient share such that rule-gated minus always-full fused recall@10 has lower bound at least -0.02 on SYN; on DEV the same difference is reported (its n cannot resolve 0.02) | at least 4,000 synthetic queries per size; DEV reported |
-| D5 | the smallest `E_CONSEC` and `EVAL_PERIOD` such that the false-move rate on stationary noise traces below a threshold has a Wilson upper bound at most 0.01 per pool-month, then the shortest `D_DWELL` with the same bound on oscillating traces; `COOL_BASE`, `RHO_RETRY` such that, on a growth trace whose every probation fails, attempts are at most `ceil(log_1.5(N_end / N_first)) + 1` and spend is at most `9 x build(N_end, 2)` (the move-per-dwell bound holds by construction and is not a criterion) | 1,000 traces per scenario |
+| D5 | the smallest `E_CONSEC` and `EVAL_PERIOD` such that the false-move rate on stationary noise traces below a threshold has a Wilson upper bound at most 0.01 per pool-month, then the shortest `D_DWELL` with the same bound on oscillating traces; `COOL_BASE`, `RHO_RETRY` such that, on a growth trace whose every probation fails, attempts are at most `ceil(log_1.5(N_end / N_first)) + 1` and spend, probation included, is at most `9 x build(N_end, 2) + A(N_end) x 3,600` (ADAPTIVE 5.4); `J_WAIT` at the 99th percentile of placement and link job time on the stub's profile, so a cancel is rare and its leaf only turns flat (the move-per-dwell bound holds by construction and is not a criterion) | 1,000 traces per scenario |
 | D6 | the smallest `R2_MIN` such that no trace with opened share outside the DESIGN 9 bounds enters stage 2, and `H_UP2`, `M_UP2` at the AUROC rule of D3 against "link expansion offered an opened item" on SYN | 1,000 traces |
-| D7 | the smallest `N_PROB` and the `G_KEEP` such that a random-router tree (stub) is rolled back in at least 95% of seeded runs and the P1 trees at sizes where tree minus flat has a positive point estimate are kept in at least 95% of bootstrap resamples, opens modelled as gold items (ASSUMPTION; real opens differ); if both cannot hold, placeholders kept, NOT ESTABLISHED | 400 seeded runs; P1's outputs |
+| D7 | the smallest `N_PROB` and the `G_KEEP` such that a random-router tree (stub, in recalls whose gold items span two pools) is rolled back in at least 95% of seeded runs and the P1 trees at sizes where tree minus flat has a positive point estimate are kept in at least 95% of bootstrap resamples, both with credit by the team-draft interleave of ADAPTIVE 5.3 replayed on the recorded fused and direct lists, opens modelled as gold items (ASSUMPTION; real opens differ); if both cannot hold, placeholders kept, NOT ESTABLISHED. `P_MIN`, `D_PROB` and `EPS_IL` are not tuned for recall: `P_MIN` 3 is the smallest count for which leave-one-principal-out leaves two, `D_PROB` bounds the reader latency window, and `EPS_IL` is reported with the interval it gives the down-move test | 400 seeded runs; P1's outputs |
 | D8 | the largest shard size at which p95 search latency is at most 2 times the value at 1 GiB on the same host (factor 2 an ASSUMPTION) | 5 runs per setting, medians with ranges |
 | D9 to D12 | the setting with the highest lower bound of its primary metric within its cost ceiling (pools queried, injected tokens), on tuning seeds | at least 1,000 synthetic items per cell |
 
@@ -227,11 +228,13 @@ probes.
 
 - Build: 133 + 399 + 1,334 = 1,866 (at 20,000 as the upper size), up to 3,732 with
   the retry allowance of DESIGN 18.1.
-- Recalls: 3 sizes x 80 questions x 67 = 16,080. This is an upper figure: the
-  counter caps each recall at `r_max` (56, 72 and 53 at the three sizes), so
-  recalls cannot exceed 80 x (56 + 72 + 53) = 14,480.
-- P1 total: 17,946 to 19,812 calls. Level-1 input tokens: about 1,750 level-1 calls
-  at about 15,000 tokens, about 26 million.
+- Recalls: the counter caps each recall at `r_max` (56, 72 and 53 at the three
+  sizes). At the measured 67 where it is under the cap and at the cap elsewhere:
+  80 x (56 + 67 + 53) = 14,080; with every recall at its cap: 80 x (56 + 72 + 53)
+  = 80 x 181 = 14,480, which recalls cannot exceed.
+- P1 total: 1,866 + 14,080 = 15,946 expected, at most 3,732 + 14,480 = 18,212 (build
+  retries and every recall at its cap), which is the stage's hard cap. Level-1
+  input tokens: about 1,750 level-1 calls at about 15,000 tokens, about 26 million.
 - Its recorded outputs (fused and direct lists, per item) give D4's escalation gain
   and D7's real-tree side by analysis at 0 calls. It also measures calls per recall
   at each size. Stop rule: if more than 10% of the first size's recalls end with
@@ -240,7 +243,8 @@ probes.
 
 P6. Held-out check on the DEV held-out part, once, after the defaults are frozen.
 The trees are question-independent (probes are never stored), so P1's trees are
-reused and P6 pays recalls only: 3 x 40 x 67 = 8,040 calls.
+reused and P6 pays recalls only: 40 x 176 = 7,040 expected, at most 40 x 181 =
+7,240 calls.
 
 There is no separate ADAPT arm on DEV. Below `N_UP1` ADAPT is stage 0, which is the
 flat arm (0 calls); after its transition its tree is the same bulk build as
@@ -250,9 +254,10 @@ reported, and the transition mechanism is decided on SYN (Z5).
 | Stage | Calls | Needed for |
 |---|---|---|
 | Z1 to Z6 | 0 | D1, D3 to D13 mechanisms and levels; AT-2, AT-4 to AT-6, AT-8, AT-9 |
-| P1 | 17,946 to 19,812 | D2, D4's gain, D7 on real trees, AT-1's timing |
-| P6 | 8,040 | the held-out check of AT-1 and D2 |
-| Total | about 26,000 to 27,900 | |
+| P1 | 15,946 to 18,212 | D2 (likely NOT ESTABLISHED at 80 per size, 4.3), D4's gain, D7 on real trees, AT-1's timing |
+| P6 | 7,040 to 7,240 | the held-out check of AT-1 and D2 |
+| Total | 22,986 to 25,452 | |
+| D2 resolution (not planned; Q8) | 54,912 to 60,204 | `N*` at half-width 0.05 |
 
 Revision 1 stated 16,400 to 40,700 calls, with a replay gate and an ADAPT arm,
 using 25 to 77 calls per recall; at the measured 67 its count was about 37,300.
@@ -285,10 +290,13 @@ is reported NOT ESTABLISHED, not passed.
 - AT-4 The state machine is bounded. Verify by: on held-out traces, false moves on
   stationary traces within the D5 bound; on growth traces with probation outcomes
   drawn as kept with probability p, for p in {0, 0.25, 0.5, 1}, attempts within the
-  D5 bound and total spend at most `9 x build(N, 2)` (counter); no proposal at or
-  below `N_FLOOR`; stage 2 entered on no trace with opened share outside the DESIGN
-  9 bounds (D6); the random-router tree rolled back in at least 95% of runs and the
-  stub tree kept in at least 95% (D7).
+  D5 bound and total spend, probation included, at most `9 x build(N, 2) + A(N) x
+  3,600` (counter); no proposal at or below `N_FLOOR`; stage 2 entered on no trace
+  with opened share outside the DESIGN 9 bounds (D6); with credit by the team-draft
+  interleave, the random-router tree (in recalls whose gold items span two pools)
+  rolled back in at least 95% of runs and the stub tree kept in at least 95% (D7);
+  a void, short or single-principal probation never keeps a tree; one principal
+  with many root tokens never meets the difficulty gate alone.
 - AT-5 Pool selection. Verify by: on held-out layouts with more than `P_ALL` granted
   pools, decoy cards and cards from the second generator, the share of questions
   whose granted answer pool is in `S` has a Wilson lower bound of at least 0.90 (at
@@ -326,11 +334,11 @@ is set when it is proposed, from P1's measured variance; it is not counted here.
 
 | Id | Question | Default in force |
 |---|---|---|
-| Q8 | Approve P1, the first paid tuning stage, at 17,946 to 19,812 model calls (cap 19,812; stop and re-count if more than 10% of the first size's recalls are cut by the per-recall cap), and later P6 at 8,040? | not run until approved; recommended yes for P1, P6 asked again with P1's results |
+| Q8 | (a) Approve P1, the first paid tuning stage, at 15,946 model calls expected and a hard cap of 18,212 (stop and re-count if more than 10% of the first size's recalls are cut by the per-recall cap), and later P6 at 7,040 to 7,240? P1 will likely leave D2 (when a pool should get a tree) NOT ESTABLISHED: at 80 questions per size the half-width is 0.10 and the measured direction is +0.10 to +0.13 (4.3), so the shipped default would then build trees late. (b) Fund resolving D2 at half-width 0.05? That needs `(1.96 x 0.45 / 0.05)^2 = 311.2`, so 312 tuning questions per size, and the DEV set has 120 questions in all (80 tuning), so 232 or more new questions with gold labels from a source beyond DEV, approved like any download (Q9). Recalls: 312 x 176 = 54,912 expected, at most 312 x 181 = 56,472 over the three sizes (232 x 176 = 40,832 to 232 x 181 = 41,992 if P1's 80 count toward it); builds 0 if the questions are over the same development pool (trees are question-independent, so P1's are reused), else 1,866 to 3,732 for a new pool. In all 54,912 to 60,204 calls standalone. | (a) not run until approved, recommended yes for P1, P6 asked again with P1's results; (b) not funded, and D2 ships NOT ESTABLISHED at the largest tested size unless the owner funds it |
 | Q9 | Approve the downloads, file by file, after licence, size and format are checked (section 3)? | none downloaded; recommended one candidate at a time, starting with the retrieval sets for D3 and D4 |
 
 The margins and bounds of section 6 are design decisions, not owner questions.
-POOLS 12 (Q1 to Q5) and ADAPTIVE 15 (Q6, Q7) hold the other owner questions.
+POOLS 12 (Q1 to Q4) and ADAPTIVE 15 (Q6, Q7) hold the other owner questions.
 
 ## 8. Edits to make in EXPERIMENT when this is adopted
 
