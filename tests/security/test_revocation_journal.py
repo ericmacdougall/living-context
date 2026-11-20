@@ -144,6 +144,45 @@ class FailClosed(Base):
         rc = s.revoke("p1")
         self.assertEqual((s.state, rc.durable_at), (FAULT, None))
 
+    def check_enospc(self, **kw):
+        import errno
+
+        class FullIO(RealIO):
+            full = False
+
+            def pwrite(self, fd, data, offset):
+                if self.full:
+                    raise OSError(errno.ENOSPC, "No space left on device")
+                super().pwrite(fd, data, offset)
+
+        io = FullIO()
+        s = self.svc(io=io, **kw)
+        s.start()
+        io.full = True      # the journal's volume is out of space
+        t0 = time.time()
+        rc = s.revoke("p1")
+        self.assertTrue(self.epochs.is_revoked(T, "p1"), "the revoke was not denied in memory")
+        self.assertLess(time.time() - t0, 2.0)
+        self.assertIsNone(rc.durable_at)
+        self.assertEqual((s.state, s.admit()), (FAULT, False), "a journal error left the tenant admitted")
+        other = Path(self.tmp.name) / "other"      # another tenant's journal is a separate file: its revoke is unaffected
+        epoch_journal.provision(other, self.size)
+        ep2 = EpochTable(lambda t: self.fence)
+        s2 = RevocationService("tenbbb", ep2, other)
+        self.addCleanup(lambda: s2._j and s2._j.close())
+        s2.start()
+        self.assertIsNotNone(s2.revoke("q1").durable_at)
+        s.clean_stop()
+        self.assertEqual(self.svc().start(), FAULT, "a tenant closed by a journal error was readmitted after a restart")
+
+    def test_a_full_journal_volume_closes_the_tenant_keeps_the_denial_and_leaves_other_tenants_alone(self):
+        self.check_enospc()
+
+    def test_broken_journal_error_that_does_not_close_the_tenant_is_red(self):
+        with self.assertRaises(AssertionError) as cm:
+            self.check_enospc(broken_journal_error_keeps_tenant_open=True)
+        self.assertIn("left the tenant admitted", str(cm.exception))
+
     def check_stays_closed(self, **kw):
         s = self.svc(io=SlowIO(0.3), d_fsync_s=0.1, **kw)
         s.start()

@@ -38,7 +38,7 @@ def tok(tenant, who):
 
 
 class World:
-    def __init__(self, test, **admin_kw):
+    def __init__(self, test, sessions_kw=None, writers=None, **admin_kw):
         self.tmp = tempfile.TemporaryDirectory()
         test.addCleanup(self.tmp.cleanup)
         d = Path(self.tmp.name) / T
@@ -49,9 +49,9 @@ class World:
         test.addCleanup(lambda: self.svc._j and self.svc._j.close())
         assert self.svc.start() == OPEN
         self.store = GrantStore()
-        self.sessions = Sessions({T: Idp(), "sysop": Idp()}, self.ep, tok, lambda t, p: self.store.get(t, p))
+        self.sessions = Sessions({T: Idp(), "sysop": Idp()}, self.ep, tok, lambda t, p: self.store.get(t, p), **(sessions_kw or {}))
         self.admin = Admin(self.store, self.ep, {T: LAT}, lambda t: self.svc, tok, **admin_kw)
-        self.gw = Gateway(None, self.sessions, {T: LAT}, admin=self.admin)
+        self.gw = Gateway(None, self.sessions, {T: LAT}, writers=writers, admin=self.admin)
         for a in ("a1", "a2", "a3"):
             self.grant(T, a, {Role.TENANT_ADMIN})
         self.grant(T, "rv", {Role.REVOKER})
@@ -138,6 +138,33 @@ class PeopleOps(unittest.TestCase):
         self.assertEqual(w.call("a2", op="revoke", who="rv"), {"ok": False, "error": "pending"})
         self.assertFalse(w.revoked("rv"))
 
+    def check_privileged_reduction(self, **kw):
+        w = World(self, **kw)
+        victim = w.login("a2")
+        first = w.call("a1", op="grant", who="a2", grant_roles=["reader"], read=["base"])
+        self.assertIn(Role.TENANT_ADMIN, w.store.get(T, "tok-a2").roles, "one administrator took another's role away alone")
+        self.assertEqual(first, {"ok": False, "error": "pending"})
+        self.assertTrue(w.call("a3", op="grant", who="a2", grant_roles=["reader"], read=["base"]).get("ok"))
+        self.assertEqual(w.store.get(T, "tok-a2").roles, frozenset({Role.READER}))
+        self.assertIsNone(w.sessions.resolve(victim))
+        # a signature for one action does not complete another
+        self.assertEqual(w.call("a1", op="remove_class", who="rv", cls="restricted"), {"ok": False, "error": "pending"})
+        r = w.call("a3", op="revoke", who="rv")
+        self.assertFalse(r.get("ok") and w.revoked("rv"), "a signature for removing a class completed a revoke")
+
+    def test_taking_a_role_from_an_administrator_needs_two_administrators_and_a_signature_binds_its_action(self):
+        self.check_privileged_reduction()
+
+    def test_broken_single_administrator_re_grant_of_an_administrator_is_red(self):
+        with self.assertRaises(AssertionError) as cm:
+            self.check_privileged_reduction(broken_single_admin_revokes_privileged=True)
+        self.assertIn("took another's role away alone", str(cm.exception))
+
+    def test_broken_signature_not_bound_to_its_action_is_red(self):
+        with self.assertRaises(AssertionError) as cm:
+            self.check_privileged_reduction(broken_signature_not_bound_to_action=True)
+        self.assertIn("completed a revoke", str(cm.exception))
+
     # ---- class-grant removal is an epoch bump -----------------------------------------------------------------------------
     def check_class_removal(self, **kw):
         w = World(self, **kw)
@@ -152,6 +179,7 @@ class PeopleOps(unittest.TestCase):
         self.assertEqual(w.sessions.principal(new).read_set, frozenset({"base"}))
         self.assertFalse(w.revoked("r1"), "removing a class revoked the principal")
         self.assertFalse(w.call("r2", op="remove_class", who="r1", cls="base").get("ok"))
+        self.assertFalse(w.call("rv", op="remove_class", who="r2", cls="base").get("ok"), "a revoker removed a class grant")
         self.assertFalse(w.call("a1", op="remove_class", who="r1", cls="nonexistent").get("ok"))
 
     def test_class_grant_removal_bumps_the_epoch_and_the_next_session_carries_the_reduced_grants(self):
@@ -161,6 +189,25 @@ class PeopleOps(unittest.TestCase):
         with self.assertRaises(AssertionError) as cm:
             self.check_class_removal(broken_removal_without_bump=True)
         self.assertRegex(str(cm.exception), "did not bump the epoch|minted before the removal")
+
+    def check_regrant(self, **kw):
+        w = World(self, **kw)
+        old = w.login("r1")
+        r = w.call("a1", op="grant", who="r1", grant_roles=["reader"], read=["base"])   # a grant that takes `restricted` away
+        self.assertTrue(r.get("ok"), r)
+        self.assertEqual(w.store.get(T, "tok-r1").read_set, frozenset({"base"}))
+        self.assertIsNone(w.sessions.resolve(old), "a session minted under the larger grant still holds the removed class")
+        keep = w.login("r2")
+        self.assertTrue(w.call("a1", op="grant", who="r2", grant_roles=["reader", "writer"], read=["base"], write=["base"]).get("ok"))
+        self.assertIsNotNone(w.sessions.resolve(keep), "a grant that only adds ended the principal's sessions")
+
+    def test_a_grant_that_takes_something_away_ends_the_old_sessions_and_one_that_only_adds_does_not(self):
+        self.check_regrant()
+
+    def test_broken_regrant_that_reduces_without_an_epoch_bump_is_red(self):
+        with self.assertRaises(AssertionError) as cm:
+            self.check_regrant(broken_removal_without_bump=True)
+        self.assertIn("still holds the removed class", str(cm.exception))
 
     def test_removing_a_base_class_removes_the_classes_that_dominate_it(self):
         w = World(self)
@@ -215,6 +262,46 @@ class PeopleOps(unittest.TestCase):
         with self.assertRaises(AssertionError) as cm:
             self.check_recovery_admins(broken_ignore_recovery_admins=True)
         self.assertIn("did not name granted", str(cm.exception))
+
+
+class WriteRevoke(unittest.TestCase):
+    """SEC-R2: a write admitted before the revoke may finish; none is admitted after the revoke returns."""
+
+    def check_write_revoke(self, **sessions_kw):
+        from types import SimpleNamespace
+        from living_context.ids import new_leaf_id
+        started, release, calls = threading.Event(), threading.Event(), []
+
+        class FakeWriter:
+            def remember(self, principal, cls, text, **kw):
+                calls.append(text)
+                if text == "slow":
+                    started.set()
+                    release.wait(10)
+                return SimpleNamespace(status="stored", leaf_id=new_leaf_id(), lv=1)
+
+        w = World(self, sessions_kw=sessions_kw, writers=lambda t: FakeWriter())
+        w.grant(T, "w1", {Role.WRITER}, write={"base"})
+        tw = w.login("w1")
+        write = lambda text: w.gw.handle(tw, {"op": "write", "cls": "base", "doc": {"text": text}})
+        out = {}
+        t = threading.Thread(target=lambda: out.__setitem__("slow", write("slow")))
+        t.start()
+        self.assertTrue(started.wait(5))
+        self.assertTrue(w.call("rv", op="revoke", who="w1").get("ok"))   # returns while the admitted write is still in flight
+        after = write("late")
+        release.set()
+        t.join(10)
+        self.assertTrue(out["slow"].get("ok"), "a write admitted before the revoke did not finish")
+        self.assertFalse(after.get("ok") or "late" in calls, "a write was admitted after the revoke returned")
+
+    def test_a_write_admitted_before_the_revoke_finishes_and_none_is_admitted_after_it(self):
+        self.check_write_revoke()
+
+    def test_broken_epoch_checked_only_when_the_session_is_minted_is_red(self):
+        with self.assertRaises(AssertionError) as cm:
+            self.check_write_revoke(broken_epoch_only_at_mint=True)
+        self.assertIn("admitted after the revoke returned", str(cm.exception))
 
 
 class Lane(unittest.TestCase):

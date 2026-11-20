@@ -189,6 +189,12 @@ class CompactionPowerLoss(Base):
             self.assertEqual(bad, [], f"the rebuilt table differed after a power loss at boundary {bad}")
         self.assertIn("rebuilt table differed", str(cm.exception))
 
+    def test_broken_compaction_in_place_instead_of_into_the_spare_is_red(self):
+        with self.assertRaises(AssertionError) as cm:
+            bad, _ = self.check_every_boundary(broken_compaction_in_place=True)
+            self.assertEqual(bad, [], f"the rebuilt table differed after a power loss at boundary {bad}")
+        self.assertIn("rebuilt table differed", str(cm.exception))
+
     def test_broken_skipped_directory_fsync_is_red(self):
         with self.assertRaises(AssertionError) as cm:
             self.check_revoke_after_compaction(broken_skip_dir_fsync=True)

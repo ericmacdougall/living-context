@@ -65,9 +65,12 @@ class KeyOwner(unittest.TestCase):
         st, _ = client.request("POST", f"/lc-{T}-base-leaf/_search", {"query": {"match_all": {}}})
         return st
 
-    def gone(self, client, tries=100):
+    def gone(self, client, tries=50):
+        """T7: an invalidated key fails within the fixed bound of 5 s (EXPERIMENT 9.1)."""
+        t0 = time.time()
         for _ in range(tries):
             if client.request("GET", "/_security/_authenticate")[0] == 401:   # an invalidated key fails authentication
+                self.latest = max(getattr(self, "latest", 0.0), time.time() - t0)
                 return True
             time.sleep(0.1)
         return False

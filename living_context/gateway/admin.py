@@ -64,14 +64,15 @@ class Admin:
                  clock: Callable[[], float] = time.time, pending_s: float = PENDING_S,
                  broken_self_grant: bool = False, broken_single_admin_revokes_privileged: bool = False,
                  broken_removal_without_bump: bool = False, broken_operator_authority_in_tenant: bool = False,
-                 broken_ignore_recovery_admins: bool = False):
+                 broken_ignore_recovery_admins: bool = False,
+                 broken_signature_not_bound_to_action: bool = False):
         self._st, self._ep, self._lat, self._rev, self._tok = store, epochs, lattices, revocations, principal_token
         self._clock, self._pending_s = clock, pending_s
         self._pending: dict[tuple[str, str], tuple[str, float]] = {}
         self._lock = threading.Lock()
         self._b = dict(self_grant=broken_self_grant, single=broken_single_admin_revokes_privileged,
                        nobump=broken_removal_without_bump, op_in_tenant=broken_operator_authority_in_tenant,
-                       any_admin=broken_ignore_recovery_admins)
+                       any_admin=broken_ignore_recovery_admins, anyact=broken_signature_not_bound_to_action)
 
     # ---- dispatch -----------------------------------------------------------------------------------------------
     def handle(self, op: str, tenant: str, p: Principal, req: Mapping[str, Any]) -> dict:
@@ -116,16 +117,36 @@ class Admin:
         svc = self._rev(tenant)
         if not (svc.state == "open" if self._b["any_admin"] else svc.may_grant(p.token)):   # a recovering tenant admits grant calls only from the administrators the operator named
             return UNAVAILABLE
+        old = self._st.get(tenant, tgt.token)
+        reduces = old is not None and not (old.roles <= tgt.roles and old.read_set <= tgt.read_set and old.write_set <= tgt.write_set)
+        if reduces and old.roles & {Role.TENANT_ADMIN, Role.REVOKER}:
+            # a grant that takes roles or classes from an administrator or a revoker is a revocation of part of its authority:
+            # two distinct administrators, like the revoke itself
+            act = ("grant", tuple(sorted(r.value for r in tgt.roles)), tuple(sorted(tgt.read_set)), tuple(sorted(tgt.write_set)), tgt.own_class)
+            verdict = self._authorise(p, tenant, lattice, old, act)
+            if verdict is not None:
+                return verdict
         self._st.put(tgt)
+        if reduces:
+            # a grant that takes anything away is a reduction: the sessions minted under the larger grant end at their next check
+            if not self._b["nobump"]:     # BROKEN variant: they keep the removed roles and classes
+                try:
+                    self._rev(tenant).bump(tgt.token)
+                except Exception:
+                    self._st.put(old)
+                    raise
         return OK_ANSWER
 
     # ---- revoke and class removal -------------------------------------------------------------------------------
-    def _authorise(self, p: Principal, tenant: str, lattice: ClassLattice, tgt: Principal) -> Optional[dict]:
-        """None when the actor may act on the target now; otherwise the typed answer (`pending` after a first administrator's call)."""
+    def _authorise(self, p: Principal, tenant: str, lattice: ClassLattice, tgt: Principal,
+                   action: tuple = ("revoke",)) -> Optional[dict]:
+        """None when the actor may act on the target now; otherwise the typed answer (`pending` after a first administrator's call).
+        A first signature counts for the same action on the same target only: a signature for removing a class does not complete
+        a revoke, and a revoke does not complete the removal of a role."""
         if tgt.roles & {Role.TENANT_ADMIN, Role.REVOKER}:
             if self._b["single"] and Role.TENANT_ADMIN in p.roles:    # BROKEN: one administrator revokes a revoker or an administrator
                 return None
-            key, now = (tenant, tgt.token), self._clock()
+            key, now = (tenant, tgt.token) if self._b["anyact"] else (tenant, tgt.token, action), self._clock()
             with self._lock:
                 first = self._pending.get(key)
                 if first is None or first[1] < now or first[0] == p.token:
@@ -145,7 +166,7 @@ class Admin:
         tgt, _ = self._target(p, tenant, who)
         if tgt is None:
             return REFUSED
-        verdict = self._authorise(p, tenant, lattice, tgt)
+        verdict = self._authorise(p, tenant, lattice, tgt, ("revoke",))
         if verdict is not None:
             return verdict
         rc = self._rev(tenant).revoke(tgt.token)    # Refused (a closed tenant) is a typed, retryable `unavailable` upstream
@@ -153,9 +174,9 @@ class Admin:
 
     def remove_class(self, p: Principal, tenant: str, lattice: ClassLattice, who: str, cls: Any) -> dict:
         tgt, _ = self._target(p, tenant, who)
-        if tgt is None or not isinstance(cls, str) or not lattice.declared(cls):
-            return REFUSED
-        verdict = self._authorise(p, tenant, lattice, tgt)
+        if tgt is None or not isinstance(cls, str) or not lattice.declared(cls) or Role.TENANT_ADMIN not in p.roles:
+            return REFUSED   # a revoker has the single revoke call and no other (4.3)
+        verdict = self._authorise(p, tenant, lattice, tgt, ("remove_class", cls))
         if verdict is not None:
             return verdict
         read = frozenset(c for c in tgt.read_set if not lattice.dominates(c, cls))   # keeps the read set down-closed

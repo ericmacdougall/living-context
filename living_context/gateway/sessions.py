@@ -102,13 +102,14 @@ class EpochTable:
 class Sessions:
     def __init__(self, adapters: dict[str, IdentityAdapter], epochs: EpochTable,
                  principal_token: Callable[[str, str], str],
-                 grants: Callable[[str, str], Optional[Principal]]):
+                 grants: Callable[[str, str], Optional[Principal]], *, broken_epoch_only_at_mint: bool = False):
         """`grants(tenant, principal_token)` returns the stored grants (roles, sets) or None."""
         self._adapters = adapters
         self._epochs = epochs
         self._principal_token = principal_token
         self._grants = grants
         self._by_hash: dict[str, Record] = {}
+        self._mint_only = broken_epoch_only_at_mint   # BROKEN variant: the epoch is checked when the session is minted, never again
         self._lock = threading.Lock()
 
     @staticmethod
@@ -144,7 +145,7 @@ class Sessions:
             return None
         if not hmac.compare_digest(self._hash(token), self._hash(token)):  # constant-shape path
             return None
-        if not self._epochs.current(rec.tenant, rec.principal_token, rec.epoch):
+        if not self._mint_only and not self._epochs.current(rec.tenant, rec.principal_token, rec.epoch):
             return None
         return rec
 

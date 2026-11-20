@@ -49,14 +49,16 @@ class RevocationService:
                  broken_admins_first: bool = False, broken_shutdown_when_faulted: bool = False,
                  broken_exchange_before_fsync: bool = False, broken_skip_dir_fsync: bool = False,
                  broken_compaction_drops_start: bool = False, broken_lane_open_during_drain: bool = False,
-                 broken_shutdown_before_drain: bool = False):
+                 broken_shutdown_before_drain: bool = False, broken_journal_error_keeps_tenant_open: bool = False,
+                 broken_compaction_in_place: bool = False):
         self.tenant, self._ep, self._dir = tenant, epochs, Path(directory)
         self._io, self._d_fsync, self._persist, self._clock = io or RealIO(), d_fsync_s, persist, clock
         self._b = dict(wait=broken_wait_for_journal, persist=broken_require_persist, nostart=broken_start_without_fsync,
                        unterminated=broken_accept_unterminated, admins_first=broken_admins_first,
                        shutdown_faulted=broken_shutdown_when_faulted, xchg_first=broken_exchange_before_fsync,
                        skip_dir=broken_skip_dir_fsync, drop_start=broken_compaction_drops_start,
-                       lane_open_drain=broken_lane_open_during_drain, shutdown_first=broken_shutdown_before_drain)
+                       lane_open_drain=broken_lane_open_during_drain, shutdown_first=broken_shutdown_before_drain,
+                       keep_open=broken_journal_error_keeps_tenant_open, in_place=broken_compaction_in_place)
         self._lock = threading.RLock()
         self.state, self.lane_open, self.fault = CLOSED, False, ""
         self.grant_admins: Optional[set] = None
@@ -139,12 +141,16 @@ class RevocationService:
                 self.compact()
                 self._j.append(rec)
             if time.monotonic() - t0 > self._d_fsync:
-                self._fault("fsync over D_FSYNC")
+                self._append_fault("fsync over D_FSYNC")
                 return False
             return True
         except (OSError, JournalFull):  # a full journal that compaction cannot shrink (live rows exceed J_SIZE) is a fault too
-            self._fault("journal I/O error or full")
+            self._append_fault("journal I/O error or full")
             return False
+
+    def _append_fault(self, why: str) -> None:
+        if not self._b["keep_open"]:   # BROKEN variant: a journal error leaves the tenant admitted
+            self._fault(why)
 
     def revoke(self, principal: str) -> Receipt:
         return self._flip(principal, True)
@@ -180,8 +186,28 @@ class RevocationService:
         return rc
 
     # ---- compaction -------------------------------------------------------------------------------------------
+    def _compact_in_place(self) -> None:
+        """BROKEN variant: the live journal is zeroed and rewritten where it is. Between the zeroing and the last record a power loss
+        leaves a journal that holds no revoke at all."""
+        size = self.journal_path.stat().st_size
+        fd = os.open(self.journal_path, os.O_RDWR)
+        try:
+            self._io.pwrite(fd, b"\0" * size, 0)
+            self._io.fsync(fd)
+        finally:
+            os.close(fd)
+        self._j.close()
+        sj = Journal(self.journal_path, self._io)
+        sj.append({"t": "start", "at": self._clock(), "compacted": True})
+        for principal, epoch, revoked in self._ep.snapshot(self.tenant):
+            sj.append({"t": "revoke" if revoked else "bump", "principal": principal, "epoch": epoch})
+        self._j = sj
+        self.events.append("compacted")
+
     def compact(self) -> None:
         with self._lock:
+            if self._b["in_place"]:
+                return self._compact_in_place()
             spare = self.spare_path
             size = spare.stat().st_size
             fd = os.open(spare, os.O_RDWR)
