@@ -202,3 +202,15 @@ Each entry names the passages, the reading the build follows and the test that k
   with digits. A title is checked against the code-built title and against the words of the leaf's tokens that contain no digit,
   so a build that keeps the letters of a token such as `quokka7` is red; the same tests run under the no-content title mode (AC-16).
   The 5-gram check on reasons and outline labels is run against leaf text, gists and facts of the tree.
+
+## Step 18 judge-call cap and the judge score bands (DESIGN 10, 12; BUILD-PLAN Steps 17, 18; ASSUMPTION, listed by the pools owner)
+
+- DESIGN 12 says at most `N_AUDIT = 100` leaves are audited per cycle and class, and at most `K_CAND = 5` candidate searches per
+  leaf; read literally that allows up to 500 judge calls per cycle. Step 18 reads as if the cap were on judge calls. Reading kept
+  (the stricter one, bounding model cost): both bounds hold, and in addition the judge calls of one cycle never exceed `N_AUDIT`.
+  Leaves that are cut off by the call cap stay in the ledger and are ranked again next cycle. The `broken_uncapped` variant in the
+  tests shows the difference.
+- DESIGN 10 says relevance labels are 0 to 3 with "relevant" meaning at least 2, and says nothing about how a judge score becomes a
+  label. In the stub the score is a 4-gram Jaccard overlap and the bands (`BANDS` in `feedback/judge.py`) are placeholder values,
+  not tuned. They are ASSUMPTIONS and are validated (EXPERIMENT 8.2) before any judged label drives a decision; an unlabelled pair
+  (a failed call) is unknown, never irrelevant.
