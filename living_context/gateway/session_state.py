@@ -34,7 +34,7 @@ def floor_class(lattice: ClassLattice) -> Optional[str]:
 
 
 class SessionStates:
-    def __init__(self, lattices, persist: Callable[[tuple, Taint], None], load: Callable[[tuple], Optional[Taint]], *,
+    def __init__(self, lattices, persist: Callable[[tuple, Callable], Taint], load: Callable[[tuple], Optional[Taint]], *,
                  broken_keyed_by_token: bool = False, broken_memory_only: bool = False):
         self._lat, self._persist, self._load = lattices, persist, load
         self._mem: dict[tuple, Taint] = {}
@@ -70,20 +70,27 @@ class SessionStates:
         cls = lat.join(*classes) if classes else None
         return Taint(cls, t.private | frozenset(p.id for p in pools if p.private))
 
+    def _join(self, tenant: str, a: Taint, b: Taint) -> Taint:
+        lat = self._lat[tenant]
+        classes = [c for c in (a.cls, b.cls) if c is not None]
+        return Taint(lat.join(*classes) if classes else None, a.private | b.private)
+
     def raise_to(self, rec, new: Taint) -> bool:
-        """Store a higher taint durably BEFORE the caller hands the response off. True when it rose."""
+        """Raise the taint to at least `new`, durably, BEFORE the caller hands the response off. The stored value is joined with `new`
+        inside a compare-and-set loop (never replaced), so two parallel raises both land and the taint can never fall. True when the
+        taint rose."""
         old = self.get(rec)
-        if new == old:
-            return False
         k = self._key(rec)
+        final = self._join(rec.tenant, old, new)
         try:
             if not self._b["mem"]:
-                self._persist(k, new)
+                final = self._persist(k, lambda stored: self._join(rec.tenant, stored or Taint(floor_class(self._lat[rec.tenant])), new))
         except Exception as e:
             raise StateError("state not stored") from e
         with self._lock:
-            self._mem[k] = new
-        return True
+            cur = self._mem.get(k, old)
+            self._mem[k] = self._join(rec.tenant, cur, final)   # joined, never assigned: a parallel raise is kept
+        return final != old
 
     def blocks_write(self, rec, pool) -> bool:
         """The write floor: a save into `pool` whose class does not dominate the taint class, or whose private set is neither empty nor
@@ -108,11 +115,19 @@ def _doc_id(key: tuple) -> str:
     return "cv:" + hashlib.sha256("\x00".join(key).encode()).hexdigest()[:40]
 
 
-def es_persist(client: Callable[[], object], tenant: str) -> Callable[[tuple, Taint], None]:
-    def persist(key: tuple, t: Taint) -> None:
+def es_persist(client: Callable[[], object], tenant: str) -> Callable[[tuple, Callable], Taint]:
+    """`persist(key, merge)`: inside a compare-and-set loop, read the stored taint, write `merge(stored)`, return what was written."""
+    def persist(key: tuple, merge: Callable) -> Taint:
         idx, did = f"lc-{tenant}-ctl", _doc_id(key)
         for _ in range(20):
             st, cur = client().request("GET", f"/{idx}/_doc/{did}")
+            stored = None
+            if st == 200 and isinstance(cur, dict) and cur.get("found"):
+                ss = cur.get("_source") or {}
+                stored = Taint(ss.get("taint_cls") or None, frozenset(ss.get("taint_private", [])))
+            elif st not in (200, 404):
+                break
+            t = merge(stored)
             body = {"tenant": tenant, "cls": "tenantwide", "kind": "session", "lin_leaves": [], "lin_leaf_ids": [], "lin_nodes": [],
                     "lin_subjects": [key[1]], "lin_queries": [], "derivation": "taint", "erasure_rewrite": 0, "schema_v": 1,
                     "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "taint_cls": t.cls or "",
@@ -124,7 +139,7 @@ def es_persist(client: Callable[[], object], tenant: str) -> Callable[[tuple, Ta
                 q += "&op_type=create"
             st2, _ = client().request("PUT", f"/{idx}/_doc/{did}{q}", body)
             if st2 in (200, 201):
-                return
+                return t
             if st2 != 409:
                 break
         raise StateError("taint not stored")
