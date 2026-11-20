@@ -214,3 +214,31 @@ Each entry names the passages, the reading the build follows and the test that k
   label. In the stub the score is a 4-gram Jaccard overlap and the bands (`BANDS` in `feedback/judge.py`) are placeholder values,
   not tuned. They are ASSUMPTIONS and are validated (EXPERIMENT 8.2) before any judged label drives a decision; an unlabelled pair
   (a failed call) is unknown, never irrelevant.
+
+## Pools foundation: readings and deviations at stage 0 (POOLS.md, ADAPTIVE.md; ASSUMPTION, listed by the pools owner)
+
+- POOLS 2.2 asks for a second administrator on a `query` or `review` grant to a tenant administrator, and for two administrators to remove an
+  administrator's grant. Neither two-signature path is built for pool grants: such a grant, and such a removal, is refused (fail closed), so
+  no administrator reads content through a pool grant. The pool delete does use two distinct administrators (first call `pending`).
+- POOLS 1.2 says a pool's own indices are created with the pool, and DESIGN 4.4 gives no tenant key a privilege to create an index. Reading
+  kept: creating and dropping a pool's indices is an index-management callable handed to the pool service and the pool eraser (as
+  provisioning is operator-side); the stored mappings are those of provisioning.
+- POOLS 1.2 puts a pool's stage 0 heads, control rows, log rows and stored queries in class-level indices read by one reader. Built:
+  `gateway/class_reader.py`, with a test that enumerates its read paths. The idempotency claim of a pool save is stored as `idem:<pool>:<h>`
+  in the class control index (so the reader can read it); the dirty queue is not written for a pool at stage 0 (no placement before stage 1).
+  The erasure scan and the verifier read every index of the tenant with their own keys and are not sessions; the reader's rule is for
+  what a session can cause.
+- POOLS 3.2 cuts a long text at `LEAF_CAP`; here a text over the leaf cap is `too_large` (no segmentation of pool saves yet). `meta.tags`
+  are validated and not stored. Update idempotency (`pool_update` with a key) is held in gateway memory only, not durable.
+- POOLS 4.1 says an empty scope touches no pool and AC-1 says every tool answers `unavailable`: a `pool_query` whose grant set is empty is
+  `unavailable`. Without a hint, selection is every non-private pool of the grant set (taint is not stored yet, so a private pool is
+  queried only when named, and `taint_raised` lists it); the card ranking above `P_ALL` is not built.
+- POOLS 3.6 seals a pointer with AES-256-GCM-SIV; the nonce is derived from the content (keyed hash of tenant and body), so the same leaf
+  version is always the same string. The key file of a tenant holds versions; retiring one makes its pointers `unavailable`.
+- The writer's principal token is in `lin_subjects` of every pool leaf and its source document (POOLS 3.8), so erasing the person reaches
+  the leaf. Token records are stored in `lc-<t>-authz` as hashes with their scope (best effort) and read back at start-up before the
+  journal is applied on top.
+- Not built (open): `principal_closed` and `J_SOFT` pressure, the journal `flock`, `J_SIZE` 16 MiB, the paused-sender hook for pool grants at
+  every wave and hand-off, conversation taint and held saves, review mode, retraction, copy, selection by cards, the merge floors, injection,
+  and the harness conformance checks (tool list, prompt capture). The pool-scope tombstone is appended to the tombstone journal; restore
+  replay of it is not built.
