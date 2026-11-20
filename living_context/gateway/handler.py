@@ -30,6 +30,9 @@ FORBIDDEN_BODY_FIELDS = {"tenant", "principal", "principal_token", "session", "r
 REFUSED = {"ok": False, "error": "refused"}
 UNAVAILABLE = {"ok": False, "error": "unavailable"}
 HELD = {"ok": False, "error": "held"}
+# A scoped or delegated token is attenuated to its pool scope (POOLS 2.6): it may call only these (default-deny, an explicit allow-list).
+# `token_revoke` is allowed without a `token_id` only (its own revocation).
+SCOPED_OPS = POOL_TOOLS | frozenset({"pool_list", "pool_describe", "token_revoke", "ping"})
 
 
 class EsGate:
@@ -93,6 +96,8 @@ class Gateway:
             return REFUSED
         p = self._sessions.principal(rec)
         op = request.get("op")
+        if rec.scope is not None and (op not in SCOPED_OPS or (op == "token_revoke" and request.get("token_id") is not None)):
+            return UNAVAILABLE
         if op in ADMIN_OPS:   # the operator's break-glass comes from the platform tenant, which has no lattice
             if self._admin is None:
                 return REFUSED
