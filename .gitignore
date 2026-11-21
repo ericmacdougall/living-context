@@ -6,3 +6,6 @@ out/
 logs/
 *.env
 secrets/
+coverage.json
+coverage.xml
+.coverage
