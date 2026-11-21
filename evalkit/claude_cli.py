@@ -312,8 +312,10 @@ class CappedPort:
         # set by ResilientPort, the run's shared halt gate (review F1): `admit(block)` raises when the stage is halted or the stop file
         # is present (with block, it also waits out a back-off); `on_halt(exc)` halts every worker, called under the charge lock by a
         # call that stops the stage, so no worker charges after it
-        self.admit: Callable[[bool], None] = lambda block: None
+        self.admit: Callable[[bool], Any] = lambda block: False
         self.on_halt: Callable[[BaseException], None] = lambda exc: None
+        # set by ResilientPort: a throttle's Retry-After, seen under the charge lock (a wait above the run's ceiling halts there)
+        self.on_throttle: Callable[[Optional[float]], None] = lambda retry_after_s: None
         self._log.parent.mkdir(parents=True, exist_ok=True)
 
     def _check_prompt(self, prompt: str) -> None:
@@ -342,7 +344,10 @@ class CappedPort:
         self._check_prompt(prompt)            # before the counter: a refused prompt costs nothing
         if self._pacer is not None:           # the wait is part of the halt gate: a stop or halt during it ends it, uncharged
             self._pacer.wait(check=lambda: self.admit(False))
-        self.admit(True)                      # after the wait: a stop, a halt or a back-off that began meanwhile
+        while self.admit(True) and self._pacer is not None:
+            # a back-off that began during the wait held this call: its pacer turn is spent, so it takes a new one (the workers a
+            # back-off releases together never charge in one unpaced burst)
+            self._pacer.wait(check=lambda: self.admit(False))
         with self._lock:                      # the charge and its bookkeeping are atomic; the process itself runs outside the lock
             self.admit(False)                 # immediately before the charge, under the lock every stopping call halts under
             self.port_calls += 1
@@ -432,6 +437,7 @@ class CappedPort:
             if rep.throttled:
                 row.update(throttled=True, error="throttled", retry_after_s=rep.retry_after_s)
                 self._append(row)
+                self.on_throttle(rep.retry_after_s)
                 raise StagePaused("throttled (HTTP %s) at call %d" % (rep.status, n), retry_after_s=rep.retry_after_s)
             failed = bool(rep.error) or rep.text is None
             self._fail_streak = self._fail_streak + 1 if failed else 0

@@ -292,6 +292,8 @@ class ResilientPort:
             inner.on_charge = self._charged
         if hasattr(inner, "admit"):                             # the inner port asks the gate again after its pacer, before its charge
             inner.admit, inner.on_halt = self._admit, self.halt
+        if hasattr(inner, "on_throttle"):
+            inner.on_throttle = self._on_throttle
         self._lost_keys = self._lost_in_flight(journal)
         # the stage runners key every call by its question or build group at every worker count (review F2): one key scheme, so a
         # resume with another worker count replays what was answered; a journal written under another scheme is refused here
@@ -335,23 +337,39 @@ class ResilientPort:
         """Under the gate: the halt in force (a fresh exception of its type), the stop file making one, or None."""
         h = self._halt
         if h is not None:
-            return type(h)(str(h))
+            err = type(h)(str(h))
+            if getattr(h, "retry_after_s", None) is not None:
+                err.retry_after_s = h.retry_after_s       # every halted worker reports the provider's requested wait
+            return err
         if self.stop_requested():
             self._halt = StageStopped("stop file present")
             self._gate.notify_all()
             return StageStopped("stop file present")
         return None
 
-    def _wait_gate(self, inner: bool = False) -> None:
-        """Before every charge: no halt, no stop file, nobody backing off. Inside the inner port (`inner`) a refusal is NotAdmitted."""
+    def _wait_gate(self, inner: bool = False) -> bool:
+        """Before every charge: no halt, no stop file, nobody backing off. Inside the inner port (`inner`) a refusal is NotAdmitted.
+        True when it waited for a back-off."""
+        waited = False
         with self._gate:
             while True:
                 err = self._halted()
                 if err is not None:
                     raise NotAdmitted(err) if inner else err
                 if self._backing_off == 0:
-                    return
+                    return waited
+                waited = True
                 self._gate.wait(0.5)
+
+    def _ceiling_pause(self, retry_after: float) -> StagePaused:
+        when = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + float(retry_after)))
+        return StagePaused("the provider asked for a wait of %.0f s, above the ceiling of %.0f s: the stage stops here; resume after %s"
+                           % (float(retry_after), self._ra_ceiling, when), retry_after_s=float(retry_after))
+
+    def _on_throttle(self, retry_after: Optional[float]) -> None:
+        """Under the inner port's charge lock: a requested wait above the ceiling halts every worker before another charge."""
+        if retry_after is not None and float(retry_after) > self._ra_ceiling:
+            self.halt(self._ceiling_pause(retry_after))
 
     def _backoff_wait(self, delay: float) -> None:
         """The back-off, at the halt gate: a halt or the stop file ends it at once (the throttled call is asked again on resume)."""
@@ -369,16 +387,16 @@ class ResilientPort:
                     return
                 self._gate.wait(min(left, 0.5))
 
-    def _admit(self, block: bool) -> None:
-        """The inner port's admission (review F1): after its pacer wait (`block`, waiting out a back-off too), during that wait and
-        immediately before its charge (never blocking: it holds the charge lock then)."""
+    def _admit(self, block: bool) -> bool:
+        """The inner port's admission (review F1): after its pacer wait (`block`, waiting out a back-off too: True when it did),
+        during that wait and immediately before its charge (never blocking: it holds the charge lock then)."""
         if block:
-            self._wait_gate(inner=True)
-            return
+            return self._wait_gate(inner=True)
         with self._gate:
             err = self._halted()
         if err is not None:
             raise NotAdmitted(err)
+        return False
 
     def call(self, task: Task, inputs: Mapping[str, Any], *, ctx: Optional[CallContext] = None, scope: Optional[str] = None) -> CallResult:
         """One logical call. A failed BUILD call is asked again, as a new charged call with its own journal key, up to
@@ -465,10 +483,8 @@ class ResilientPort:
                     retry_after = getattr(e, "retry_after_s", None)
                     if retry_after is not None and float(retry_after) > self._ra_ceiling:
                         # the provider asks for a longer wait than a run sits through: stop resumably now, with no retry spent
-                        when = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + float(retry_after)))
-                        err = StagePaused("the provider asked for a wait of %.0f s, above the ceiling of %.0f s: the stage stops "
-                                          "here; resume after %s" % (float(retry_after), self._ra_ceiling, when),
-                                          retry_after_s=float(retry_after))
+                        # (the inner port has already halted every worker under its charge lock, `_on_throttle`)
+                        err = self._ceiling_pause(retry_after)
                         self.halt(err)
                         raise err from None
                     if attempt > self._retries:   # per call: a burst of throttles in flight together halves and goes on

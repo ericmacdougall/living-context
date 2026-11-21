@@ -427,9 +427,10 @@ class PacedHalt(unittest.TestCase):
 
     def test_a_call_that_stops_the_stage_halts_the_others_before_its_charge_lock_is_released(self):
         # B reaches the charge lock while A, holding it, records its mismatch: when A releases it, B must already see the halt
-        for cond in ("quota", "mismatch"):
+        for cond in ("quota", "mismatch", "ceiling"):
             with self.subTest(cond=cond), tempfile.TemporaryDirectory() as tmp:
-                up = Upstream(**{cond: (1,)})
+                up = Upstream(retry_after=7200, throttle=(1,)) if cond == "ceiling" else Upstream(**{cond: (1,)})
+                stop = cc.StagePaused if cond == "ceiling" else cc.StageLimited
                 b, port, _ = port_over(self, tmp, up, concurrency=2)
                 inner, b_at_lock, box = port._inner, threading.Event(), {}
 
@@ -457,9 +458,45 @@ class PacedHalt(unittest.TestCase):
                 a, abox = started(lambda: port.scoped("qa").call(Task.ROUTE, route_inputs(1)), "A")
                 a.join(10)
                 box["bt"].join(10)
-                self.assertIsInstance(abox.get("err"), cc.StageLimited, cond)
-                self.assertIsInstance(box["bbox"].get("err"), cc.StageLimited, cond)
+                self.assertIsInstance(abox.get("err"), stop, cond)
+                self.assertIsInstance(box["bbox"].get("err"), stop, cond)
                 self.assertEqual((b.count(), up.n), (1, 1), cond)
+
+    def test_a_call_held_by_a_back_off_takes_a_new_pacer_turn_before_its_charge(self):
+        # workers released together from a back-off must not charge in one unpaced burst
+        with tempfile.TemporaryDirectory() as tmp:
+            up = Upstream()
+            b, port, _ = port_over(self, tmp, up, concurrency=2)
+            turns, held, release = [], threading.Event(), threading.Event()
+
+            class Turns:
+                def wait(self, check=None):
+                    turns.append(1)
+                    if len(turns) == 1:
+                        held.set()
+                        release.wait(10)
+            port._inner._pacer = Turns()
+            t, box = started(lambda: port.scoped("q").call(Task.ROUTE, route_inputs(1)))
+            self.assertTrue(held.wait(10))
+            with port._gate:
+                port._backing_off = 1                  # another worker's back-off begins while this one waits its pacer turn
+            release.set()
+            time.sleep(0.4)
+            self.assertEqual((len(turns), up.n, b.count()), (1, 0, 0))   # held at admission, nothing charged
+            with port._gate:
+                port._backing_off = 0
+                port._gate.notify_all()
+            t.join(10)
+            self.assertIsNone(box.get("err"))
+            self.assertEqual((len(turns), up.n, b.count()), (2, 1, 1))   # a new pacer turn, then the one charge
+
+    def test_every_worker_halted_by_a_pause_sees_its_requested_wait(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b, port, _ = port_over(self, tmp, Upstream(), concurrency=2)
+            port.halt(cc.StagePaused("asked to wait", retry_after_s=7200.0))
+            with self.assertRaises(cc.StagePaused) as e:
+                port.scoped("q").call(Task.ROUTE, route_inputs(1))
+            self.assertEqual((e.exception.retry_after_s, b.count()), (7200.0, 0))
 
 
 @mock.patch.object(rs, "EXPECTED_LEAVES", 1)
@@ -496,6 +533,19 @@ class Stage(unittest.TestCase):
         keys = [{json.loads(l)["key"] for l in (r / "journal.jsonl").read_text().splitlines()} for r in (r1, r4)]
         self.assertEqual(keys[0], keys[1])                         # review F2: one key scheme, so any resume replays what was answered
         self.assertTrue(keys[0] and all("|" in k for k in keys[0]))
+
+    def test_a_retry_after_above_the_ceiling_pauses_s6h1_and_says_why(self):
+        base, s3, man, run = t6.setup_dirs()
+        a = t6.args(base, s3, run, concurrency=4, concurrency_reason="test", **vars(margs(rpm=10 ** 6)))
+        live = Live(Upstream(retry_after=7200, throttle=(1,)))
+        self.addCleanup(live.close)
+        with seeded_node_ids():
+            rc = rs.run(a, embedder=t6.RealEmbed(), runner=live.runner, loader=lambda _a: t6.rel.QS, tenant_factory=t6.factory(run),
+                        registered_pool=t6.POOL, registered_fresh=t6.rel.REG, manifest_path=man)
+        self.assertEqual(rc, 75)
+        state = json.loads((run / "STATE.json").read_text())
+        self.assertEqual((state["state"], state["retry_after_s"]), ("PAUSED_THROTTLE", 7200.0))
+        self.assertIn("above the ceiling", state["error"])
 
     def test_an_early_build_on_another_kind_or_setting_is_refused_to_the_stamped_run(self):
         base, s3, man, run = t6.setup_dirs()
