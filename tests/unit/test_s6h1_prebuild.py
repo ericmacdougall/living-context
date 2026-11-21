@@ -3,7 +3,11 @@ sealed at parse time (never held in any object); the prebuild ingests the whole 
 `load_questions` and `fresh_questions` made to raise; the questions stay unreleased until RELEASE.json; the stamped run attaches to
 the prebuilt tenant and tree (no build call twice) and gives the same ledger as a run without the prebuild; and every binding (code,
 fields, pool, registry, tenant state) refuses when it does not hold."""
+import builtins
+import contextlib
+import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -37,7 +41,13 @@ def write(recs):
 
 def sealed():
     boom = mock.Mock(side_effect=AssertionError("a question was parsed during the early build"))
-    return mock.patch.multiple(ds, parse_record=boom, load_questions=boom, fresh_questions=boom)
+    return mock.patch.multiple(ds, parse_record=boom, load_questions=boom, fresh_questions=boom, read_release=boom, session_hashes=boom,
+                               content_clusters=boom)
+
+
+def sealed_strings(qs):
+    """What must never leave the early build: the markers of every sealed field, has_answer, every question id and session id."""
+    return {"SEALED", "has_answer"} | {q.qid for q in qs} | {sid for q in qs for sid, _ in q.sessions}
 
 
 class PoolContents(unittest.TestCase):
@@ -95,12 +105,12 @@ class Prebuild(unittest.TestCase):
     def why(self, a, man=None):
         return rs.check_prereqs(a, embed=RealEmbed(), manifest_path=man or self.man, mem_available=lambda: 64000.0)
 
-    def prebuild(self, run=None, **kw):
+    def prebuild(self, run=None, runner=None, **kw):
         run = run or self.run
         real = ds.pool_contents
         with sealed(), mock.patch.object(ds, "pool_contents", lambda path: real(path, expect_sha256=None)):    # the runner's own read
-            return rs.run(self.pa(run, dataset=self.path, **kw), embedder=RealEmbed(), runner=Runner(), tenant_factory=factory(run),
-                          registered_pool=POOL, manifest_path=self.base / "absent.json")
+            return rs.run(self.pa(run, dataset=self.path, **kw), embedder=RealEmbed(), runner=runner or Runner(),
+                          tenant_factory=factory(run), registered_pool=POOL, manifest_path=self.base / "absent.json")
 
     def stamped(self, run=None, man=None, **kw):
         run = run or self.run
@@ -145,6 +155,65 @@ class Prebuild(unittest.TestCase):
         self.assertEqual(json.loads((self.run / "STAMP.json").read_text())["prebuild"]["pool_sha256"], pre["pool_sha256"])
         self.assertEqual((self.run / "done.jsonl").read_bytes(), (run0 / "done.jsonl").read_bytes())
         self.assertEqual(len(self.calls()), len(self.calls(run0)))
+
+    def test_no_prebuild_output_names_a_question_an_answer_a_session_or_has_answer(self):
+        """The release gate of the early build: the dataset is opened once, inside pool_contents, and no file of the run directory,
+        no registry row and nothing printed holds a sealed marker, has_answer, a question id or a session id."""
+        target, inside, opened = os.path.realpath(self.path), [False], []
+        real_pc, real_open, real_io_open = ds.pool_contents, builtins.open, io.open
+
+        def pc(path):
+            inside[0] = True
+            try:
+                return real_pc(path, expect_sha256=None)
+            finally:
+                inside[0] = False
+
+        def spy(opener):
+            def o(file, *a, **k):
+                if isinstance(file, (str, bytes, os.PathLike)) and os.path.realpath(os.fsdecode(file)) == target:
+                    opened.append(inside[0])
+                return opener(file, *a, **k)
+            return o
+        out = io.StringIO()
+        with sealed(), mock.patch.object(ds, "pool_contents", pc), mock.patch("builtins.open", spy(real_open)), \
+                mock.patch("io.open", spy(real_io_open)), contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            rc = rs.run(self.pa(dataset=self.path), embedder=RealEmbed(), runner=Runner(), tenant_factory=factory(self.run),
+                        registered_pool=POOL, manifest_path=self.base / "absent.json")
+        self.assertEqual(rc, 0)
+        self.assertEqual(opened, [True])                                    # one read of the dataset, through the sealed parser
+        texts = {"stdout": out.getvalue(), "registry": (self.base / "stamps.jsonl").read_text()}
+        files = [p for p in self.run.rglob("*") if p.is_file()]
+        self.assertTrue({"PREBUILD.json", "STATE.json", "calls.jsonl", "journal.jsonl", "tree.json"} <= {p.name for p in files})
+        texts.update({str(p): p.read_bytes().decode("utf-8", "replace") for p in files})
+        bad = sealed_strings(rel.QS)
+        for name, text in texts.items():
+            hit = sorted(x for x in bad if x in text)
+            self.assertEqual(hit, [], name)
+
+    def test_a_prebuild_stopped_in_its_build_goes_on_at_another_concurrency_and_the_stamped_run_gives_the_same_ledger(self):
+        base0, s30, man0, run0 = setup_dirs()
+        with seeded_node_ids():
+            self.assertEqual(rs.run(args(base0, s30, run0), embedder=RealEmbed(), runner=Runner(), loader=lambda _a: rel.QS,
+                                    tenant_factory=factory(run0), registered_pool=POOL, registered_fresh=rel.REG, manifest_path=man0), 0)
+        n_build0 = sum(c["task"].startswith("build") for c in self.calls(run0))
+        with seeded_node_ids():
+            self.assertEqual(self.prebuild(runner=Runner(stop_at=n_build0 // 2, stop_file=self.run / "STOP")), 3)
+            self.assertEqual(json.loads((self.run / "STATE.json").read_text())["state"], "STOPPED")
+            self.assertTrue((self.run / rs.PREBUILD_FILE).exists())
+            self.assertFalse((self.run / "BUILT.json").exists())
+            (self.run / "STOP").unlink()
+            self.assertEqual(self.why(self.pa(concurrency=3, concurrency_reason="test"), man=self.base / "absent.json"), [])
+            self.assertEqual(self.prebuild(concurrency=3, concurrency_reason="test"), 0)        # the journal replays the first part
+            self.assertEqual(json.loads((self.run / "STATE.json").read_text())["state"], "PREBUILT")
+            (self.run / ds.RELEASE_FILE).write_text(self.release)
+            self.assertEqual(self.stamped(), 0)
+        self.assertEqual(sum(c["task"].startswith("build") for c in self.calls()), n_build0)       # no build call charged twice
+        self.assertEqual((self.run / "done.jsonl").read_bytes(), (run0 / "done.jsonl").read_bytes())
+        self.assertEqual(len(self.calls()), len(self.calls(run0)))
+        self.assertEqual([json.loads(l)["mode"] for l in (self.run / "starts.jsonl").read_text().splitlines()],
+                         ["prebuild", "prebuild", "stamped"])
+        self.assertEqual([r["stage"] for r in rs._registry_rows(self.base / "stamps.jsonl")], [rs.PREBUILD_STAGE, rs.STAGE])
 
     def test_the_stamped_run_refuses_another_code_fields_model_or_pool(self):
         self.assertEqual(self.prebuild(), 0)

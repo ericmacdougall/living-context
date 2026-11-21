@@ -446,8 +446,9 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
         raise
     if not prebuild:
         extra.update(questions_done=len(ledger.rows), questions=len(fs.questions))
-    extra.update(counter=budget.count(), cap=a.approved_cap, leaves=n_leaves, replayed=port.replayed, fresh=port.fresh, lost_in_flight=port.lost, throttled=port.throttled,
-                 limited=port.limited, concurrency_now=port.slots.limit, concurrency_changes=port.slots.changes)
+    extra.update(counter=budget.count(), cap=a.approved_cap, leaves=n_leaves, replayed=port.replayed, fresh=port.fresh,
+                 lost_in_flight=port.lost, throttled=port.throttled, limited=port.limited, concurrency_now=port.slots.limit,
+                 concurrency_changes=port.slots.changes)
     if state == "COMPLETE":
         dec = st.decide(ledger, fs, clusters, shuffled_qids=shuffled_qids, shuffled_min=vals["thresholds"]["shuffled_min_point"])
         pool_label = "whole pool (%d contents, %d leaves)" % (len(pool), n_leaves)
