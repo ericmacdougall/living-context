@@ -24,6 +24,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 from .es import EsClient
 from .indices import class_index, check_pool_id
+from .reads import IncompleteRead, complete_count, complete_search, doc_read, mget_items
 
 _ID_CHARS = re.compile(r"^[A-Za-z0-9:_.-]{3,200}$")
 READABLE_KINDS = ("ctl", "log", "sq")
@@ -144,17 +145,32 @@ class ClassReader:
         body.update(extra)
         return body
 
-    def _send(self, cls: str, kind: str, method: str, path: str, body: Any, pool: str, *, search: bool) -> Any:
+    def _send(self, cls: str, kind: str, op: str, pool: str, *, doc_ids: Sequence[str] = (), body: Any = None) -> Any:
+        """Send one read and judge its answer as it returns (`reads`): a get is `doc_read` (exactly this document through the class alias,
+        found with its sequence fields, or verifiably absent), a multi-get `mget_items` (every item in order, about exactly the id asked,
+        no item error), a search `complete_search` and a count `complete_count` (HTTP 200, every shard, no time-out: a hold missing from
+        a partial answer would read as no hold, F13). Any other answer refuses (review round 6: a `(200, {})` head was "no head", so a
+        retract answered `retracted` with nothing retracted)."""
         if kind not in READABLE_KINDS:
             raise ReaderRefused("kind")
-        if search and not (self._b["no_term"] or self._b["scored"]):
+        if op == "search" and not (self._b["no_term"] or self._b["scored"]):
             check_request(body, pool)
         index = class_index(self.tenant, cls, kind)
-        self.plan.append((path, index))
-        st, r = self._client_for(cls).request(method, path.replace("{index}", index), body)
-        if st not in (200, 404) or not isinstance(r, (dict, list)):
-            raise ReaderRefused("failed")
-        return st, r
+        es = self._client_for(cls)
+        try:
+            if op == "get":
+                self.plan.append((f"/{{index}}/_doc/{doc_ids[0]}", index))
+                return doc_read(*es.request("GET", f"/{index}/_doc/{doc_ids[0]}"), index, doc_ids[0], True)
+            if op == "mget":
+                self.plan.append(("/{index}/_mget", index))
+                return mget_items(*es.request("POST", f"/{index}/_mget", {"ids": list(doc_ids)}), [(index, i) for i in doc_ids], True)
+            if op == "count":
+                self.plan.append(("/{index}/_count", index))
+                return complete_count(*es.request("POST", f"/{index}/_count", body))
+            self.plan.append(("/{index}/_search", index))
+            return complete_search(*es.request("POST", f"/{index}/_search", body))
+        except IncompleteRead as e:
+            raise ReaderRefused("incomplete") from e
 
     def _check_ids(self, ids: Sequence[str], pool: str) -> None:
         if not all(isinstance(i, str) and _ID_CHARS.match(i) for i in ids):
@@ -170,24 +186,20 @@ class ClassReader:
     def get(self, cls: str, kind: str, doc_id: str, pool: str) -> Optional[Doc]:
         check_pool_id(pool)
         self._check_ids([doc_id], pool)
-        st, r = self._send(cls, kind, "GET", f"/{{index}}/_doc/{doc_id}", None, pool, search=False)
-        if st == 404 or not r.get("found"):
+        r = self._send(cls, kind, "get", pool, doc_ids=[doc_id])
+        if r is None:   # a verified absence of exactly this document
             return None
         self._leak([r], pool)
-        return Doc(doc_id, r.get("_source") or {}, r.get("_seq_no", -1), r.get("_primary_term", -1))
+        return Doc(doc_id, r["_source"], r["_seq_no"], r["_primary_term"])
 
     def mget(self, cls: str, kind: str, doc_ids: Sequence[str], pool: str) -> dict[str, Optional[Doc]]:
         check_pool_id(pool)
         self._check_ids(list(doc_ids), pool)   # one id of another pool refuses the whole call
         if not doc_ids:
             return {}
-        st, r = self._send(cls, kind, "POST", "/{index}/_mget", {"ids": list(doc_ids)}, pool, search=False)
-        out: dict[str, Optional[Doc]] = {i: None for i in doc_ids}
-        docs = [d for d in r.get("docs", []) if d.get("found") is True]
-        self._leak(docs, pool)
-        for d in docs:
-            out[d["_id"]] = Doc(d["_id"], d.get("_source") or {}, d.get("_seq_no", -1), d.get("_primary_term", -1))
-        return out
+        items = self._send(cls, kind, "mget", pool, doc_ids=list(doc_ids))
+        self._leak([d for d in items if d is not None], pool)
+        return {i: None if d is None else Doc(i, d["_source"], d["_seq_no"], d["_primary_term"]) for i, d in zip(doc_ids, items)}
 
     def search(self, cls: str, kind: str, pool: str, filters: Sequence[dict] = (), *, size: int = 100,
                source: Optional[Sequence[str]] = None, sort: Optional[list] = None) -> list[Doc]:
@@ -198,8 +210,9 @@ class ClassReader:
         if sort is not None:
             extra["sort"] = sort
         body = self._body(pool, filters, **extra)
-        _, r = self._send(cls, kind, "POST", "/{index}/_search", body, pool, search=True)
-        hits = (r.get("hits") or {}).get("hits", [])
+        hits = self._send(cls, kind, "search", pool, body=body)["hits"]["hits"]
+        if not all(isinstance(h.get("_id"), str) and isinstance(h.get("_source", {}), dict) for h in hits):
+            raise ReaderRefused("incomplete")
         self._leak(hits, pool)
         return [Doc(h["_id"], h.get("_source") or {}) for h in hits]
 
@@ -208,11 +221,12 @@ class ClassReader:
         body = {"query": self._body(pool, filters)["query"]}
         if not self._b["scored"] and not self._b["no_term"]:
             check_request(body, pool)
-        _, r = self._send(cls, kind, "POST", "/{index}/_count", body, pool, search=False)
-        return int(r.get("count", 0))
+        return self._send(cls, kind, "count", pool, body=body)
 
     def aggregate(self, cls: str, kind: str, pool: str, aggs: Mapping[str, Any], filters: Sequence[dict] = ()) -> Mapping[str, Any]:
         check_pool_id(pool)
         body = self._body(pool, filters, size=0, aggs=dict(aggs))
-        _, r = self._send(cls, kind, "POST", "/{index}/_search", body, pool, search=True)
-        return r.get("aggregations") or {}
+        r = self._send(cls, kind, "search", pool, body=body).get("aggregations")
+        if not isinstance(r, dict) or not all(isinstance(r.get(name), dict) for name in aggs):
+            raise ReaderRefused("incomplete")   # an answer without the aggregation asked is not "no buckets"
+        return r

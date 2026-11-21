@@ -110,49 +110,66 @@ class SessionStates:
 import datetime
 import hashlib
 
+from .reads import IncompleteRead, put_doc, read_doc, restored
+
+PERSIST_TRIES = 20   # lost compare-and-sets in a row before a raise is refused (a handful of parallel raises at most, module doc)
+
 
 def _doc_id(key: tuple) -> str:
     return "cv:" + hashlib.sha256("\x00".join(key).encode()).hexdigest()[:40]
 
 
+def _record(doc: dict, idx: str, did: str, tenant: str) -> dict:
+    """The stored session record of a document read by its id (`reads.restored`: this index, this id, this tenant, kind `session`)."""
+    return restored(doc, idx, tenant, {"session": lambda s: did})
+
+
+def _taint_of(source: dict, tenant: str, key: tuple) -> Taint:
+    """The taint a stored record holds. The record must be this conversation's session record (tenant, principal and conversation as
+    written by `es_persist`) with a string class and a list of string pool ids; anything else is not a taint to build on."""
+    priv = source.get("taint_private")
+    if source.get("kind") != "session" or source.get("tenant") != tenant or source.get("conversation") != key[2] \
+            or source.get("lin_subjects") != [key[1]] or not isinstance(source.get("taint_cls"), str) \
+            or not isinstance(priv, list) or not all(isinstance(p, str) for p in priv):
+        raise IncompleteRead("not this conversation's taint record")
+    return Taint(source["taint_cls"] or None, frozenset(priv))
+
+
 def es_persist(client: Callable[[], object], tenant: str) -> Callable[[tuple, Callable], Taint]:
-    """`persist(key, merge)`: inside a compare-and-set loop, read the stored taint, write `merge(stored)`, return what was written."""
+    """`persist(key, merge)`: inside a compare-and-set loop, read the stored taint, write `merge(stored)`, return what was written.
+
+    The read is `reads.read_doc` and the write `reads.put_doc`, both through the control alias (review round 6, F19): the stored record
+    is exactly this document, found with its sequence fields, or verifiably absent; the write landed only on a well-formed
+    acknowledgement about this document. A malformed or foreign answer raises `StateError` at once (the caller aborts the response and
+    answers `unavailable`); only the typed version conflict of a lost compare-and-set is retried, at most PERSIST_TRIES times."""
     def persist(key: tuple, merge: Callable) -> Taint:
         idx, did = f"lc-{tenant}-ctl", _doc_id(key)
-        for _ in range(20):
-            st, cur = client().request("GET", f"/{idx}/_doc/{did}")
-            stored = None
-            if st == 200 and isinstance(cur, dict) and cur.get("found"):
-                ss = cur.get("_source") or {}
-                stored = Taint(ss.get("taint_cls") or None, frozenset(ss.get("taint_private", [])))
-            elif st not in (200, 404):
-                break
-            t = merge(stored)
-            body = {"tenant": tenant, "cls": "tenantwide", "kind": "session", "lin_leaves": [], "lin_leaf_ids": [], "lin_nodes": [],
-                    "lin_subjects": [key[1]], "lin_queries": [], "derivation": "taint", "erasure_rewrite": 0, "schema_v": 1,
-                    "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "taint_cls": t.cls or "",
-                    "taint_private": sorted(t.private), "conversation": key[2]}
-            q = "?refresh=true"
-            if st == 200 and isinstance(cur, dict) and cur.get("found"):
-                q += f"&if_seq_no={cur['_seq_no']}&if_primary_term={cur['_primary_term']}"
-            else:
-                q += "&op_type=create"
-            st2, _ = client().request("PUT", f"/{idx}/_doc/{did}{q}", body)
-            if st2 in (200, 201):
-                return t
-            if st2 != 409:
-                break
+        try:
+            for _ in range(PERSIST_TRIES):
+                cur = read_doc(client(), idx, did, alias=True)
+                t = merge(None if cur is None else _taint_of(_record(cur, idx, did, tenant), tenant, key))
+                body = {"tenant": tenant, "cls": "tenantwide", "kind": "session", "lin_leaves": [], "lin_leaf_ids": [], "lin_nodes": [],
+                        "lin_subjects": [key[1]], "lin_queries": [], "derivation": "taint", "erasure_rewrite": 0, "schema_v": 1,
+                        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "taint_cls": t.cls or "",
+                        "taint_private": sorted(t.private), "conversation": key[2]}
+                cas = ("op_type=create",) if cur is None else (f"if_seq_no={cur['_seq_no']}", f"if_primary_term={cur['_primary_term']}")
+                if put_doc(client(), idx, did, body, "refresh=true", *cas, alias=True):
+                    return t
+        except IncompleteRead as e:
+            raise StateError("taint not stored") from e
         raise StateError("taint not stored")
     return persist
 
 
 def es_load(client: Callable[[], object], tenant: str) -> Callable[[tuple], Optional[Taint]]:
+    """`load(key)`: the stored taint, or None ("no taint yet") only for a verified absence of exactly this record (`reads.read_doc`: a
+    404 `found: false` about this `_index` and `_id`, or the index absent). Any other answer raises `StateError`: an empty or foreign 404,
+    or a 200 that is not this record found, would otherwise read as the floor and lower the taint after a restart (review round 5)."""
     def load(key: tuple) -> Optional[Taint]:
-        st, r = client().request("GET", f"/lc-{tenant}-ctl/_doc/{_doc_id(key)}")
-        if st == 404:
-            return None
-        if st != 200 or not isinstance(r, dict):
-            raise StateError("taint unreadable")
-        s = r.get("_source") or {}
-        return Taint(s.get("taint_cls") or None, frozenset(s.get("taint_private", [])))
+        try:
+            idx, did = f"lc-{tenant}-ctl", _doc_id(key)
+            r = read_doc(client(), idx, did, alias=True)
+            return None if r is None else _taint_of(_record(r, idx, did, tenant), tenant, key)
+        except IncompleteRead as e:
+            raise StateError("taint unreadable") from e
     return load

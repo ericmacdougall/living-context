@@ -11,6 +11,7 @@ hold old bytes; this module controls the file layer only.
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import hmac
 import os
@@ -242,16 +243,20 @@ class Keystore:
 
 
 def _locked(fn):
+    @functools.wraps(fn)
     def wrapper(self, *a, **kw):
         with self._lock:
             return fn(self, *a, **kw)
-    wrapper.__name__, wrapper.__doc__ = fn.__name__, fn.__doc__
     return wrapper
 
 
-for _name in ("subject_token", "digest", "has_key", "principal_token", "register_identifier", "encrypt",
-              "decrypt", "destroy", "destroy_versions", "count_keys"):
-    setattr(Keystore, _name, _locked(getattr(Keystore, _name)))
+# Every public method runs under the lock: the set is enumerated from the class body, never listed by hand, so a method added
+# later (destroy_exact_version was missed by the old hand-written list) cannot use the shared connection unlocked. Private
+# helpers (_hmac_key, _after_destroy, _configure) are called only from these methods or from __init__, before the object is
+# shared; tests/unit/test_keystore_lock_guard.py checks both.
+for _name, _fn in list(vars(Keystore).items()):
+    if callable(_fn) and not _name.startswith("_"):
+        setattr(Keystore, _name, _locked(_fn))
 
 
 class KeystoreSet:

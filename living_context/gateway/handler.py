@@ -8,12 +8,18 @@ Rules (DESIGN 3, 7.1, 8.7; probe P2 mitigations, main's decision):
   files by path inside this process and never appear in a response;
 * no Elasticsearch error body, sub-response or index name is ever forwarded: every
   failure is one of two typed answers, `refused` or `unavailable`, identical for
-  forbidden, erased, missing and failed.
+  forbidden, erased, missing and failed;
+* the answer goes out with what its hand-off must re-check (`serve` returns a `Reply`): the token whose authority it carries and every
+  pool (with the operations) whose content it carries; the server runs `send_ok` under the shared side of the tenant's send fence at
+  every hand-off (POOLS 2.4, 2.5, AC-2) and aborts the whole answer when it fails.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
+from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional
 
 from ..ids import IdError, KIND_LEAF, Pointer, decode_pointer, encode_pointer
@@ -24,6 +30,8 @@ POOL_TOOLS = frozenset({"pool_save", "pool_update", "pool_query", "pool_fetch", 
 from .es import EsClient, EsError
 from ..recall.direct import DirectSearch
 from .indices import class_index
+from .pool_authz import carried
+from .reads import IncompleteRead, mget_items
 from .sessions import Sessions
 
 FORBIDDEN_BODY_FIELDS = {"tenant", "principal", "principal_token", "session", "roles", "read_set", "write_set"}
@@ -33,6 +41,16 @@ HELD = {"ok": False, "error": "held"}
 # A scoped or delegated token is attenuated to its pool scope (POOLS 2.6): it may call only these (default-deny, an explicit allow-list).
 # `token_revoke` is allowed without a `token_id` only (its own revocation).
 SCOPED_OPS = POOL_TOOLS | frozenset({"pool_list", "pool_describe", "token_revoke", "token_renew", "token_delegate", "ping"})
+
+
+@dataclass(frozen=True)
+class Reply:
+    """An answer and what its send hand-off re-checks (POOLS 2.4): `token`, the token whose authority the answer carries (checks 1 to 3;
+    None only for the receipt of a bearer's revocation of its own token, which carries nothing that token could still read), and
+    `needs`, pool id to the operations, for every pool whose content the answer carries (check 4)."""
+    body: Any
+    token: Optional[str]
+    needs: Mapping[str, frozenset] = field(default_factory=dict)
 
 
 class EsGate:
@@ -69,8 +87,9 @@ class EsGate:
 class Gateway:
     def __init__(self, es: EsGate, sessions: Sessions, lattices: Mapping[str, ClassLattice],
                  writers: Optional[Callable[[str], Any]] = None, admin: Any = None,
-                 pools: Optional[Callable[[str], Any]] = None):
+                 pools: Optional[Callable[[str], Any]] = None, admits: Optional[Callable[[str], bool]] = None):
         self._es, self._sessions, self._lattices = es, sessions, lattices
+        self._admits = admits   # tenant -> does its journal admit; None: the pool runtime's `admit` (no runtime, no admission)
         self._writers = writers
         self._pools = pools   # tenant -> gateway.pool_admin.PoolService (pools, grants, token revoke) and the pool tools
         self._admin = admin   # gateway.admin.Admin: grant, revoke, remove_class, break_glass_revoke
@@ -88,25 +107,64 @@ class Gateway:
             return None
         return {"pointer": ptr, "title": src.get("title", ""), "size": src.get("size_tokens", 0)}
 
+    def _admit(self, tenant: str) -> bool:
+        """The ONE journal admission check (POOLS 2.5; DESIGN 4.4: a journal fault closes the tenant): every operation except the
+        administrator's own lane (ADMIN_OPS, which `Admin.handle` admits by its own rules) and both mint forms pass it before anything
+        is dispatched; a closed tenant is the one `unavailable`. There is no fail-open default: with neither an explicit `admits` nor a
+        pool runtime, nothing is admitted. tests/unit/test_admission_guard.py enumerates the operations and mint forms."""
+        try:
+            if self._admits is not None:
+                return self._admits(tenant) is True
+            rt = self._pools(tenant) if self._pools else None
+            return rt is not None and rt.admit() is True
+        except Exception:
+            return False
+
+    def _runtime(self, tenant: str):
+        """The tenant's pool runtime, only while its epoch journal admits."""
+        rt = self._pools(tenant) if self._pools else None
+        if rt is None or not self._admit(tenant):
+            return None
+        return rt
+
     def mint(self, tenant: str, proof: bytes, request: Any) -> dict:
-        """The one way to obtain a scoped token over the socket: an authentication proof (verified by the tenant's identity adapter) and a
-        request naming the conversation, the scope (pool id to operations), an optional default save pool and a lifetime. The `human` flag
-        is never read from the request: a token is `agent` unless the harness's own adapter says a human is present, and no request field
-        can say so. Every failure is the one `unavailable` answer."""
+        """A scoped token from an authentication proof (verified by the tenant's identity adapter) and a request naming the conversation,
+        the scope (pool id to operations), an optional default save pool and a lifetime. The actor is `human` only when the tenant's
+        identity adapter says the proof carries a fresh user-presence assertion (POOLS 2.3); no request field can say so. Every failure is
+        the one `unavailable` answer."""
         from .sessions import TokenError
         try:
+            if self._runtime(tenant) is None:
+                return UNAVAILABLE
             if not isinstance(request, dict) or not isinstance(request.get("scope"), dict) or not isinstance(proof, bytes):
                 return UNAVAILABLE
             scope = {k: frozenset(v) for k, v in request["scope"].items() if isinstance(k, str) and isinstance(v, list)}
             if len(scope) != len(request["scope"]):
                 return UNAVAILABLE
-            ttl = request.get("ttl_s")
             tok = self._sessions.mint_scoped(tenant, proof, conversation=request.get("conversation"), scope=scope,
-                                             default_save_pool=request.get("default_save_pool"),
-                                             ttl_s=float(ttl) if isinstance(ttl, (int, float)) and not isinstance(ttl, bool) else None)
+                                             default_save_pool=request.get("default_save_pool"), ttl_s=request.get("ttl_s"), human=None)
             return {"ok": True, "token": tok}
         except (TokenError, ValueError, TypeError):
             return UNAVAILABLE
+
+    def mint_line(self, m: Any):
+        """The socket's `mint` line (DESIGN 3, POOLS 2.3): `{"tenant", "proof" (base64), "request"}`. A request `{"session": "plain"}`
+        mints a plain session (DESIGN 5.10); any other request is a scoped mint. Returns (answer, token or None)."""
+        if not isinstance(m, dict) or not isinstance(m.get("tenant"), str) or not isinstance(m.get("proof"), str) \
+                or not isinstance(m.get("request"), dict):
+            return UNAVAILABLE, None
+        try:
+            proof = base64.b64decode(m["proof"], validate=True)
+        except (binascii.Error, ValueError):
+            return UNAVAILABLE, None
+        req = m["request"]
+        if not self._admit(m["tenant"]):   # both mint forms: a closed tenant mints nothing (review F1)
+            return UNAVAILABLE, None
+        if req == {"session": "plain"}:
+            tok = self._sessions.mint(m["tenant"], proof)
+            return ({"ok": True, "token": tok}, tok) if tok else (UNAVAILABLE, None)
+        out = self.mint(m["tenant"], proof, req)
+        return out, out.get("token")
 
     def _token_op(self, op: str, token: str, rec, request: dict) -> dict:
         from .sessions import TokenError
@@ -114,21 +172,62 @@ class Gateway:
             if op == "token_renew":
                 return {"ok": True, "exp": self._sessions.renew(token)}
             scope = request.get("scope")
-            ttl = request.get("ttl_s")
-            if not isinstance(scope, dict) or not isinstance(ttl, (int, float)) or isinstance(ttl, bool):
+            if not isinstance(scope, dict) or not all(isinstance(v, list) for v in scope.values()):
                 return UNAVAILABLE
-            return {"ok": True, "token": self._sessions.delegate(token, {k: frozenset(v) for k, v in scope.items()}, float(ttl))}
+            return {"ok": True, "token": self._sessions.delegate(token, {k: frozenset(v) for k, v in scope.items()}, request.get("ttl_s"))}
         except (TokenError, ValueError, TypeError):
             return UNAVAILABLE
 
     def handle(self, token: str, request: Any) -> dict:
+        """The answer alone (callers that do not send it); the socket server uses `serve`."""
+        return self.serve(token, request).body
+
+    def serve(self, token: str, request: Any) -> Reply:
+        """The answer with what its hand-off must re-check: every successful pool authorization of the request is collected
+        (`pool_authz.carried`). The ONE exemption from the token check is the receipt of a bearer revoking its own token (op
+        `token_revoke` with no `token_id`, answered `ok`, and the token no longer resolving): it carries no pool and nothing the revoked
+        token could read, and withholding it would only hide from the harness that its revoke landed (tests/unit/test_send_reply.py)."""
+        with carried() as box:
+            body = self._dispatch(token, request)
+        needs = {pid: frozenset(ops) for pid, ops in box.items()}
+        if (isinstance(request, dict) and request.get("op") == "token_revoke" and request.get("token_id") is None
+                and isinstance(body, dict) and body.get("ok") is True and body.get("denied") is True and not needs
+                and self._sessions.resolve(token) is None):
+            return Reply(body, None, {})
+        return Reply(body, token, needs)
+
+    def send_ok(self, reply: Reply) -> bool:
+        """POOLS 2.4 at the send hand-off, run by the server under the SHARED side of the tenant's send fence before every chunk:
+        checks 1 to 3 for `reply.token` (it resolves: tenant prefix, `exp`, individual revocation, epoch, root and parent) and check 4
+        for every pool in `reply.needs` with its operations, and the live visibility check for every pool it names (`VIEW`; the pool
+        runtime's `send_ok`, `pool_authz.recheck`). Memory only: the session, epoch, pool
+        directory and grant tables, each under its own leaf lock, which no thread holds while taking the fence (lock order: fence, then
+        a leaf lock); no Elasticsearch, journal, disk or socket I/O, and the fence is never re-entered. Any failure or error is False,
+        and the whole answer is aborted. Journal admission is not re-checked here: 2.4 names checks 1 to 4, and the administrator's lane
+        is answered on a closed tenant."""
+        try:
+            if reply.token is None:
+                return not reply.needs
+            rec = self._sessions.resolve(reply.token)
+            if rec is None:
+                return False
+            if not reply.needs:
+                return True
+            rt = self._pools(rec.tenant) if self._pools else None
+            return rt is not None and rt.send_ok(reply.token, reply.needs) is True
+        except Exception:
+            return False
+
+    def _dispatch(self, token: str, request: Any) -> dict:
         rec = self._sessions.resolve(token)
         if rec is None:
+            return UNAVAILABLE
+        op = request.get("op") if isinstance(request, dict) and isinstance(request.get("op"), str) else None
+        if op not in ADMIN_OPS and not self._admit(rec.tenant):   # before any dispatch, class operations and ping included (F1)
             return UNAVAILABLE
         if not isinstance(request, dict) or FORBIDDEN_BODY_FIELDS & set(request):
             return REFUSED
         p = self._sessions.principal(rec)
-        op = request.get("op")
         if rec.scope is not None and (op not in SCOPED_OPS or (op == "token_revoke" and request.get("token_id") is not None)):
             return UNAVAILABLE
         if op in ADMIN_OPS:   # the operator's break-glass comes from the platform tenant, which has no lattice
@@ -142,9 +241,9 @@ class Gateway:
         if lattice is None:
             return UNAVAILABLE
         if op in ("token_renew", "token_delegate"):
-            return self._token_op(op, token, rec, request)
+            return self._token_op(op, token, rec, request) if self._runtime(rec.tenant) is not None else UNAVAILABLE
         if isinstance(op, str) and (op in POOL_OPS or op in POOL_TOOLS):
-            svc = self._pools(rec.tenant) if self._pools else None
+            svc = self._runtime(rec.tenant)
             if svc is None:
                 return UNAVAILABLE
             try:   # every failure of a pool request is the one typed answer, with no body and no trace
@@ -185,11 +284,14 @@ class Gateway:
         for cls in sorted(p.read_set):
             if not decide(p, Op.LOOKUP, tenant=tenant, lattice=lattice, cls=cls):
                 continue
-            st, body = self._es.client(tenant, f"read-{cls}").request(
-                "POST", "/_mget", {"docs": [{"_index": class_index(tenant, cls, "leaf"), "_id": f"{ptr.id}:{ptr.version}"}]})
-            docs = body.get("docs") if st == 200 and isinstance(body, dict) else None
-            if docs and len(docs) == 1 and docs[0].get("found") is True and "error" not in docs[0]:
-                src = docs[0].get("_source") or {}
+            want = [(class_index(tenant, cls, "leaf"), f"{ptr.id}:{ptr.version}")]
+            try:   # the item must be exactly this leaf of this class (`reads.mget_items`); any other answer refuses (review round 6)
+                doc, = mget_items(*self._es.client(tenant, f"read-{cls}").request(
+                    "POST", "/_mget", {"docs": [{"_index": i, "_id": d} for i, d in want]}), want, alias=True)
+            except IncompleteRead:
+                return UNAVAILABLE
+            if doc is not None:
+                src = doc["_source"]
                 return {"ok": True, "text": src.get("text", ""), "title": src.get("title", "")}
         return UNAVAILABLE
 

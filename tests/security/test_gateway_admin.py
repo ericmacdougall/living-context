@@ -51,9 +51,11 @@ class World:
         test.addCleanup(lambda: self.svc._j and self.svc._j.close())
         assert self.svc.start() == OPEN
         self.store = GrantStore()
+        self.store.attach(T, self.svc)   # the reductions go through the tenant's journal
         self.sessions = Sessions({T: Idp(), "sysop": Idp()}, self.ep, tok, lambda t, p: self.store.get(t, p), **(sessions_kw or {}))
         self.admin = Admin(self.store, self.ep, {T: LAT}, lambda t: self.svc, tok, **admin_kw)
-        self.gw = Gateway(None, self.sessions, {T: LAT}, writers=writers, admin=self.admin)
+        self.gw = Gateway(None, self.sessions, {T: LAT}, writers=writers, admin=self.admin,
+                          admits=lambda t: True)   # no epoch journal in this test: admission is explicit (no fail-open default)
         for a in ("a1", "a2", "a3"):
             self.grant(T, a, {Role.TENANT_ADMIN})
         self.grant(T, "rv", {Role.REVOKER})

@@ -352,7 +352,7 @@ class WriterOnElasticsearch(unittest.TestCase):
         fences = {}
         sessions = Sessions({T: Adapter()}, EpochTable(lambda t: fences.setdefault(t, SendFence())),
                             lambda t, who: "tok-user", lambda t, p: grants.get((t, p)))
-        gw = Gateway(self.gate, sessions, {T: LAT}, writers=lambda t: w)
+        gw = Gateway(self.gate, sessions, {T: LAT}, writers=lambda t: w, admits=lambda t: True)   # no journal here: explicit admission
         tk = sessions.mint(T, b"user")
         self.assertEqual(gw.handle(tk, {"op": "write", "cls": "base", "doc": {"text": "Marta Silva wrote back"}}), HELD_ANSWER)
         self.assertEqual(gw.handle(tk, {"op": "write", "cls": "base", "doc": {"text": "x marta.silva@example.com"}}), REFUSED)
@@ -504,7 +504,7 @@ class WriterOnElasticsearch(unittest.TestCase):
         fences = {}
         sessions = Sessions({T: Adapter()}, EpochTable(lambda t: fences.setdefault(t, SendFence())),
                             lambda t, who: "tok-user", lambda t, p: grants.get((t, p)))
-        return Gateway(self.gate, sessions, {T: LAT}, writers=writers), sessions.mint(T, b"user")
+        return Gateway(self.gate, sessions, {T: LAT}, writers=writers, admits=lambda t: True), sessions.mint(T, b"user")   # explicit admission
 
     def test_a_write_handled_on_another_thread_works(self):
         """The server handles each connection on its own thread; the writer and keystore were built on this one."""

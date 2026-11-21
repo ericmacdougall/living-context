@@ -4,8 +4,13 @@ Newline-delimited JSON: `{"token": ..., "request": {...}}` per line. Composition
 bytes are bounded before parsing (admission.read_line), the tenant comes from the session
 record, per-tenant slots and connection caps apply (admission.Admission), and every
 tenant-bound response goes out through the fenced, queue-capped hand-off (fence.handoff)
-whose final check is the session's epoch. Unauthenticated connections are bounded globally
-and by an idle deadline until their first valid line binds them to a tenant.
+whose final check, before EVERY chunk, is the session's epoch and the handler's `send_ok` over
+the reply's token and carried pools (POOLS 2.4, 2.5, AC-2: checks 1 to 4 for every pool whose
+content the response carries). A failed check aborts the whole response: nothing of it sent
+yet, the typed `unavailable` line goes instead; part of it sent, the connection is closed (a
+line is never completed after the boundary, and never sent with items dropped). Both, and a
+response that misses its send deadline, are counted (INV-11). Unauthenticated connections are
+bounded globally and by an idle deadline until their first valid line binds them to a tenant.
 """
 from __future__ import annotations
 
@@ -19,6 +24,7 @@ from typing import Any, Callable
 from ..config import Constants
 from . import admission, fence
 from .admin import REVOKE_LANE_OPS, lane_allowed
+from .handler import Reply
 from .sessions import EpochTable, Sessions
 
 REFUSED_LINE = b'{"error": "refused", "ok": false}\n'
@@ -46,6 +52,10 @@ class Server:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self.bytes_read = 0  # test counter: request bytes taken from sockets
+        self.aborted = 0     # responses aborted by a failed hand-off check (INV-11)
+        self.expired = 0     # responses that missed the send deadline with bytes unsent (INV-11)
+        self.before_write: Callable[[], None] | None = None   # test seam: runs under the shared fence between the check and the write
+        self.send_deadline_s = 10.0
 
     def start(self) -> "Server":
         threading.Thread(target=self._accept_loop, daemon=True).start()
@@ -88,14 +98,24 @@ class Server:
                 try:
                     with self.adm.parse_semaphore:  # one semaphore around parsing only (LAB-R5)
                         msg = admission.parse(raw, max_structures=1000)
-                    token, req = msg["token"], msg["request"]
+                    mint = msg.get("mint") if isinstance(msg, dict) and set(msg) == {"mint"} else None
+                    token, req = (None, None) if mint is not None else (msg["token"], msg["request"])
                 except (admission.Refused, KeyError, TypeError):
                     self._plain(conn, REFUSED_LINE)
                     continue
-                rec = self.sessions.resolve(token)
-                if rec is None:
-                    self._plain(conn, UNAVAILABLE_LINE)
-                    continue
+                if mint is not None:
+                    # the socket's mint (POOLS 2.3, 2.6): verified by the tenant's identity adapter; the connection is still
+                    # unauthenticated (bounded globally and by the idle deadline) until the minted token binds it to its tenant
+                    resp, tok = self.handler.mint_line(mint)
+                    rec = self.sessions.resolve(tok) if tok else None
+                    if rec is None:
+                        self._plain(conn, UNAVAILABLE_LINE)
+                        continue
+                else:
+                    rec = self.sessions.resolve(token)
+                    if rec is None:
+                        self._plain(conn, UNAVAILABLE_LINE)
+                        continue
                 if tenant is None:
                     try:
                         self.adm.open_connection(rec.tenant)
@@ -110,6 +130,10 @@ class Server:
                 elif rec.tenant != tenant:
                     self._plain(conn, REFUSED_LINE)
                     return
+                if mint is not None:
+                    if not self._fenced(conn, (json.dumps(resp, sort_keys=True) + "\n").encode(), rec, Reply(resp, tok, {})):
+                        return
+                    continue
                 try:
                     op = req.get("op") if isinstance(req, dict) else None
                     # the lane is granted only to a resolved session whose role admits the operation (DESIGN 4.4, 15)
@@ -117,13 +141,15 @@ class Server:
                             (self._lane_from_body or lane_allowed(op, self.sessions.principal(rec))))
                     release = self.adm.acquire(tenant, timeout=2.0, revoke=lane)
                 except admission.Refused:
-                    self._fenced(conn, REFUSED_LINE, rec)
+                    if not self._fenced(conn, REFUSED_LINE, rec, Reply(None, token, {})):
+                        return
                     continue
                 try:
-                    resp = self.handler.handle(token, req)  # Elasticsearch calls never hold the global semaphore
+                    reply = self._reply(token, req)  # Elasticsearch calls never hold the global semaphore
                 finally:
                     release()
-                self._fenced(conn, (json.dumps(resp, sort_keys=True) + "\n").encode(), rec)
+                if not self._fenced(conn, (json.dumps(reply.body, sort_keys=True) + "\n").encode(), rec, reply):
+                    return  # aborted after part of it was sent, or past its deadline: the connection ends
         finally:
             try:
                 f.close()
@@ -144,19 +170,62 @@ class Server:
         except OSError:
             pass
 
-    def _fenced(self, conn, data: bytes, rec):
+    def _reply(self, token, req) -> Reply:
+        serve = getattr(self.handler, "serve", None)
+        if serve is not None:
+            return serve(token, req)
+        # a handler with `handle` only (the tests' stand-ins): its answer carries no pool; the hand-off still re-checks the token
+        return Reply(self.handler.handle(token, req), token, {})
+
+    def _check(self, rec, reply: Reply) -> Callable[[], bool]:
+        """The final check of every hand-off, run under the shared side of the tenant's send fence: the session's epoch (as before),
+        then the handler's `send_ok(reply)` (checks 1 to 4 over the reply's token and pools). A handler without `send_ok` gets the
+        token check (`Sessions.resolve`) in its place, never the epoch alone."""
+        send_ok = getattr(self.handler, "send_ok", None)
+        if send_ok is None:
+            send_ok = lambda r: r.token is None or self.sessions.resolve(r.token) is not None
+
+        def check() -> bool:
+            try:
+                return self.epochs.current(rec.tenant, rec.principal_token, rec.epoch) is True and send_ok(reply) is True
+            except Exception:
+                return False
+        return check
+
+    def _fenced(self, conn, data: bytes, rec, reply: Reply) -> bool:
+        """Hand `data` to the kernel in fenced, capped chunks, re-checking before each one. Returns False when the connection must end:
+        the check failed after part of the response was sent, or the deadline passed with bytes unsent (the next response would
+        otherwise follow a partial line). A check that fails before any byte went out sends the typed `unavailable` line instead."""
         f = self.fence_for(rec.tenant)
-        check = lambda: self.epochs.current(rec.tenant, rec.principal_token, rec.epoch)
-        deadline = time.time() + 10
+        check = self._check(rec, reply)
+        deadline = time.time() + self.send_deadline_s
+        sent = 0
         conn.setblocking(False)
         try:
-            while data and time.time() < deadline:
+            while data:
+                if time.time() >= deadline:
+                    with self._lock:
+                        self.expired += 1
+                    return False
                 try:
-                    n = fence.handoff(conn, data, f, check)
+                    n = fence.handoff(conn, data, f, check, before_write=self.before_write)
                 except fence.Aborted:
-                    return
+                    with self._lock:
+                        self.aborted += 1   # the unsent bytes are discarded with `data`
+                    if sent:
+                        return False
+                    conn.settimeout(30)
+                    self._plain(conn, UNAVAILABLE_LINE)   # carries no tenant data: no fence needed
+                    return True
+                except OSError:
+                    return False
+                sent += n
                 data = data[n:]
                 if data:
                     select.select([], [conn], [], 0.05)
+            return True
         finally:
-            conn.settimeout(30)
+            try:
+                conn.settimeout(30)
+            except OSError:
+                pass

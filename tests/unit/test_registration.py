@@ -127,7 +127,7 @@ def operations(tree):
     """Discover comparisons and mapping dispatch, including delegated handlers."""
     out = set()
     for fn in (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
-               and n.name in ("handle", "_token_op")):
+               and n.name in ("handle", "_dispatch", "_token_op")):   # `Gateway.handle` and `serve` reach `_dispatch`
         for n in ast.walk(fn):
             if isinstance(n, ast.Compare) and isinstance(n.left, ast.Name) and n.left.id == "op":
                 for right in n.comparators:
@@ -153,6 +153,37 @@ def registration_gaps(rows, covered_rows, indexes, covered_indexes, ops,
         gaps.add((op, "scoped allow-list", "gateway/handler.py", 35))
     for kind in reads - served:
         gaps.add((kind, "class reader", "gateway/class_reader.py", 31))
+    return gaps
+
+
+def key_kinds(tree):
+    """Kinds of documents that carry ciphertext under a data key: a `_base(kind, ...)` call with a
+    `key_ref` keyword. Returns kind -> the keyword names of those calls (where the key id must be)."""
+    out = {}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call) and call_name(n) == "_base" and any(k.arg == "key_ref" for k in n.keywords):
+            kind = literal(n.args[0 if isinstance(n.func, ast.Attribute) else 2])
+            out.setdefault(kind, set()).update(k.arg for k in n.keywords if k.arg)
+    return out
+
+
+def dict_declaration(tree, name):
+    for n in tree.body:
+        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == name for t in n.targets):
+            return ast.literal_eval(n.value)
+    raise AssertionError("missing declaration " + name)
+
+
+def key_gaps(held, registry):
+    """Pure checker: every key-holding kind is in the pool delete's key inventory, by the field that names its key."""
+    gaps = set()
+    for kind, fields in held.items():
+        if kind not in registry:
+            gaps.add((kind, "pool delete key inventory", "erasure/pool_scope.py"))
+        elif registry[kind] not in fields:
+            gaps.add((kind, "key id field " + registry[kind], "erasure/pool_scope.py"))
+    for kind in set(registry) - set(held):
+        gaps.add((kind, "registered key kind with no producer", "erasure/pool_scope.py"))
     return gaps
 
 
@@ -196,8 +227,8 @@ class Registration(unittest.TestCase):
         find = symbol(parse("erasure/scan.py"), "find")
         pattern = next(n.value for n in ast.walk(find) if isinstance(n, ast.Assign)
                        and any(isinstance(t, ast.Name) and t.id == "pattern" for t in n.targets))
-        self.assertEqual(ast.unparse(pattern), 'f"lc-{check_id(tenant, \'tenant\')}-*"')
-        self.assertIn("f'/{pattern}/_search?ignore_unavailable=true'", ast.unparse(find))
+        self.assertIn(ast.unparse(pattern).replace("'", '"'), ('f"lc-{check_id(tenant, "tenant")}-*"',))   # quoting differs by Python version
+        self.assertIn("reads.scan(es, pattern, body, page=PAGE, ignore_unavailable=True)", ast.unparse(find))   # the whole tenant glob, one snapshot
         self.assert_no_kind_filter(find)
         verifier = parse("verifier/check.py")
         self.assertEqual(ast.unparse(symbol(verifier, "_all").body[0].value), "f'lc-{self.tenant}-*'")
@@ -232,7 +263,8 @@ class Registration(unittest.TestCase):
         self.assertIn("f'lc-{self.tenant}-*'", ast.unparse(pool_docs))
         self.assertTrue({"pool", "lin_pools"} <= strings(pool_docs))
         self.assert_no_kind_filter(pool_docs)
-        self.assertIn("f'/lc-{tenant}-*/_search?ignore_unavailable=true'", ast.unparse(symbol(verifier, "pool_residue")))
+        self.assertIn('f"/lc-{tenant}-*/_search?ignore_unavailable=true&allow_partial_search_results=false"',
+                      ast.unparse(symbol(verifier, "pool_residue")).replace("'", '"'))   # quoting differs by Python version
 
         handler = parse("gateway/handler.py")
         admin = parse("gateway/admin.py")
@@ -245,7 +277,9 @@ class Registration(unittest.TestCase):
             ops |= operations(tree)
         self.assertFalse(SCOPED_ALLOWED & SCOPED_DENIED)
         self.assertEqual(SCOPED_ALLOWED | SCOPED_DENIED, ops)
-        handle = symbol(handler, "handle")
+        handle = symbol(handler, "_dispatch")   # what `Gateway.handle` and `Gateway.serve` both run
+        self.assertIn("self._dispatch(token, request)", ast.unparse(symbol(handler, "serve")))
+        self.assertEqual(ast.unparse(symbol(handler, "handle").body[-1]), "return self.serve(token, request).body")
         gate = next(n for n in handle.body if isinstance(n, ast.If) and "SCOPED_OPS" in ast.unparse(n.test))
         self.assertEqual(ast.unparse(gate.test), "rec.scope is not None and (op not in SCOPED_OPS or (op == 'token_revoke' and request.get('token_id') is not None))")
         self.assertEqual(ast.unparse(gate.body[0]), "return UNAVAILABLE")
@@ -294,9 +328,102 @@ class Registration(unittest.TestCase):
         helper = symbol(writer, "_repair_pool_source")
         self.assertEqual(index_calls(helper)["pool_index"],
                          declarations(parse("gateway/indices.py"), ("POOL_KINDS",))["POOL_KINDS"])
-        self.assertIn("self._project", ast.unparse(helper))
-        self.assertIn("self.advance_head", ast.unparse(helper))
+        # the pool repair rebuilds a projection only through the gated helper that copies the source's provenance (C6), and creates a
+        # missing head only through the gated create (C3/C4); it never advances a head
+        self.assertIn("self._ensure_projection", ast.unparse(helper))
+        self.assertIn("self._create_pool_head", ast.unparse(helper))
+        self.assertNotIn("self.advance_head", ast.unparse(helper))
+        ensure = ast.unparse(symbol(writer, "_ensure_projection"))
+        self.assertIn("self._project(cls, leaf_id, lv, text, src, pool)", ensure)   # the projection is built from the stored source
+        self.assertIn("source_prov(src)", ast.unparse(symbol(writer, "_project")))   # which carries its provenance (F3)
         self.assertTrue({"src", "leaf", "ctl"} <= set().union(*index_calls(repair).values()))
+
+    def test_every_key_holding_kind_is_destroyed_by_the_pool_delete(self):
+        """C5 (pools delta review): the pool delete's key inventory is derived from a registry this test checks against the
+        producers, so a new kind that holds a data key and is not in the inventory fails here."""
+        producers = [parse("ingest/writer.py"), parse("gateway/session_state.py")] + [
+            parse(str(p.relative_to(ROOT))) for p in sorted((ROOT / "gateway").glob("pool_*.py"))]
+        held = {}
+        for tree in producers:
+            for kind, fields in key_kinds(tree).items():
+                held.setdefault(kind, set()).update(fields)
+        self.assertTrue({"src", "quarantine"} <= set(held), held)
+        scope = parse("erasure/pool_scope.py")
+        registry = dict_declaration(scope, "KEY_KINDS")
+        self.assertEqual(key_gaps(held, registry), set())
+        inventory = symbol(scope, "_key_inventory")
+        self.assertIn("KEY_KINDS", {n.id for n in ast.walk(inventory) if isinstance(n, ast.Name)})
+        # the inventory reads the pool's closure (every document naming the pool), never a kind-filtered subset of it
+        self.assertIn("self._docs", ast.unparse(inventory))
+        # keys are destroyed before any closure document is deleted, so a crash never loses the record of a key
+        delete = symbol(scope, "delete")
+        order = [n for n in ast.walk(delete) if isinstance(n, ast.Call) and ast.unparse(n.func) in ("self._ks.destroy", "self._del")]
+        first_destroy = min(n.lineno for n in order if ast.unparse(n.func) == "self._ks.destroy")
+        first_delete = min(n.lineno for n in order if ast.unparse(n.func) == "self._del")
+        self.assertLess(first_destroy, first_delete)
+
+    def test_checker_reports_a_fabricated_key_kind(self):
+        self.assertIn(("fabricated", "pool delete key inventory", "erasure/pool_scope.py"),
+                      key_gaps({"fabricated": {"key_ref", "qid"}}, {"src": "leaf_id"}))
+        self.assertIn(("src", "key id field leaf_id", "erasure/pool_scope.py"), key_gaps({"src": {"key_ref"}}, {"src": "leaf_id"}))
+
+    def test_every_authz_start_up_and_erasure_search_is_a_complete_read(self):
+        """C1 (pools delta review), F12: the authz, start-up and pool-erasure paths read through `reads.scan` (a PIT, the `_shard_doc`
+        cursor, `complete_hits` on every page) and build no search path of their own. The package-wide enumeration of every request
+        call site is tests/unit/test_read_paths.py; this test pins the three start-up and pool-erasure modules to the scan (the start-up
+        modules through `reads.restore_scan`, which judges each hit and reads through `scan`; review round 8, F3)."""
+        for rel in ("gateway/pool_boot.py", "gateway/boot.py", "erasure/pool_scope.py"):
+            tree = parse(rel)
+            for n in ast.walk(tree):
+                if isinstance(n, ast.Constant) and isinstance(n.value, str):
+                    self.assertNotIn("_search", n.value, rel + ": a search path built outside reads")
+            self.assertTrue(any(isinstance(c, ast.Call) and call_name(c) in ("scan", "restore_scan") for c in ast.walk(tree)), rel)
+        reads = parse("gateway/reads.py")
+        self.assertIn("scan", {call_name(c) for c in ast.walk(symbol(reads, "restore_scan")) if isinstance(c, ast.Call)})
+        checked = ast.unparse(symbol(reads, "complete_search")) + ast.unparse(symbol(reads, "_shards_complete"))
+        for check in ("timed_out", "terminated_early", "failed", "successful", "total"):
+            self.assertIn(check, checked)
+        self.assertIn("complete_search", {call_name(c) for c in ast.walk(symbol(reads, "complete_hits")) if isinstance(c, ast.Call)})
+        self.assertIn("allow_partial_search_results=false", ast.unparse(symbol(reads, "search_path")))
+        scan = symbol(reads, "scan")
+        self.assertIn("_shard_doc", strings(scan))
+        self.assertIn("complete_search", {call_name(c) for c in ast.walk(scan) if isinstance(c, ast.Call)})
+
+    def test_every_pool_write_of_the_writer_is_gated(self):
+        """C4 (pools delta review): every Writer entry point that writes a pool document takes the write gate and checks the pool is
+        active first; a public method with a `pool` parameter that is not an entry point never calls an ungated writer directly."""
+        writer = parse("ingest/writer.py")
+        entries = declarations(writer, ("POOL_WRITES",))["POOL_WRITES"]
+        cls = symbol(writer, "Writer")
+        methods = {f.name: f for f in cls.body if isinstance(f, ast.FunctionDef)}
+        for name in entries:
+            f = methods[name]
+            body = [b for b in f.body if not (isinstance(b, ast.Expr) and isinstance(b.value, ast.Constant))]
+            self.assertIsInstance(body[0], ast.With, name)
+            self.assertEqual(ast.unparse(body[0].items[0].context_expr), "self._gate.shared()", name)
+            inner = ast.unparse(body[0]) + (ast.unparse(methods["_remember"]) if name == "remember" else "")
+            self.assertIn("self._pool_ok(pool)", inner, name)
+        ungated = {"_put", "_project", "advance_head", "_remember", "_append_source", "_record_retraction", "_hold_tainted",
+                   "_release_held", "_update_head"}
+        for name, f in methods.items():
+            if name.startswith("_") or name in entries or name == "advance_head":
+                continue   # advance_head is the head primitive, called only inside _remember and _create_pool_head (gated)
+            if "pool" not in {a.arg for a in f.args.args}:
+                continue
+            direct = {call_name(c) for c in ast.walk(f) if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                      and ast.unparse(c.func.value) == "self"}
+            self.assertFalse(direct & ungated, (name, sorted(direct & ungated)))
+        callers = {name for name, f in methods.items()
+                   if any(isinstance(c, ast.Call) and ast.unparse(c.func) == "self.advance_head" for c in ast.walk(f))}
+        self.assertEqual(callers, {"_remember", "_create_pool_head", "repair"})
+
+    def test_origin_is_read_in_one_place(self):
+        """C6 (pools delta review): a version's origin is read only by `origin_of` (missing or unknown is `unknown`, never `agent`)."""
+        for rel in ("gateway/pool_tools.py", "ingest/writer.py"):
+            for f in (n for n in ast.walk(parse(rel)) if isinstance(n, ast.FunctionDef) and n.name not in ("origin_of", "source_prov")):
+                for c in ast.walk(f):
+                    if isinstance(c, ast.Call) and call_name(c) == "get" and c.args and isinstance(c.args[0], ast.Constant):
+                        self.assertNotEqual(c.args[0].value, "origin", rel + ":" + f.name)
 
     def test_checker_reports_fabricated_kind(self):
         gaps = registration_gaps({"fabricated_kind"}, set(), set(), set(),

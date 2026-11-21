@@ -7,6 +7,7 @@ from living_context.config import Constants
 from living_context.gateway.sessions import TokenError
 from living_context.policy import pools as pl
 from tests.security.test_pool_tokens import Base, T, TB, UNAV, World, q
+from tests.unit.fake_es import unconfirmed_puts
 
 
 class Tokens(Base):
@@ -140,7 +141,7 @@ class Delegation(Base):
 
     def test_broken_delegation_variants_accept_what_the_real_code_refuses(self):
         for flag, scope_of, ttl in (("broken_scope_not_attenuated", lambda a, b: {b: q("save")}, 60),
-                                    ("broken_ttl_not_capped", lambda a, b: {a: q("query")}, 10**6)):
+                                    ("broken_ttl_not_capped", lambda a, b: {a: q("query")}, 7200)):   # past the parent, inside max_age
             w = World(tempfile.mkdtemp(), sess_kw={flag: True}).start()
             a, b = w.pool("alpha", ops={"query", "save", "update"}), w.pool("beta", ops={"query", "save"})
             r = w.mint("alice", {a: q("query", "save"), b: q("query")})
@@ -157,7 +158,7 @@ class Delegation(Base):
         with self.assertRaises(TokenError) as e:
             w.mint("alice", {self.a: q("query")}, conv="over")
         self.assertEqual(e.exception.code, "rate_limited")
-        w.sessions.revoke_hash(w.sessions.resolve(toks[0]).hash)   # a loop of mint and revoke cannot grow the records
+        w.sessions.revoke_hash(w.sessions.resolve(toks[0]).hash, T)   # a loop of mint and revoke cannot grow the records
         with self.assertRaises(TokenError):
             w.mint("alice", {self.a: q("query")}, conv="over2")
         w.clock.t += w.consts.token_ttl_s + 1
@@ -331,6 +332,77 @@ class Revocation(Base):
         w.restart()
         self.assertEqual(w.dir.live_ops(T, "pt-user-alice", a), frozenset())
         self.assertIsNone(w.auth(tok, {a: q("query")}))
+
+
+    def test_a_grant_removal_stays_unconfirmed_until_its_authz_write_is_confirmed(self):
+        # Round 5: at f16ea94 any 404 or 200 to the record's delete confirmed the removal, so compaction dropped its journal record and a
+        # restart rebuilt the grant from the authz copy, which still held it. Round 8: a removal is a write of the record with no
+        # operations (never a delete), conditioned on the record it read; only a well-formed acknowledgement about exactly this record,
+        # through the authz alias, confirms it. Any other answer to the write, or to the read it is conditioned on, leaves the removal
+        # unconfirmed (at the call and at the next start's write), and the journal keeps it.
+        gid0 = "pg:x"
+        cases = {f"PUT {n}": ("PUT", n) for n in unconfirmed_puts(f"lc-{T}-authz", gid0)}
+        cases.update({"GET 200 with an empty body": ("GET", (200, {})), "GET 404 with an empty body": ("GET", (404, {})),
+                      "GET 503": ("GET", (503, {}))})
+        for name, (method, answer) in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                w = World(tmp).start()
+                a = w.pool("alpha")
+                gid = f"pg:pt-user-alice:{a}"
+                tok = w.mint("alice", {a: q("query")})
+                w.authz.doc_answers[(method, gid)] = unconfirmed_puts(f"lc-{T}-authz", gid)[answer] if method == "PUT" else answer
+                r = w.admin("pool_ungrant", who="user-alice", pool=a)
+                self.assertEqual((r["ok"], r["denied"], r["durable"]), (True, True, True))
+                self.assertIsNone(w.auth(tok, {a: q("query")}))
+                self.assertEqual(w.authz.docs[gid]["ops"], ["query", "save"])   # the answer was no write: the copy still holds the grant
+                self.assertEqual(len(w.svc._unconfirmed), 1)
+                w.rev.compact()
+                w.restart()
+                self.assertEqual(w.dir.live_ops(T, "pt-user-alice", a), frozenset())   # the journal kept the removal
+                self.assertIsNone(w.auth(tok, {a: q("query")}))
+                self.assertEqual(len(w.svc._unconfirmed), 1)                         # the start-up write got the same answer
+                w.rev.clean_stop()
+
+    def test_a_partial_grant_removal_stays_unconfirmed_until_its_authz_put_is_confirmed(self):
+        # Round 6 (F18): at 4e7ee85 the replacement PUT of a partial removal (remove `query`, keep `save`) was accepted on its HTTP status
+        # alone, so an answer that wrote nothing cleared the journal retention entry; compaction dropped the record and a restart rebuilt
+        # `query` from the authz copy. Only a well-formed acknowledgement about exactly this record (`reads.doc_written` through the
+        # authz alias) confirms it now; anything else leaves the removal unconfirmed and the journal keeps it.
+        for name in unconfirmed_puts(f"lc-{T}-authz", "pg:x"):
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                w = World(tmp).start()
+                a = w.pool("alpha", ops={"query", "save"})
+                gid = f"pg:pt-user-alice:{a}"
+                tok = w.mint("alice", {a: q("query", "save")})
+                w.authz.doc_answers[("PUT", gid)] = unconfirmed_puts(f"lc-{T}-authz", gid)[name]
+                r = w.admin("pool_ungrant", who="user-alice", pool=a, ops=["query"])
+                self.assertEqual((r["ok"], r["denied"], r["durable"]), (True, True, True))
+                self.assertEqual(w.authz.docs[gid]["ops"], ["query", "save"])   # the answer was no write: the authz copy still holds query
+                pending = len(w.svc._unconfirmed)
+                w.rev.compact()
+                w.restart()
+                self.assertEqual(w.dir.live_ops(T, "pt-user-alice", a), frozenset({"save"}))   # the journal kept the removal
+                self.assertIsNone(w.auth(tok, {a: q("query")}))
+                self.assertIsNotNone(w.auth(tok, {a: q("save")}))
+                self.assertEqual(pending, 1)                                     # because it stayed unconfirmed
+                w.rev.clean_stop()
+
+    def test_control_a_confirmed_partial_removal_is_dropped_by_compaction_and_survives_a_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            w = World(tmp).start()
+            a = w.pool("alpha", ops={"query", "save"})
+            gid = f"pg:pt-user-alice:{a}"
+            tok = w.mint("alice", {a: q("query", "save")})
+            r = w.admin("pool_ungrant", who="user-alice", pool=a, ops=["query"])
+            self.assertEqual((r["ok"], r["denied"], r["durable"]), (True, True, True))
+            self.assertEqual(w.authz.docs[gid]["ops"], ["save"])
+            self.assertEqual(w.svc._unconfirmed, {})                              # a confirmed write: the record is not needed
+            w.rev.compact()
+            w.restart()
+            self.assertEqual(w.dir.live_ops(T, "pt-user-alice", a), frozenset({"save"}))   # rebuilt from the authz copy
+            self.assertIsNone(w.auth(tok, {a: q("query")}))
+            self.assertIsNotNone(w.auth(tok, {a: q("save")}))
+            w.rev.clean_stop()
 
 
 if __name__ == "__main__":

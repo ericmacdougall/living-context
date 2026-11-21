@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Optional
 
-from ..gateway import validator
+from ..gateway import reads, validator
 from ..gateway.es import EsClient
 from ..gateway.fence import SendFence
 from ..gateway.gate import WriteGate
@@ -30,6 +30,7 @@ DELETE_KINDS = frozenset({"src", "leaf", "member", "edge", "log", "sq", "note", 
                           "idem", "session", "grant", "judge", "pgrant", "token", "pool", "retraction", "event"})
 REWRITE_KINDS = frozenset({"node"})
 KEEP_KINDS = frozenset({"manifest", "tomb", "counter", "idem_scope"})  # ids only, or no content
+REWRITE_TRIES = 3   # a node rewrite that loses its compare-and-set this many times raises (the erasure is retried)
 
 
 class Held(Exception):
@@ -149,6 +150,15 @@ class Executor:
                     out.add(h.search_id)
         return out
 
+    def _visible(self, er) -> None:
+        """Every acknowledged write of the tenant is searchable before the closure (or the residue recount) is read: a refresh of
+        `lc-<t>-*` that every primary ran (`reads.refresh`). A refresh that did not would let the closure miss a document the erasure
+        must reach, and the receipt certify it (review round 6), so anything else raises `ScanError` and nothing is published."""
+        try:
+            reads.refresh(er, f"lc-{self.tenant}-*")
+        except reads.IncompleteRead as e:
+            raise scan.ScanError("refresh before the closure failed") from e
+
     # ---- the request ------------------------------------------------------------------------------------------
     def erase_item(self, leaf_ids: Iterable[str], *, apply_guard: Callable[[], None] = lambda: None) -> Receipt:
         """Erase one or more items (DESIGN 14.1): every version of the named leaves and everything derived from them."""
@@ -162,7 +172,7 @@ class Executor:
         t0 = time.monotonic()
         er, rc = self._er(), Receipt()
         with self._gate.exclusive():
-            er.request("POST", f"/lc-{self.tenant}-*/_refresh")
+            self._visible(er)
             hits, leaves = self.closure(subject, item_leaves)
             self._pause("closure")
             self._check_holds(subject, leaves, hits)
@@ -205,7 +215,7 @@ class Executor:
         er, rc = self._er(), Receipt()
         leaves = set(leaf_ids)
         with self._gate.exclusive():
-            er.request("POST", f"/lc-{self.tenant}-*/_refresh")
+            self._visible(er)
             hits, found = self.closure(subject, leaves)
             leaves |= found
             if leaves:
@@ -264,7 +274,7 @@ class Executor:
         t0, er, rc = time.monotonic(), self._er(), Receipt()
         leaf_ids = sorted(set(leaf_ids))
         with self._gate.exclusive():
-            er.request("POST", f"/lc-{self.tenant}-*/_refresh")
+            self._visible(er)
             hits, lv_max = self.class_closure(leaf_ids, old_cls)
             self._check_holds("", leaf_ids, hits)
             redact = sorted({h.id for h in hits.values()})
@@ -279,7 +289,7 @@ class Executor:
         """The restore's replay of a relabel tombstone: the old-class closure only; the new-class version (a higher `lv`) stays."""
         t0, er, rc = time.monotonic(), self._er(), Receipt()
         with self._gate.exclusive():
-            er.request("POST", f"/lc-{self.tenant}-*/_refresh")
+            self._visible(er)
             hits, _ = self.class_closure(leaf_ids, old_cls)
             hits = {k: h for k, h in hits.items() if self._relabel_all or self._within(h, lv_max)}
             redact = sorted({h.id for h in hits.values()})
@@ -327,8 +337,7 @@ class Executor:
             elif h.kind in REWRITE_KINDS:
                 rc.rewritten += self._rewrite_node(h, leaves, subject)
                 touched.add(h.index)
-        def one(ix: str):
-            er.request("POST", f"/{ix}/_refresh")
+        def one(ix: str):   # purge_index refreshes and flushes the index itself before its expunge passes
             return ix, purge.purge_index(er, ix, deadline_s=self._pd, interval_s=self._pi)
 
         with ThreadPoolExecutor(max(1, min(8, len(touched)))) as ex:  # the tombstone clocks run side by side
@@ -336,7 +345,7 @@ class Executor:
                 rc.purge_s[ix] = round(res.seconds, 1)
                 rc.purge_left[ix] = res.deleted_left
                 rc.purge_ok &= res.ok
-        er.request("POST", f"/lc-{self.tenant}-*/_refresh")
+        self._visible(er)   # the residue recount reads what every applied delete left
         remaining = [h for h in scan.find(er, self.tenant, subjects=[subject] if subject else [], leaf_ids=leaves)
                      if h.kind not in KEEP_KINDS | REWRITE_KINDS]
         if cls is not None:   # the new-class copy names the same leaf ids: only the old class's documents are residue
@@ -347,11 +356,26 @@ class Executor:
 
     def _rewrite_node(self, h: scan.Hit, leaves: set, subject: str) -> int:
         """A node version that names an erased leaf or derives from one: the child entries of erased leaves and every
-        gist, fact and summary go (the code-built placeholder, no model call); lineage is pruned of what was erased."""
+        gist, fact and summary go (the code-built placeholder, no model call); lineage is pruned of what was erased.
+
+        Returns 1 when the rewrite landed, 0 only when the node version is verifiably gone (`reads.read_doc`: a 404 about exactly this
+        `_index` and `_id`, or the index absent). A failed or malformed read or write raises `ScanError` (review round 5: the residue
+        recount does not count rewrite kinds, so a silent 0 left the erased content in place unreported). A lost compare-and-set (a
+        concurrent write to the node) is re-read and retried, a bounded number of times."""
         st = self._st()
-        code, doc = st.request("GET", f"/{h.index}/_doc/{h.id}")
-        if code != 200:
-            return 0
+        for _ in range(REWRITE_TRIES):
+            try:
+                doc = reads.read_doc(st, h.index, h.id)
+            except reads.IncompleteRead as e:
+                raise scan.ScanError("node read failed") from e
+            if doc is None:
+                return 0
+            if self._rewrite_once(st, h, doc, leaves, subject):
+                return 1
+        raise scan.ScanError("node rewrite lost every compare-and-set")
+
+    @staticmethod
+    def _rewrite_once(st: EsClient, h: scan.Hit, doc: dict, leaves: set, subject: str) -> bool:
         s = doc["_source"]
         s["children"] = [{**{k: v for k, v in c.items() if k not in ("gist", "facts", "entities")}, "gist": "", "facts": [],
                           "entities": []} for c in s.get("children", []) if c.get("child_id") not in leaves]
@@ -361,8 +385,10 @@ class Executor:
         s["lin_subjects"] = [x for x in s.get("lin_subjects", []) if x != subject]
         if not (s["lin_leaf_ids"] or s["lin_nodes"] or s["lin_subjects"]):
             s["lin_nodes"] = ["erased"]
-        code, _ = st.request("PUT", f"/{h.index}/_doc/{h.id}?if_seq_no={doc['_seq_no']}&if_primary_term={doc['_primary_term']}", s)
-        return 1 if code in (200, 201) else 0
+        try:
+            return reads.put_doc(st, h.index, h.id, s, f"if_seq_no={doc['_seq_no']}", f"if_primary_term={doc['_primary_term']}")
+        except reads.IncompleteRead as e:
+            raise scan.ScanError("node rewrite failed") from e
 
     def _strip_or_delete_log_row(self, h: scan.Hit, leaves: set, subject: str, seq: int, rc: Receipt) -> bool:
         """DESIGN 14.3 step 5: a row whose actor is the subject, or whose query text mentions the subject, is the subject's
@@ -370,9 +396,12 @@ class Executor:
         history: its pointer and the item's subject tokens are stripped by an in-place rewrite (`erasure_rewrite = seq`,
         DEVIATION 6). The document id still holds the offered leaf id (an id, no content; a stated limit)."""
         st = self._lg()
-        code, doc = st.request("GET", f"/{h.index}/_doc/{h.id}")
-        if code != 200:
-            raise scan.ScanError(f"log row read failed ({code})")
+        try:
+            doc = reads.read_doc(st, h.index, h.id)
+        except reads.IncompleteRead as e:
+            raise scan.ScanError("log row read failed") from e
+        if doc is None:
+            raise scan.ScanError("log row read failed")   # unchanged: a row the closure found and cannot read is an error (retry)
         s = doc["_source"]
         item_subjects = set(s.get("item_subjects", []))
         own = (set(s.get("lin_subjects", [])) - item_subjects) | {s.get("actor", "")}
@@ -380,8 +409,11 @@ class Executor:
             rc.deleted += scan.delete(self._er(), [h])
             return True
         s.update(pointer={}, lin_leaf_ids=[], item_subjects=[], lin_subjects=sorted(own - {""}), erasure_rewrite=seq)
-        code, _ = st.request("PUT", f"/{h.index}/_doc/{h.id}?if_seq_no={doc['_seq_no']}&if_primary_term={doc['_primary_term']}", s)
-        if code not in (200, 201):
-            raise scan.ScanError(f"log row rewrite failed ({code})")
+        try:
+            landed = reads.put_doc(st, h.index, h.id, s, f"if_seq_no={doc['_seq_no']}", f"if_primary_term={doc['_primary_term']}")
+        except reads.IncompleteRead as e:
+            raise scan.ScanError("log row rewrite failed") from e
+        if not landed:
+            raise scan.ScanError("log row rewrite failed (conflict)")
         rc.stripped += 1
         return True

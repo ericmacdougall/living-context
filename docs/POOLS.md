@@ -226,9 +226,23 @@ does:
   `lc-<t>-authz` and then applies the journal on top: a grant or state in authz
   that a later journal record removed stays removed. A grant re-made after a
   removal is a new grant document with a higher counter, so it is not confused
-  with the removed one.
-- Compaction keeps a pool-grant or detach record until the authz index has been
-  read back without the removed grant (the best-effort write landed), and a
+  with the removed one. Start-up restores only records that are exactly what
+  they claim (index, id, tenant and kind checked by one judge, `reads.restored`);
+  a record that fails is not restored and makes the read incomplete, so nothing
+  is confirmed from it.
+- Every write of a pool or pool-grant record is a compare-and-set against the
+  record it read, taken from memory after that read, so a write built before a
+  change can never land after the change's own write. A removal writes the
+  grant record with no operations; it never deletes it. Pool counters are
+  reserved per process in the epoch journal (a ceiling record), so a grant of an
+  earlier process always carries a lower counter than a later removal.
+- Compaction keeps a pool-grant record until a write of that grant made after
+  the removal has landed. A read of the authz index never confirms a removal: a
+  start-up writes each unconfirmed grant again and confirms it only when that
+  write lands. No grant record is written for a pool that is being deleted, and
+  a removal on a pool that has been erased is dropped at the next start, so no
+  record of an erased pool is written back. Compaction keeps a detach record
+  while the pool is detached, and a
   token-revoke record until its `exp` passes, at most `TOKEN_TTL` after the
   revoke. Bound: a principal holds at most `TOK_LIVE_MAX` tokens whose `exp` has
   not passed, revoked or not (2.6), so it has at most `TOK_LIVE_MAX` revoke
@@ -1126,7 +1140,8 @@ Conflicts (quote, then the resolving edit):
 - DESIGN 4.4 removal of a class grant bumps the epoch; pool access removal is the
   journalled record of 2.5 instead. The same restart gap exists for class-grant
   removal (a removed class grant re-read from best-effort authz on a re-mint);
-  the edit applies the journal record to class-grant removal too.
+  the edit applies the journal record to class-grant removal too (built in review
+  round 7: `admin.GrantStore.reduce` journals every grant reduction before the answer).
 - DESIGN 4.4 `J_SIZE = 4 MiB`: 16 MiB, with `J_SOFT` and the principal-closed
   record (2.5 arithmetic).
 - DESIGN 4.4 break-glass recovery rebuilds from the journal and authz and

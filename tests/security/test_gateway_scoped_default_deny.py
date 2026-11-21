@@ -20,6 +20,9 @@ class Recorder:
         self.calls.append(op)
         return {"ok": True}
 
+    def admit(self):   # the tenant journal is open
+        return True
+
 
 class ScopedDefaultDeny(Base):
     def gateway(self, w):

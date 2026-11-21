@@ -78,7 +78,8 @@ class IsolationOnElasticsearch(unittest.TestCase):
         cls.stores = {t: Keystore(root / "ks" / f"{t}.db", t) for t in TENANTS}
         cls.writers = {t: Writer(lambda t=t: cls.es.client(t, "ingest"), cls.stores[t], t,
                                  Guard(TokenSource(cls.stores[t]))) for t in TENANTS}
-        cls.gw = Gateway(cls.es, cls.sessions, {t: LAT for t in TENANTS}, writers=lambda t: cls.writers[t])
+        cls.gw = Gateway(cls.es, cls.sessions, {t: LAT for t in TENANTS}, writers=lambda t: cls.writers[t],
+                         admits=lambda t: True)   # no epoch journal in this test: admission is explicit (no fail-open default)
         cls.tok = {t: cls.sessions.mint(t, b"user") for t in TENANTS}
         cls.sup = {t: cls.sessions.mint(t, b"usersuper") for t in TENANTS}
         cls.ptr = {}
@@ -194,7 +195,8 @@ class IsolationOnElasticsearch(unittest.TestCase):
         self.assertEqual(before, after)
 
     def test_t3_broken_gateway_that_forwards_a_sub_response_is_caught(self):
-        bad = Forwarding(self.es, self.sessions, {t: LAT for t in TENANTS}, writers=lambda t: self.writers[t])
+        bad = Forwarding(self.es, self.sessions, {t: LAT for t in TENANTS}, writers=lambda t: self.writers[t],
+                         admits=lambda t: True)   # as `cls.gw`: no epoch journal here, admission is explicit (F1 has no fail-open default)
         for ix in ("lc-tenb-base-leaf", "lc-tenb-base-alias"):
             r = bad.handle(self.tok["tena"], {"op": "lookup", "index": ix})
             self.assertIn("lc-tenb", json.dumps(r), ix)  # the leak the clean checks must see

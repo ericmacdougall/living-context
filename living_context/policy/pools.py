@@ -72,18 +72,33 @@ class PoolDirectory:
         self._pools: dict[tuple[str, str], Pool] = {}
         self._grants: dict[tuple[str, str, str], tuple[frozenset, int]] = {}   # (tenant, principal, pool) -> (ops, counter)
         self._counters: dict[str, int] = {}
+        self._ceilings: dict[str, int] = {}
         self._used_ids: set[tuple[str, str]] = set()
 
     # ---- counters --------------------------------------------------------------------------------------------------
     def next_counter(self, tenant: str) -> int:
+        """The next counter of the tenant. Past the ceiling the caller reserved (`limit_counter`) there is none: a counter is never
+        taken that a later process could take again (`gateway.pool_admin.PoolService.reserve_counters`)."""
         with self._lock:
-            self._counters[tenant] = self._counters.get(tenant, 0) + 1
-            return self._counters[tenant]
+            c = self._counters.get(tenant, 0) + 1
+            if c > self._ceilings.get(tenant, c):
+                raise PoolError("counter block exhausted")
+            self._counters[tenant] = c
+            return c
 
     def observe_counter(self, tenant: str, counter: int) -> None:
         """A counter read back from a store or the journal at start: the next one is above it."""
         with self._lock:
             self._counters[tenant] = max(self._counters.get(tenant, 0), int(counter))
+
+    def counter(self, tenant: str) -> int:
+        with self._lock:
+            return self._counters.get(tenant, 0)
+
+    def limit_counter(self, tenant: str, ceiling: int) -> None:
+        """The tenant's counters stop at `ceiling` (the block this process reserved in the epoch journal)."""
+        with self._lock:
+            self._ceilings[tenant] = int(ceiling)
 
     # ---- pools -------------------------------------------------------------------------------------------------------
     def create(self, tenant: str, cls: str, kind: str, label: str, card: str = "") -> Pool:
@@ -177,6 +192,13 @@ class PoolDirectory:
         with self._lock:
             self.observe_counter(tenant, counter)
             self._grants[(tenant, principal, pool_id)] = (frozenset(ops), int(counter))
+
+    def grant_state(self, tenant: str, principal: str, pool_id: str) -> tuple[frozenset, int, int]:
+        """In one step: the grant's operations and counter (none: empty, 0), and the tenant's counter now. Every change of the grant made
+        at a counter up to the last value is in the first two."""
+        with self._lock:
+            ops, c = self._grants.get((tenant, principal, pool_id), (frozenset(), 0))
+            return ops, c, self._counters.get(tenant, 0)
 
     def live_ops(self, tenant: str, principal: str, pool_id: str) -> frozenset:
         with self._lock:
