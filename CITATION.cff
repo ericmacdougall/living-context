@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below. A paper is in preparation."
+title: living-context
+type: software
+authors:
+  - family-names: MacDougall
+    given-names: Eric
+repository-code: "https://github.com/ericmacdougall/living-context"
+license: BUSL-1.1
+version: 0.1.0-dev
+date-released: 2026-11-21
+abstract: >-
+  Layered, self-reorganising long-term memory for AI agents: size-bounded
+  leaves under a recursive summary tree, recall by fan-out down the tree fused
+  with flat search. Graph cross-links and an evidence-driven reorganisation loop
+  are designed and not evaluated. Experimental; the method is not proven.
+keywords:
+  - agent memory
+  - retrieval
+  - long-term memory

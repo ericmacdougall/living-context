@@ -1,0 +1,185 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="720pt" height="528pt"
+     viewBox="0 0 1080 792" font-family="Arial" role="img" aria-labelledby="title description">
+  <title id="title">living-context — Memory index and recall</title>
+  <desc id="description">Ingest splits sessions into size-bounded leaves. L1 summaries
+    group leaves and upper levels recursively summarise lower levels. Proposed graph
+    edges cross-link leaves. At query time LLM holders fan out down the index in
+    parallel and return pointers and sizes only. Organise ranks the tree pointers.
+    Reciprocal-rank fusion combines the tree and flat hybrid BM25 and dense rankings
+    and offers a pointer set to the agent. The dashed feedback loop uses offered,
+    opened and used events, reflection and reverse audit to propose a reorganisation.
+    Replay determines whether to adopt the candidate index or reject it. The graph
+    cross-links and the feedback loop are designed, not yet evaluated.</desc>
+  <defs>
+    <style>
+      text { fill: #172D35; }
+      .title { font-size: 39px; font-weight: 700; }
+      .name { font-size: 23px; font-weight: 500; }
+      .section { font-size: 26px; font-weight: 700; }
+      .label { font-size: 19px; font-weight: 600; }
+      .body { font-size: 17px; }
+      .small { font-size: 15px; }
+      .muted { fill: #48616B; }
+      .teal { fill: #006F68; }
+      .ochre { fill: #87581F; }
+      .wire { fill: none; stroke: #425B65; stroke-width: 2; stroke-linejoin: round; }
+      .route { fill: none; stroke: #006F68; stroke-width: 2.5; stroke-linejoin: round; }
+      .plan { fill: none; stroke: #87581F; stroke-width: 2; stroke-dasharray: 6 5; stroke-linejoin: round; }
+      .glyph { fill: none; stroke: #607784; stroke-width: 1.8; stroke-linecap: round; }
+      .node { fill: #F0F4F3; stroke: #536B73; stroke-width: 1.8; }
+      .call { fill: #E8F4F1; stroke: #006F68; stroke-width: 1.8; }
+      .proposed { fill: #FDFAF5; stroke: #87581F; stroke-width: 1.6; stroke-dasharray: 6 5; }
+    </style>
+    <marker id="arrow" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10"
+            refX="8" refY="5" orient="auto" viewBox="0 0 10 10">
+      <path d="M1 1 L9 5 L1 9 Z" fill="#425B65"/>
+    </marker>
+    <marker id="route-arrow" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10"
+            refX="8" refY="5" orient="auto" viewBox="0 0 10 10">
+      <path d="M1 1 L9 5 L1 9 Z" fill="#006F68"/>
+    </marker>
+    <marker id="plan-arrow" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10"
+            refX="8" refY="5" orient="auto" viewBox="0 0 10 10">
+      <path d="M1 1 L9 5 L1 9 Z" fill="#87581F"/>
+    </marker>
+  </defs>
+
+  <rect width="1080" height="792" fill="white"/>
+  <text class="title" x="46" y="59">Memory index and recall</text>
+  <text class="name teal" x="1034" y="56" text-anchor="end">living-context</text>
+  <path d="M46 80 H1034 M46 324 H1034 M46 604 H1034" stroke="#D5DEDC" stroke-width="1.5"/>
+
+  <!-- Build from left to right. Each pair of leaves shares an L1 holder. -->
+  <g id="index-construction">
+    <text class="section" x="46" y="121">Index construction</text>
+    <g class="label" text-anchor="middle">
+      <text x="100" y="161">Ingest</text>
+      <text x="327" y="161">Size-bounded leaves</text>
+      <text x="587" y="161">L1 summaries</text>
+      <text x="849" y="161">Upper index levels</text>
+    </g>
+    <g aria-label="Source sessions">
+      <rect class="node" x="70" y="194" width="51" height="56" rx="3"/>
+      <rect class="node" x="77" y="200" width="51" height="56" rx="3"/>
+      <rect x="84" y="206" width="51" height="56" rx="3" fill="white" stroke="#536B73" stroke-width="1.8"/>
+      <path class="glyph" d="M94 222 H124 M94 230 H121 M94 238 H115 M94 246 H125"/>
+      <text class="body muted" x="100" y="298" text-anchor="middle">Sessions</text>
+    </g>
+    <path class="wire" d="M148 232 H226" marker-end="url(#arrow)"/>
+    <rect x="234" y="173" width="183" height="110" rx="6" fill="#F5F8F7"/>
+    <g aria-label="Four leaves with a graph link between leaves in different groups">
+      <path class="plan" d="M284 187 C244 187 244 268 284 268"/>
+      <circle cx="282" cy="187" r="3.5" fill="#87581F"/>
+      <circle cx="282" cy="268" r="3.5" fill="#87581F"/>
+      <g class="node">
+        <rect x="286" y="178" width="103" height="18" rx="4"/>
+        <rect x="286" y="205" width="103" height="18" rx="4"/>
+        <rect x="286" y="232" width="103" height="18" rx="4"/>
+        <rect x="286" y="259" width="103" height="18" rx="4"/>
+      </g>
+      <path class="glyph" d="M298 187 H317 M324 187 H359 M298 214 H338 M345 214 H376
+                              M298 241 H310 M317 241 H350 M298 268 H331 M338 268 H363"/>
+      <path class="plan" d="M194 301 H218"/>
+      <text class="small ochre" x="225" y="306">Graph cross-links · unevaluated</text>
+    </g>
+    <g class="wire">
+      <path d="M389 187 H446 L471 201 H531" marker-end="url(#arrow)"/>
+      <path d="M389 214 H446 L471 201"/>
+      <path d="M389 241 H446 L471 255 H531" marker-end="url(#arrow)"/>
+      <path d="M389 268 H446 L471 255"/>
+      <path d="M641 201 H680 L723 228 H761" marker-end="url(#arrow)"/>
+      <path d="M641 255 H680 L723 228"/>
+      <path d="M852 228 H923" marker-end="url(#arrow)"/>
+    </g>
+    <g class="node">
+      <rect x="537" y="185" width="104" height="32" rx="4"/>
+      <rect x="537" y="239" width="104" height="32" rx="4"/>
+      <rect x="767" y="208" width="85" height="40" rx="4"/>
+      <rect x="929" y="208" width="64" height="40" rx="4"/>
+    </g>
+    <path class="glyph" d="M550 196 H626 M550 206 H605 M550 250 H622 M550 260 H610
+                           M780 222 H837 M780 233 H822 M942 222 H980 M942 233 H971"/>
+    <text class="body muted" x="855" y="298" text-anchor="middle">Summarise recursively</text>
+  </g>
+
+  <!-- The same query feeds both rankings. Holders return reference metadata. -->
+  <g id="query-time-recall">
+    <text class="section" x="46" y="365">Query-time recall</text>
+    <text class="label teal" x="228" y="403">Parallel tree routing</text>
+    <text class="small muted" x="228" y="425">LLM calls descend the index</text>
+
+    <rect x="46" y="472" width="106" height="46" rx="23" fill="#172D35"/>
+    <text class="label" x="99" y="502" text-anchor="middle" style="fill:white">Query</text>
+    <path class="wire" d="M152 495 H186"/>
+    <path class="route" d="M186 495 V461 H236" marker-end="url(#route-arrow)"/>
+    <path class="wire" d="M186 495 V558 H219" marker-end="url(#arrow)"/>
+    <circle cx="186" cy="495" r="3" fill="#172D35"/>
+    <g class="route">
+      <path d="M270 461 H291 L316 441 H339" marker-end="url(#route-arrow)"/>
+      <path d="M291 461 H339" marker-end="url(#route-arrow)"/>
+      <path d="M291 461 L316 481 H339" marker-end="url(#route-arrow)"/>
+      <path d="M389 441 H410 L435 461 H479" marker-end="url(#route-arrow)"/>
+      <path d="M389 461 H435 M389 481 H410 L435 461"/>
+    </g>
+    <g class="call">
+      <rect x="242" y="451" width="28" height="20" rx="3"/>
+      <rect x="345" y="434" width="44" height="14" rx="3"/>
+      <rect x="345" y="454" width="44" height="14" rx="3"/>
+      <rect x="345" y="474" width="44" height="14" rx="3"/>
+      <rect x="485" y="438" width="133" height="46" rx="5"/>
+    </g>
+    <text class="label teal" x="551.5" y="467" text-anchor="middle">Organise</text>
+    <text class="body teal" x="228" y="511">Holders return pointers + sizes only.</text>
+
+    <rect class="node" x="225" y="532" width="250" height="53" rx="5"/>
+    <text class="label" x="241" y="555">Flat hybrid search</text>
+    <text class="small muted" x="241" y="575">BM25 + dense</text>
+
+    <path class="route" d="M618 461 H647 Q653 461 653 467 V480 Q653 486 659 486 H677" marker-end="url(#route-arrow)"/>
+    <path class="wire" d="M475 558 H647 Q653 558 653 552 V518 Q653 512 659 512 H677" marker-end="url(#arrow)"/>
+    <rect x="683" y="466" width="168" height="66" rx="5" fill="#F0F4F3" stroke="#425B65" stroke-width="1.8"/>
+    <text class="label" x="767" y="494" text-anchor="middle">Reciprocal-rank</text>
+    <text class="body" x="767" y="517" text-anchor="middle">fusion (RRF)</text>
+    <path class="wire" d="M851 499 H926" marker-end="url(#arrow)"/>
+    <text class="small" x="892" y="484" text-anchor="middle">Pointer set</text>
+    <rect x="932" y="476" width="92" height="46" rx="23" fill="#172D35"/>
+    <text class="label" x="978" y="506" text-anchor="middle" style="fill:white">Agent</text>
+  </g>
+
+  <!-- Agent observations enter at the left; only adoption changes the index. -->
+  <g id="feedback-and-reorganisation">
+    <text class="section" x="46" y="646">Feedback and reorganisation</text>
+    <path class="plan" d="M423 637 H454"/>
+    <text class="body ochre" x="464" y="643">designed, not yet evaluated</text>
+    <g class="plan">
+      <path d="M978 523 V660 Q978 667 971 667 H151 Q144 667 144 674 V690" marker-end="url(#plan-arrow)"/>
+      <path d="M233 725 H258" marker-end="url(#plan-arrow)"/>
+      <path d="M469 725 H494" marker-end="url(#plan-arrow)"/>
+      <path d="M671 725 H696" marker-end="url(#plan-arrow)"/>
+      <path d="M831 725 H849 L871 704 H898" marker-end="url(#plan-arrow)"/>
+      <path d="M849 725 L871 746 H898" marker-end="url(#plan-arrow)"/>
+      <path d="M989 704 H1043 Q1050 704 1050 697 V235 Q1050 228 1043 228 H999" marker-end="url(#plan-arrow)"/>
+    </g>
+    <g class="proposed">
+      <rect x="46" y="696" width="187" height="58" rx="5"/>
+      <rect x="264" y="696" width="205" height="58" rx="5"/>
+      <rect x="500" y="696" width="171" height="58" rx="5"/>
+      <rect x="702" y="696" width="129" height="58" rx="5"/>
+      <rect x="904" y="689" width="85" height="30" rx="15"/>
+      <rect x="904" y="731" width="85" height="30" rx="15"/>
+    </g>
+    <g text-anchor="middle" class="body">
+      <text x="139.5" y="721">Usage events</text>
+      <text class="small muted" x="139.5" y="742">offered / opened / used</text>
+      <text x="366.5" y="721">Reflection</text>
+      <text x="366.5" y="742">and reverse audit</text>
+      <text x="585.5" y="721">Candidate</text>
+      <text x="585.5" y="742">reorganisation</text>
+      <text x="766.5" y="721">Replay gate</text>
+      <text class="small muted" x="766.5" y="742">Improves?</text>
+      <text x="946.5" y="710">Adopt</text>
+      <text x="946.5" y="752">Reject</text>
+    </g>
+  </g>
+</svg>
