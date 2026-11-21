@@ -174,8 +174,8 @@ def per_category(run: Run, qids: Sequence[str], arms: Sequence[str], resamples: 
 
 
 def md_category(title: str, pc: dict, arms: Sequence[str], names: Mapping[str, str]) -> List[str]:
-    L = ["### %s" % title, "", "Categories are labelled by number (the LoCoMo repository does not name them). Category 3 has very few questions in the subset: its "
-         "intervals are printed but are not interpretable.", "",
+    L = ["### %s" % title, "", "Categories are labelled by number (the LoCoMo repository does not name them). Category 3 has few questions (about 6 in B1): its "
+         "intervals are printed but are not interpretable at that size.", "",
          "| Category | n | " + " | ".join("%s leaf@10" % names[a] for a in arms) + " | " + " | ".join("%s sess@5" % names[a] for a in arms)
          + (" | A1 minus A0 leaf@10 |" if "A1" in arms and "A0" in arms else " |"), "|---|---|" + "---|" * (2 * len(arms) + (1 if "A1" in arms and "A0" in arms else 0))]
     for cat, r in pc.items():
@@ -257,7 +257,7 @@ def build(run: Run, resamples: int) -> dict:
     res["completion"] = {"eligible_questions": len(allq), "a0_all_rows": len(run.a0), "b1_planned": len(planned), "b1_completed": len(b1),
                          "shuffled_planned": len(sh_planned), "shuffled_completed": len(sh_done), "b2_completed": len(b2),
                          "state": run.state.get("state"), "counter": run.state.get("counter", len(run.calls)), "cap": run.state.get("cap", run.stamp.get("cap")),
-                         "models_reported": run.state.get("models_reported"), "commit": run.stamp.get("commit"), "concurrency_changes": run.state.get("concurrency_changes"),
+                         "models_reported": run.state.get("models_reported") or sorted({m for r in run.calls for m in r.get("models_reported", [])}), "commit": run.stamp.get("commit"), "concurrency_changes": run.state.get("concurrency_changes"),
                          "excluded_no_evidence": None, "pools": run.pools}
     a0q = [q for q in allq if q in run.a0]
     res["a0_all"] = {"block": None}
@@ -293,8 +293,8 @@ def build(run: Run, resamples: int) -> dict:
         sb["shuffled_failed"] = sum(run.done["B1"][q]["arms"]["SHUFFLED"]["failed"] for q in sh_done)
         sb["shuffled_mean_leaves"] = statistics.mean(len(run.done["B1"][q]["arms"]["SHUFFLED"]["leaves"]) for q in sh_done)
         res["shuffled"] = sb
-    tl = [statistics.mean(len(run.done_row(q)["arms"]["A1-tree-only"]["leaves"]) for q in b1)] if b1 else []
-    res["tree_only_mean_list_length_B1"] = tl[0] if tl else None
+    res["tree_only_mean_list_length"] = {name: statistics.mean(len(run.done_row(q)["arms"]["A1-tree-only"]["leaves"]) for q in qs)
+                                         for name, qs in (("B1", b1), ("B2", b2)) if qs}
     res["cost"] = cost(run)
     return res
 
@@ -330,8 +330,9 @@ def render(res: dict, run: Run) -> str:
         L += md_category("Per category", b["by_category"], ARMS, names)
         L += ["Tree recalls that failed (scored 0, kept): %d of %d. A0 at recall time equals the A0 of the all-questions stage on %d of %d questions." % (
             b["tree_failed_recalls"], b["n"], b["a0_recall_time_equals_a0_all"]["same"], b["a0_recall_time_equals_a0_all"]["of"]), ""]
-    if res.get("tree_only_mean_list_length_B1") is not None:
-        L += ["A1-tree-only returns on average %.2f leaves per question in B1 (it is scored as returned, not padded to 10)." % res["tree_only_mean_list_length_B1"], ""]
+    if res.get("tree_only_mean_list_length"):
+        L += ["A1-tree-only returns on average %s leaves per question (scored as returned, not padded to 10); the pools hold 25 to 60 leaves." % ", ".join(
+            "%.2f in %s" % (v, k) for k, v in res["tree_only_mean_list_length"].items()), ""]
     if "shuffled" in res:
         s = res["shuffled"]
         L += ["## SHUFFLED-SUMMARIES negative control", "", "On the %d questions where it ran. The expectation about zero is not pre-registered for pools this small." % s["n"],
