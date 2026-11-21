@@ -111,12 +111,16 @@ class ShardedFake(FakeEs):
     * a point in time (`POST /<pattern>/_pit`, then `POST /_search` with `pit` and `sort: _shard_doc`) gives every hit a value unique
       across the snapshot (shard number and document number), so `search_after` neither skips nor repeats.
 
-    `partial` makes the next N search answers HTTP 200 with a failed shard; `alias_status` answers `GET /<name>/_alias`. Not a
-    model of Elasticsearch beyond these cursors: the real behaviour is in the `_es` tests."""
+    `partial` makes the next N search answers HTTP 200 with a failed shard; `alias_status` answers `GET /<name>/_alias` with that
+    error status; `alias_answers[name]` and `pit_answers[name]` give the exact (status, body) of `GET /<name>/_alias` and
+    `POST /<name>/_pit` (a malformed answer). A missing name answers the 404 Elasticsearch gives, naming it (`index`, `resource.id`;
+    the shape tests/security/test_pools_rescue_es.py checks on the cluster). Not a model of Elasticsearch beyond these cursors: the
+    real behaviour is in the `_es` tests."""
 
     def __init__(self):
         super().__init__()
         self.aliases, self.pits, self.partial, self.alias_status, self.closed_pits = {}, {}, 0, None, []
+        self.alias_answers, self.pit_answers = {}, {}
 
     def _indices(self, pattern):
         import fnmatch
@@ -144,10 +148,12 @@ class ShardedFake(FakeEs):
         if op == "_alias":
             if self.alias_status is not None:
                 return self.alias_status, {"error": {"type": "unavailable_shards_exception"}}
-            hit = {n: {"aliases": {target: {}}} for n, al in self.aliases.items() if target in al}
+            if target in self.alias_answers:
+                return self.alias_answers[target]
+            hit = {n: {"aliases": {a: {} for a in sorted(al)}} for n, al in self.aliases.items() if target in al}
             if target in self.docs:
-                hit[target] = {"aliases": {}}
-            return (200, hit) if hit else (404, {"error": {"type": "index_not_found_exception"}, "status": 404})
+                hit[target] = {"aliases": {a: {} for a in sorted(self.aliases.get(target, ()))}}
+            return (200, hit) if hit else self._missing(target)
         if op.startswith("_doc/"):
             phys = self._indices(target)
             did = m.group(3)
@@ -160,12 +166,19 @@ class ShardedFake(FakeEs):
         if op == "_refresh":
             return 200, {"_shards": self._shards(len(phys))}
         if op == "_pit":
+            if target in self.pit_answers:
+                return self.pit_answers[target]
             if not phys and "ignore_unavailable=true" not in qs and "*" not in target:
-                return 404, {"error": {"type": "index_not_found_exception"}, "status": 404}
+                return self._missing(target)
             pid = f"pit{len(self.pits) + len(self.closed_pits)}"
             self.pits[pid] = [(n, list(self.docs[n].items())) for n in phys]   # the snapshot
             return 200, {"id": pid, "_shards": self._shards(len(phys))}
         return self._page([(n, list(self.docs[n].items())) for n in phys], body, unique=False)
+
+    @staticmethod
+    def _missing(name):
+        return 404, {"error": {"type": "index_not_found_exception", "reason": f"no such index [{name}]", "resource.type": "index_or_alias",
+                               "resource.id": name, "index_uuid": "_na_", "index": name}, "status": 404}
 
     def _page(self, snapshot, body, *, unique):
         hits = []

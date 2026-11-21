@@ -71,14 +71,35 @@ def refresh(client: Any, index: str, *params: str) -> None:
         raise IncompleteRead("refresh failed")
 
 
-def aliases(client: Any, name: str) -> list:
-    """The physical indices behind `name` (an alias or an index). A verified absence (HTTP 404, `index_not_found_exception`) is [];
-    any other failure or a malformed answer raises, so a failed discovery never reads as "no indices" (review F11)."""
-    st, r = client.request("GET", f"/{name}/_alias")
-    if st == 200 and isinstance(r, dict) and all(isinstance(k, str) for k in r):
-        return sorted(r)
+def exact_name(name: Any) -> str:
+    """`name` when it is one exact index or alias name (no wildcard, list or exclusion): only an exact name has a verifiable absence."""
+    if not isinstance(name, str) or not name or any(c in name for c in "*?,") or name.startswith(("-", "_", "+")):
+        raise ValueError("an exact index or alias name is required")
+    return name
+
+
+def absent(st: int, r: Any, name: str) -> bool:
+    """Whether an answer is a verified absence of the exact name `name`: HTTP 404, `index_not_found_exception`, and the error names
+    `name` (`index` or `resource.id`). Any other answer, an empty or malformed 200 included, proves nothing (review F11)."""
     err = r.get("error") if isinstance(r, dict) else None
-    if st == 404 and isinstance(err, dict) and err.get("type") == "index_not_found_exception":
+    return st == 404 and isinstance(err, dict) and err.get("type") == "index_not_found_exception" \
+        and name in (err.get("index"), err.get("resource.id"))
+
+
+def aliases(client: Any, name: str) -> list:
+    """The physical indices behind the exact name `name` (an alias or an index). [] only for a verified absence of that name
+    (`absent`). An HTTP 200 must be well formed and about `name`: at least one index, each with an `aliases` object, and either the one
+    index `name` itself or indices that all carry the alias `name`. Any other answer raises, so a failed or malformed discovery never
+    reads as "no indices" (review F11)."""
+    exact_name(name)
+    st, r = client.request("GET", f"/{name}/_alias")
+    if st == 200:
+        if isinstance(r, dict) and r and all(isinstance(k, str) and k and isinstance(v, dict) and isinstance(v.get("aliases"), dict)
+                                             for k, v in r.items()) \
+                and (set(r) == {name} or all(name in v["aliases"] for v in r.values())):
+            return sorted(r)
+        raise IncompleteRead("malformed alias answer")
+    if absent(st, r, name):
         return []
     raise IncompleteRead("alias discovery failed")
 
@@ -86,16 +107,14 @@ def aliases(client: Any, name: str) -> list:
 def scan(client: Any, index: str, body: dict, *, page: int = 500, ignore_unavailable: bool = False, missing_ok: bool = False,
          keep_alive: str = "1m") -> list:
     """Every hit of `body["query"]` over `index` (a name, alias or pattern) in one consistent snapshot: a PIT, the `_shard_doc` sort
-    and `search_after`, `complete_hits` on every page. `missing_ok`: a verified absent index (HTTP 404 `index_not_found_exception` on
-    opening the PIT) is an empty result; any other failure raises `IncompleteRead`. The PIT is closed when the scan ends."""
+    and `search_after`, `complete_hits` on every page. `missing_ok`: a verified absence of the exact name `index` (`absent`: HTTP 404
+    `index_not_found_exception` naming it, on opening the PIT) is an empty result; any other failure raises `IncompleteRead`. The PIT is closed when the scan ends."""
     if not isinstance(page, int) or page < 1:
         raise ValueError("page must be a positive integer")
     params = [f"keep_alive={keep_alive}", "allow_partial_search_results=false"] + (["ignore_unavailable=true"] if ignore_unavailable else [])
     st, r = client.request("POST", f"/{index}/_pit?" + "&".join(params))
-    if st == 404 and missing_ok:
-        err = r.get("error") if isinstance(r, dict) else None
-        if isinstance(err, dict) and err.get("type") == "index_not_found_exception":
-            return []
+    if missing_ok and absent(st, r, index):
+        return []
     if st != 200 or not isinstance(r, dict) or not isinstance(r.get("id"), str) or ("_shards" in r and not _shards_complete(r)):
         raise IncompleteRead("point in time could not be opened")
     pit, out, after = r["id"], [], None

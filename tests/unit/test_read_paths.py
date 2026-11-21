@@ -53,7 +53,7 @@ VERIFIER_VALIDATORS = {"_complete", "_refreshed"}   # the verifier's own (DESIGN
 ALLOWED = {
     # --- reads.py: the helpers themselves ----------------------------------------------------------------------------------------
     ("gateway/reads.py", "refresh", "POST"): (1, "checked", "the checked refresh: status and _shards.failed are verified"),
-    ("gateway/reads.py", "aliases", "GET"): (1, "checked", "the checked alias lookup: 200 dict, or a verified 404, else it raises"),
+    ("gateway/reads.py", "aliases", "GET"): (1, "checked", "the checked exact-name alias lookup: a well-formed 200 about the name, or a 404 naming it, else it raises"),
     ("gateway/reads.py", "scan", "POST"): (1, "checked", "opening the PIT: status, id and _shards are verified (the page search is validated)"),
     ("gateway/reads.py", "scan", "DELETE"): (1, "best-effort", "closing the PIT: an unclosed PIT expires after keep_alive"),
     # --- erasure ------------------------------------------------------------------------------------------------------------------

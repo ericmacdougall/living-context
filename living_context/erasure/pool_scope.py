@@ -108,7 +108,7 @@ class PoolEraser:
 
     def _physical(self, cls: str, pool: str) -> list[str]:
         """Every physical index of the pool: the indices behind its leaf alias and the ones its manifest names. A failed or malformed
-        alias lookup raises (review F11); only a verified absence (404 `index_not_found_exception`) reads as none behind the alias."""
+        alias lookup raises (review F11); only a verified absence (`reads.absent`: a 404 naming the alias) reads as none behind it."""
         alias = pool_index(self.tenant, cls, pool, "leaf")
         try:
             behind = aliases(self._er(), alias)
