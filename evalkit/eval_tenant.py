@@ -9,18 +9,21 @@ the pinned `EsView`; the direct list is `flat.FlatSearch` (the `DirectSearch` re
 Credentials are passed by PATH only (the files are read by the Elasticsearch client, mode 0600 enforced). Nothing is printed."""
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 import numpy as np
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from living_context.config import Constants
 from living_context.embed import stub as embed_stub
 from living_context.gateway.es import EsClient
 from living_context.gateway.handler import EsGate
+from living_context.gateway.indices import TENANT_CLS, tenant_index
 from living_context.gateway.provision import provision_tenant
 from living_context.ingest import segment, title
 from living_context.ingest.subjects import Guard, TokenSource
-from living_context.ingest.writer import Writer
+from living_context.ingest.writer import CAS_TRIES, Writer, WriterError
 from living_context.keystore import Keystore
 from living_context.policy import ClassLattice, Principal, Role
 from living_context.recall.view import EsView
@@ -28,6 +31,7 @@ from living_context.structure import build
 from living_context.structure.build import LeafRec
 from living_context.structure.publish import Publisher
 
+from . import parallel as par
 from .arms import World
 from .flat import A0_FIELDS_DEFAULT, FlatSearch
 from .corpus import session_leaf_texts
@@ -35,6 +39,48 @@ from .dataset import opaque_ref
 
 CLS = "base"
 LATTICE = ClassLattice([CLS], [])
+
+
+class OrderedWriter(Writer):
+    """The real `Writer` for a concurrent ingest: the tenant's `src_seq` range for the whole ingest is reserved by ONE compare-and-set
+    of the same counter `next_seq` advances, and each leaf takes the sequence number of its position in the serial order, so the
+    leaves carry exactly the numbers a one-at-a-time ingest would give them (the leaf order of `load_leaves` on a resume follows).
+    Everything else is the inherited write path."""
+    def __init__(self, *args, **kw):
+        super().__init__(*args, **kw)
+        self._local = threading.local()
+
+    def reserve(self, n: int) -> int:
+        """Advance the counter by `n`; returns the value before (the leaves get value+1 .. value+n)."""
+        idx = tenant_index(self.tenant, "ctl")
+        for _ in range(CAS_TRIES):
+            cur = self._get(idx, "seq")
+            if cur is None:
+                st, _ = self._put(idx, "seq", self._base("counter", TENANT_CLS, value=n), cls=None, create=True)
+                if st in (200, 201):
+                    return 0
+                continue
+            v = int(cur["_source"]["value"])
+            st, _ = self._put(idx, "seq", self._base("counter", TENANT_CLS, value=v + n), cls=None,
+                              cas=(cur["_seq_no"], cur["_primary_term"]))
+            if st in (200, 201):
+                return v
+            time.sleep(0.005)
+        raise WriterError("sequence counter contended")
+
+    def remember_at(self, seq: int, *args, **kw):
+        self._local.seq = seq
+        try:
+            return self.remember(*args, **kw)
+        finally:
+            self._local.seq = None
+
+    def next_seq(self) -> int:
+        seq = getattr(self._local, "seq", None)
+        if seq is None:
+            raise WriterError("a concurrent ingest write without its reserved sequence number")
+        self._local.seq = None          # one number per write
+        return seq
 
 
 def reset_tenant(admin: EsClient, tenant: str, *, registry_doc_only: bool = False) -> None:
@@ -109,6 +155,45 @@ class EvalTenant:
                 wrote += 1
         self.admin.request("POST", f"/lc-{self.tenant}-{CLS}-leaf/_refresh")
         return wrote
+
+    def ingest_concurrent(self, sessions: Sequence[Tuple[str, Sequence[Tuple[str, str]]]], *, writers: int,
+                          embed_many: Callable[[List[str]], Mapping[str, Sequence[float]]]) -> int:
+        """`ingest` with the passage vectors computed up front by `embed_many` (texts in serial order; for instance embed_pool.passages
+        over worker processes) and the leaves written by `writers` threads through an `OrderedWriter`. The leaves, their order, their
+        `src_seq`, the session map and the sizes are those `ingest` produces (leaf ids are random either way); a vector is whatever
+        `embed_many` returned for the text. A refused write raises, as in `ingest`, after the writes before it in serial order."""
+        plan: List[Tuple[str, str]] = []
+        for h, turns in sessions:
+            if h in self._seen:
+                continue
+            self._seen.add(h)
+            plan += [(h, text) for text in session_leaf_texts(turns, self.consts.leaf_cap)]
+        vecs = embed_many([t for _, t in plan]) if plan else {}
+        missing = [t for _, t in plan if t not in vecs]
+        if missing:
+            raise RuntimeError("the up-front embedding returned no vector for %d leaf texts" % len(missing))
+        w = OrderedWriter(lambda: self.gate.client(self.tenant, "ingest"), self.ks, self.tenant, Guard(TokenSource(self.ks)),
+                          consts=self.consts, embed=lambda text: list(vecs[text]))
+        base = w.reserve(len(plan)) if plan else 0
+        ref_of = {h: {"session": opaque_ref(h)} for h, _ in plan}
+
+        def work(i):
+            h, text = plan[i]
+            return w.remember_at(base + 1 + i, "eval", CLS, text, source_ref=ref_of[h], refresh=False)
+
+        def commit(i, _item, res):
+            h, text = plan[i]
+            if not res.ok:
+                raise RuntimeError("the write path refused a leaf: %s" % res.status)
+            size = segment.tokens_of(text, self.consts.chars_per_token_bound)
+            self.leaves.append(LeafRec(res.leaf_id, res.lv, text, title.build_title(text, n=self.consts.title_terms),
+                                       list(vecs[text]), size, (), res.src_seq))
+            self.leaf_session[res.leaf_id] = h
+            self.session_tokens[h] = self.session_tokens.get(h, 0) + size
+            self.max_seq = max(self.max_seq, res.src_seq)
+        par.run_ordered(list(range(len(plan))), work, commit, workers=max(1, writers))
+        self.admin.request("POST", f"/lc-{self.tenant}-{CLS}-leaf/_refresh")
+        return len(plan)
 
     def _vector_of(self, text: str) -> list:
         if self._last_vec is not None and self._last_vec[0] == text:

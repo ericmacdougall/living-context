@@ -55,7 +55,7 @@ def args(base, s3, run, **kw):
              stamp_registry=str(base / "stamps.jsonl"), embed_dir="", binary="fake", model=MODEL, rates_from=[str(logs())],
              model_kind="claude", approved_cap=35574, approval_ref=APPROVAL, release_ref=REF, commit=COMMIT, a0_fields="strong",
              resume=False, threads=1, max_retries=2, base_delay=0.0, mem_proof=str(base / "mem.json"), concurrency=1,
-             concurrency_reason="", cluster_workers=1)
+             concurrency_reason="", cluster_workers=1, ingest_writers=1, embed_workers=1)
     a.update(kw)
     return argparse.Namespace(**a)
 
@@ -156,6 +156,12 @@ class Guards(unittest.TestCase):
         self.assertEqual(self.why(mem_proof=str(self.base / "m5.json"), cluster_workers=8), [])
         self.has("with 16 workers, fewer than --cluster-workers 17", mem_proof=str(self.base / "m5.json"), cluster_workers=17)
 
+    def test_embedding_processes_need_their_own_memory(self):
+        base_free = 9000.0 + rs.CLI_CHILD_MB + rs.MEM_MARGIN_MB
+        self.assertEqual(self.why(free=base_free, embed_workers=1), [])
+        self.has("6 embedding processes", free=base_free, embed_workers=6)
+        self.assertEqual(self.why(free=9000.0 + 6 * rs.E5_WORKER_MB + rs.MEM_MARGIN_MB, embed_workers=6), [])
+
     def test_concurrency_above_the_registered_value_needs_a_recorded_reason(self):
         self.has("above the registered 2", free=64000.0, concurrency=4)
         self.assertEqual(self.why(concurrency=2), [])
@@ -180,6 +186,15 @@ class MemTenant:
         self.mc = corpus.MemCorpus(pool)
         self.ingested = len(pool)
         return len(self.mc.leaves)
+
+    def ingest_concurrent(self, pool, *, writers, embed_many):
+        """The concurrent path's contract as the runner uses it: every leaf text is embedded up front, then the same leaves."""
+        self.writers = writers
+        texts = [t for _h, turns in pool for t in corpus.session_leaf_texts(turns)]
+        self.vectors = embed_many(texts)
+        if set(self.vectors) != set(texts):
+            raise RuntimeError("missing vectors")
+        return self.ingest(pool)
 
     def save_state(self, p):
         Path(p).write_text(json.dumps({"leaves": len(self.mc.leaves)}))
@@ -258,6 +273,25 @@ class Body(unittest.TestCase):
             self.assertNotIn(q.question, body)
         ds.assert_model_safe(body)
         self.assertEqual(len(rs._registry_rows(base / "stamps.jsonl")), 1)
+
+    def test_a_concurrent_ingest_embeds_up_front_in_worker_processes_and_gives_the_same_result(self):
+        from tests.unit.test_ingest_concurrent import make_embed
+        from tests.unit.test_parallel import seeded_node_ids
+        base, s3, man, run = setup_dirs()
+        with seeded_node_ids():                                   # node ids enter recall tie-breaks; seed them for the comparison
+            self.assertEqual(self.go(base, s3, run, man), 0)
+        base2, s32, man2, run2 = setup_dirs()
+        a = args(base2, s32, run2, ingest_writers=3, embed_workers=2)
+        with seeded_node_ids():
+            rc = rs.run(a, embedder=RealEmbed(), runner=Runner(), loader=lambda _a: rel.QS, tenant_factory=factory(run2),
+                        registered_pool=POOL, registered_fresh=rel.REG, manifest_path=man2, embed_factory=make_embed)
+        self.assertEqual(rc, 0)
+        t = _TENANTS[str(run2)]
+        self.assertEqual(t.writers, 3)
+        self.assertEqual(t.vectors, {x: make_embed().passage(x) for x in t.vectors})        # embedded in the worker processes
+        self.assertEqual((run2 / "done.jsonl").read_bytes(), (run / "done.jsonl").read_bytes())
+        row = json.loads((run2 / "starts.jsonl").read_text().splitlines()[-1])
+        self.assertEqual((row["ingest_writers"], row["embed_workers"]), (3, 2))
 
     def test_more_leaves_than_the_proven_size_is_refused_before_any_call(self):
         base, s3, man, run = setup_dirs()

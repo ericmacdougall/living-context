@@ -65,6 +65,13 @@ python -m evalkit.run_s6h1 --dataset <dataset> --es-url <es-url> --es-ca <es-ca>
 - `--cluster-workers W` (default 1): clusterer threads. The groups are byte-identical at any W (MEASURED on the run host, synthetic
   384-d vectors: 20,000 leaves 172 s at W=1, 21 s at W=16; 40,000 leaves 692 s at W=1, 78 s at W=16, the same groups SHA-256;
   78,700 leaves 297 s and 3.6 GB at W=16). Each worker holds one 16 MB block buffer, so the memory proof must use at least W.
+- `--embed-workers P` and `--ingest-writers T` (default 1 each: the one-at-a-time ingest). With either above 1, every leaf text is
+  embedded first in P processes of `--threads` torch threads (pinned model, one text at a time, so a vector depends on the text, the
+  model and the thread count only: MEASURED on the run host, 60 synthetic texts, 3 workers equal the in-process vectors byte for
+  byte), then T threads write the leaves through the real writer with the tenant's `src_seq` range reserved in one compare-and-set,
+  so the leaves, their order and their `src_seq` are those of the one-at-a-time ingest. Each embedding process needs about 1 GB
+  (MEASURED 761 to 800 MB); the memory gate counts them. Writes cost about 61 ms per leaf one at a time (MEASURED: pilot ingest
+  4,813.7 s, of which 3,606.8 s embedding, 19,605 leaves); concurrent write throughput on Elasticsearch is NOT measured yet.
 
 ## Watch, stop, resume
 

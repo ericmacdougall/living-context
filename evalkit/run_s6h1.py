@@ -35,6 +35,7 @@ REGISTERED_POOL = 18_464            # distinct session contents of all 500 quest
 EXPECTED_LEAVES = 78_700            # 18,464 x 4.262 leaves per session (S3's dev static pool; counts only)
 MEM_MARGIN_MB = 2_048               # free memory beyond the proven peak that the host must have at the start
 CLI_CHILD_MB = 256                  # one headless CLI process (MEASURED: 238 MB peak RSS each, 4 at once on the run host)
+E5_WORKER_MB = 1_024                # one up-front embedding process (MEASURED: 761 to 800 MB RSS each, 3 at once, 6 threads)
 RC = {"COMPLETE": 0, "STOPPED": 3, "CAP_REACHED": 4, "BUILD_FAILED": 5, "PAUSED_THROTTLE": 75, "LIMIT_REACHED": 76, "ERROR": 1,
       "REFUSED": 2}
 STAMP_KEYS = ("commit", "cap", "approval_ref", "release_ref", "freeze_sha256", "a0_fields", "model")
@@ -146,6 +147,11 @@ def check_prereqs(a, *, embed=None, manifest_path: Path = fz.MANIFEST, root: Pat
         if free is not None and free < need:
             why.append("the host has %.0f MB available, less than the proven build peak %.0f MB plus %d CLI processes of %d MB plus %d MB"
                        % (free, mp["peak_rss_mb"], n_par, CLI_CHILD_MB, MEM_MARGIN_MB))
+        ew = int(getattr(a, "embed_workers", 1) or 1)
+        need_ingest = float(mp["peak_rss_mb"]) + (ew * E5_WORKER_MB if ew > 1 else 0) + MEM_MARGIN_MB   # the processes end before the build
+        if free is not None and need_ingest > need and free < need_ingest:
+            why.append("the host has %.0f MB available, less than the proven peak %.0f MB plus %d embedding processes of %d MB plus %d MB"
+                       % (free, mp["peak_rss_mb"], ew, E5_WORKER_MB, MEM_MARGIN_MB))
     try:
         est = bud.estimate(EXPECTED_LEAVES, bud.measured_rates(a.rates_from), concurrency=n_par)
         why += bud.refusal(est, a.approved_cap or 0)
@@ -185,8 +191,10 @@ def whole_pool(qs) -> List[tuple]:
 
 
 def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, tenant_factory: Optional[Callable] = None,
-        registered_pool: int = REGISTERED_POOL, registered_fresh=None, manifest_path: Path = fz.MANIFEST, root: Path = fz.ROOT) -> int:
-    """The body of S6-H1; `check_prereqs` must have passed. Tests pass a synthetic loader, an in-memory tenant and a fake runner."""
+        registered_pool: int = REGISTERED_POOL, registered_fresh=None, manifest_path: Path = fz.MANIFEST, root: Path = fz.ROOT,
+        embed_factory: Optional[Callable] = None) -> int:
+    """The body of S6-H1; `check_prereqs` must have passed. Tests pass a synthetic loader, an in-memory tenant, a fake runner and a
+    picklable embedder factory for the up-front embedding processes."""
     from living_context.config import Constants
     from living_context.model.budget import Budget, BudgetExceeded
     from living_context.model.port import PortRefused
@@ -219,6 +227,7 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
         return write_state(run_dir, "REFUSED", error="the whole pool has %d contents, registered %d" % (len(pool), registered_pool))
 
     consts = Constants()
+    ingest_writers, embed_workers = int(getattr(a, "ingest_writers", 1) or 1), int(getattr(a, "embed_workers", 1) or 1)
     built = run_dir / "BUILT.json"
     resumed_built = built.exists()
     ingested = (run_dir / "tenant_state.json").exists()
@@ -233,7 +242,15 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
             et.load_leaves(n_leaves)
     else:
         t0 = time.time()
-        n_leaves = et.ingest(pool)
+        if ingest_writers > 1 or embed_workers > 1:
+            from . import embed_pool
+            factory = embed_factory or (embed_pool.E5Factory(a.embed_dir, a.threads) if embed_workers > 1 else (lambda: embedder))
+            report = lambda i, n: (i % 2000 == 0 or i == n) and print("embedded %d/%d leaf texts in %.0fs" % (i, n, time.time() - t0),
+                                                                      flush=True)
+            n_leaves = et.ingest_concurrent(pool, writers=ingest_writers, embed_many=lambda texts: embed_pool.passages(
+                texts, factory, workers=embed_workers, progress=report))
+        else:
+            n_leaves = et.ingest(pool)
         et.save_state(run_dir / "tenant_state.json")
         print("ingested %d contents as %d leaves in %.0fs" % (len(pool), n_leaves, time.time() - t0), flush=True)
     if n_leaves > proven_max_leaves:
@@ -267,6 +284,7 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
                          concurrency=n_par)
     with open(run_dir / "starts.jsonl", "a") as f:      # every start or resume, with its concurrency (outputs do not depend on it)
         f.write(json.dumps({"at": time.time(), "commit": a.commit, "concurrency": n_par, "cluster_workers": cluster_workers,
+                            "ingest_writers": ingest_writers, "embed_workers": embed_workers,
                             "concurrency_reason": getattr(a, "concurrency_reason", "") or ""}, sort_keys=True) + "\n")
     ledger = s2_stage.Ledger(run_dir / "done.jsonl")
     shuffled_qids = st.shuffled_subset(fs, vals["thresholds"]["shuffled_n"])
@@ -343,6 +361,11 @@ def parser() -> argparse.ArgumentParser:
                     help="model calls at once (registered %d; questions and build groups run concurrently, outputs do not depend on it)"
                     % par.REGISTERED_CONCURRENCY)
     ap.add_argument("--concurrency-reason", default="", help="required above the registered value; recorded in the stamp")
+    ap.add_argument("--ingest-writers", type=int, default=1,
+                    help="writer threads for the ingest (leaves, order and src_seq do not depend on it)")
+    ap.add_argument("--embed-workers", type=int, default=1,
+                    help="embedding processes of --threads torch threads each, before the writes (a vector depends on the text, the "
+                         "model and --threads only)")
     ap.add_argument("--cluster-workers", type=int, default=1,
                     help="clusterer threads (the groups do not depend on it); the memory proof must have used at least as many")
     return ap
