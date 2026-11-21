@@ -51,7 +51,7 @@ class FakeAuthz:
     writes nothing. A scan (PIT, one search page, PIT close) returns every stored grant."""
 
     def __init__(self):
-        self.docs, self.refuse, self.seq, self.refused = {}, None, 0, 0
+        self.docs, self.refuse, self.seq, self.refused, self.search_down = {}, None, 0, 0, False
 
     def request(self, method, path, body=None, **kw):
         if method == "PUT" and "/_doc/" in path:
@@ -65,6 +65,8 @@ class FakeAuthz:
         if method == "POST" and path.startswith(f"/{AUTHZ}/_pit"):
             return 200, {"id": "pit1", "_shards": SH}
         if method == "POST" and path.startswith("/_search"):
+            if self.search_down:
+                return 503, {}
             hits = [{"_index": AUTHZ, "_id": d, "_source": s, "sort": [i]} for i, (d, s) in enumerate(sorted(self.docs.items()))]
             return 200, {"timed_out": False, "_shards": SH, "hits": {"hits": hits}}
         if method == "DELETE" and path == "/_pit":
@@ -122,11 +124,12 @@ class World:
     def put(self, who, roles, read=(), write=()):
         self.node.rt.grants.put(Principal(T, tok(T, who), frozenset(roles), frozenset(read), frozenset(write)))
 
-    def restart(self, how):
+    def restart(self, how, *, compact=True, read_ok=True):
         """Compaction, then a clean stop or a crash (no shutdown record: the next start stays closed until the operator's
         break-glass recovery), then a new process over the same directories and the same authz index."""
         svc = self.node.rt.revocation
-        svc.compact()
+        if compact:
+            svc.compact()
         if how == "clean":
             svc.clean_stop()
         else:
@@ -139,8 +142,11 @@ class World:
             self.test.assertEqual(svc.state, FAULT)
             svc.break_glass([], [tok(T, "a1")])
         self.test.assertEqual(svc.state, OPEN)
-        self.test.assertEqual(self.node.rt.grant_load_error, "", "the start-up read of the authz copy failed")
-        self.test.assertEqual(self.node.rt.loaded_grants, 3)
+        if read_ok:
+            self.test.assertEqual(self.node.rt.grant_load_error, "", "the start-up read of the authz copy failed")
+            self.test.assertEqual(self.node.rt.loaded_grants, 3)
+        else:
+            self.test.assertNotEqual(self.node.rt.grant_load_error, "")
 
     def journal_reductions(self):
         """The reduction records the compacted journal holds (read from the file, after a clean stop)."""
@@ -189,6 +195,31 @@ class AReductionHoldsAcrossARestart(unittest.TestCase):
                         self.reduced(w, f"{name}, {answer}, {how}, a second restart")
                         w.node.rt.revocation.clean_stop()
                         self.assertEqual(len(w.journal_reductions()), 1, "compaction dropped an unconfirmed reduction")
+
+    def test_the_record_is_written_before_the_answer_a_crash_before_any_compaction_keeps_it(self):
+        for name, reduce in REDUCTIONS.items():
+            with self.subTest(reduction=name):
+                w = World(self)
+                w.authz.refuse = (503, {})
+                self.assertTrue(reduce(w.node).get("ok"))
+                w.authz.refuse = None
+                w.restart("crash", compact=False)   # the process dies right after the answer
+                self.reduced(w, f"{name}, a crash before any compaction")
+
+    def test_a_failed_start_up_read_confirms_nothing(self):
+        # a start-up whose read of the authz copy failed holds no grants (fail closed) and proves nothing about the copy: the record
+        # must outlive it, its compaction and its stop, and narrow the grant at the next start that reads the copy
+        for name, reduce in REDUCTIONS.items():
+            with self.subTest(reduction=name):
+                w = World(self)
+                w.authz.refuse = (503, {})
+                self.assertTrue(reduce(w.node).get("ok"))
+                w.authz.refuse, w.authz.search_down = None, True
+                w.restart("clean", read_ok=False)
+                self.assertIsNone(w.node.get("r1"))
+                w.authz.search_down = False
+                w.restart("clean")
+                self.reduced(w, f"{name}, after a start-up whose read failed")
 
     def test_control_a_confirmed_write_drops_the_record_and_the_reduction_still_holds(self):
         for name, reduce in REDUCTIONS.items():
