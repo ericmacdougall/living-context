@@ -37,7 +37,7 @@ Run: started 2026-11-21 06:42 UTC, complete 09:15 UTC (STAMP.json, STATE.json).
 | A1-tree-only | 94 | 0.540 [0.452, 0.627] | 0.101 | 0.415 | 0.462 |
 | SHUFFLED | 50 | 0.000 | 0.000 | 0.000 | 0.000 |
 
-Paired differences (clustered bootstrap, 90 clusters; replicated independently):
+Paired differences (clustered bootstrap, 90 clusters; an unclustered bootstrap gives [-0.011, +0.122]):
 
 - A1 - A0: **+0.054**, 95% CI [-0.009, +0.123]. The interval crosses zero.
 - A1 - A0+LEN: +0.049, CI [-0.016, +0.118].
@@ -128,7 +128,8 @@ recall; 4.39 h for build plus 60 recalls.
 
 ## Partial S3 on Sonnet (abandoned)
 
-32 questions, abandoned when the run moved to Muse. A0 0.545, A1 0.528,
+32 questions; the run stopped when the account allowance ran out (STATE.json:
+LIMIT_REACHED), and the model was then changed to Muse. A0 0.545, A1 0.528,
 tree-only 0.433. Too small to read; listed so the abandoned run is on the
 record. These are the first 32 S3 questions on the same pool; A1 minus A0 is
 -0.017 here and +0.134 on the same questions in the Muse run. The model was
