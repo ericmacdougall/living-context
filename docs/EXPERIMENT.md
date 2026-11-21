@@ -1347,3 +1347,38 @@ The rest of 10.3 (S6-H2 and the loop stages) is not restated here.
   as before.
 - Sharing the account: S3's questions and the early S6-H1 build (14.5) run at the same time on one subscription; their ceilings
   together stay under 16 calls at once (S3 at most 8).
+
+### 14.5 DEVIATION (order only): the S6-H1 whole pool is ingested and built before the S3 freeze, questions sealed (2026-11-20)
+
+- Registered: S6-H1 starts after S3 is COMPLETE, after the freeze (3.7) and after the owner's release of the fresh set (X1). Until
+  the release no stage below S6 touches the fresh set (3.2), and 14.3 kept the held-out and fresh question sets unloaded.
+- Amended: the part of S6-H1 that reads no question, the whole-pool ingest, clustering and tree build, may run before S3
+  completes, as an early build in the run directory that the stamped run will use (`evalkit.run_s6h1 --prebuild --amendment-ref
+  DEV-14.5`, docs/RUN-S6H1.md). Reason: the owner approved in chat on 2026-11-20 building the pool early, with the questions and
+  answers sealed until the freeze ("Yes, build pool early"), so that the build (about 5,250 calls) does not wait for S3.
+- What the early build reads, and what it exposes:
+  - It reads all 18,464 distinct session contents of the 500 questions. These include the haystack sessions and the gold sessions
+    of the 312 fresh questions, as unlabelled pool contents.
+  - The parser keeps only each record's haystack arrays and each turn's role and content (`evalkit.dataset.pool_contents`). It drops
+    the question, the answer, the gold session ids, the has_answer flags, the dates, the ids and the question type as it parses, so
+    no object holds them.
+  - The contents reach the model in build prompts before the freeze, as they would in the registered S6-H1 build after it. Nothing
+    tells which content is gold for which question.
+  - The fresh questions and their answers stay sealed until RELEASE.json. Tested in `tests/unit/test_s6h1_prebuild.py`: a full early
+    build opens the dataset once, through that parser, and no file it writes, no registry row and nothing it prints holds a
+    question, an answer, a question id, a session id or a has_answer flag.
+- Before the freeze, the operator reads counts only (STATE.json, tree.json, budget.json, the progress lines). The summaries the build
+  writes stay in the S6-H1 tenant and are not inspected. S3 retrieves only from its own tenant.
+- Code freeze at the early-build commit. This is main's ruling of 2026-11-20 ("freeze at the prebuild commit"), not the owner's.
+  - PREBUILD.json binds the commit, the full code digest (`s6h1_freeze.code_digest`), the cap, the approval, the A0 fields, the model,
+    the model kind, `--threads` and the pool's ordered content hashes.
+  - The memory proof is measured on that code, and the freeze must name that commit. The stamped run refuses any other value.
+  - Consequence for 3.7: S3 still freezes the values it measures, beta and the A0 field set, as data in the freeze manifest. Every
+    other value S6-H1 uses that is code (the prompts, the thresholds, the merge rule, the statistics, the tree constants) is fixed at
+    the early-build commit, before S3's results exist.
+  - A change to code after that commit, a power amendment that edits code included, voids the early build. The registry then refuses
+    a second build in another run directory until the owner decides on the calls already charged, which count against the S6-H1 cap.
+- What it does not change: the cap (35,574) and the approval; the prompts, the arms, the metrics, the H1 rule, the questions and
+  their order. The stamped run is the stage's one stamped run. It reads the freeze and the release as registered, attaches to the
+  prebuilt tenant and tree and builds nothing again; its ledger equals that of a run without the early build (tested, including an
+  early build stopped halfway through its build and continued at another concurrency).
