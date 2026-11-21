@@ -1,9 +1,9 @@
 name: ci
 
+# Manual trigger only: CI runs locally (`make ci` or tools/ci_local.sh) because hosted Actions minutes are not used for this
+# repository. Run this workflow by hand from the Actions tab when a hosted check is wanted.
 on:
-  push:
-    branches: [main, "phase1/**", "fix/**", "feat/**"]
-  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
