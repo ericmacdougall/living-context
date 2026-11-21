@@ -161,6 +161,7 @@ def _args(ks, name):
     table = {
         "subject_token": ("p@example.org",),
         "digest": ("idem", b"body"),
+        "mac": ("subject", b"msg"),
         "has_key": ("leafarg", 1),
         "principal_token": ("p@example.org",),
         "register_identifier": ("q@example.org",),

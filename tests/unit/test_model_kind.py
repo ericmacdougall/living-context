@@ -1,0 +1,782 @@
+"""The `muse` model kind (evalkit.model_kind) over the REAL `muse_api.MusePort` against a stub OpenRouter on 127.0.0.1 (the port's
+loopback test mode with a fake key; no network, no real key). The guards never open the key file and require the registered
+reasoning effort and output limit; a port that cannot be built refuses the stage before any stamp or charge; one pacer per run
+spaces requests at --rpm; a 429, a 503 or OpenRouter's in-flight 402 pauses with Retry-After as the back-off floor and is not a
+failure of the streak; a 402 or OpenRouter's 403 budget refusal and a reported model mismatch stop the stage at once, unretried;
+an answer cut by `finish_reason` length is a failed call, never an answer; every call row records prompt, completion and
+reasoning tokens, the reported model and the upstream provider; and the S6-H1 stage gives the same ledger at 1 and 4 workers,
+with the model's identity in the stamp and every ledger row."""
+import argparse
+import builtins
+import io
+import json
+import os
+import shutil
+import sys
+import tempfile
+import threading
+import time
+import types
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from evalkit import claude_cli as cc, model_kind as mk, muse_api as ma, run_h1, run_s2, run_s6h1 as rs
+from evalkit.s2_ports import Journal, ResilientPort, StageStopped
+from living_context.model.budget import Budget, BudgetExceeded
+from living_context.model.port import Task
+from tests.security.test_run_s2_es import Runner
+from tests.unit import test_run_h1_guards as hg, test_run_s3_parallel as s3p, test_run_s6h1 as t6
+from tests.unit.test_muse_api import OR_KEY, Stub, completion, err_body
+from tests.unit.test_parallel import SafeRunner, in_threads, route_inputs, seeded_node_ids
+
+MODEL = "meta/muse-spark-1.3-contributor"
+
+
+def key_file(text="NOT-A-KEY-MARKER", mode=0o600):
+    p = Path(tempfile.mkdtemp()) / "muse.key"
+    p.write_text(text)
+    os.chmod(p, mode)
+    return str(p)
+
+
+def margs(**kw):
+    a = dict(model_kind="muse", model=MODEL, provider="openrouter", key_file=key_file(), key_secret_project="", key_secret_name="",
+             base_url="", reasoning_effort="low", max_tokens=4096, rpm=140, api_timeout=30.0, binary="")
+    a.update(kw)
+    return argparse.Namespace(**a)
+
+
+class Upstream:
+    """OpenRouter's chat completions on 127.0.0.1: answers each prompt as the stage test Runner would (the same outputs as the CLI
+    kind), with scripted outcomes by request number."""
+    KINDS = ("throttle", "unavailable", "inflight", "quota", "budget", "error", "mismatch", "length")
+
+    def __init__(self, retry_after=None, **script):
+        assert set(script) <= set(self.KINDS), script
+        self.runner, self.n, self.lock = Runner(), 0, threading.Lock()
+        self.script = {k: set(script.get(k, ())) for k in self.KINDS}
+        self.retry_after, self.systems, self.bodies = retry_after, [], []
+
+    def has(self, kind, k):
+        return k in self.script[kind]
+
+    def reply(self, path, headers, body):
+        with self.lock:
+            self.n += 1
+            k = self.n
+            self.systems.append(body["messages"][0]["content"])
+            self.bodies.append({x: body.get(x) for x in ("model", "max_tokens", "reasoning_effort", "provider")})
+        ra = {"Retry-After": str(self.retry_after)} if self.retry_after is not None else {}
+        if self.has("throttle", k):
+            return 429, ra, err_body(429, etype="rate_limit_error")
+        if self.has("unavailable", k):
+            return 503, ra, err_body(503)
+        if self.has("inflight", k):
+            return 402, ra, err_body(402, metadata={"limit_source": "openrouter_in_flight_budget"})
+        if self.has("quota", k):
+            return 402, {}, err_body(402, etype="billing_error")
+        if self.has("budget", k):
+            return 403, {}, err_body(403, metadata={"limit_source": "openrouter_key_limit"})
+        if self.has("error", k):
+            return 500, {}, err_body(500)
+        with self.lock:
+            text = json.loads(self.runner(body["messages"][1]["content"]).stdout)["result"]
+        extra = {"provider": "Meta"}
+        if self.has("length", k):           # a parseable answer cut short: must never count as an answer
+            extra["choices"] = [{"index": 0, "finish_reason": "length", "message": {"role": "assistant", "content": text}}]
+        return 200, {}, completion(text, "some/other-model" if self.has("mismatch", k) else MODEL, prompt_tokens=1200, cached=200,
+                                   completion_tokens=340, extra=extra)
+
+
+class Live:
+    """A stub upstream and the real port over it (test-only loopback mode, never a runner flag)."""
+    def __init__(self, upstream, **port_kw):
+        self.up, self.stub = upstream, Stub(upstream.reply)
+        self.stub.__enter__()
+        self.key = key_file(OR_KEY)
+        kw = dict(model=MODEL, provider="openrouter", max_tokens=4096, reasoning_effort="low", timeout=30.0)
+        kw.update(port_kw)
+        self.runner = mk.MuseRunner(ma.MusePort(self.key, _loopback_test_port=self.stub.port, **kw))
+
+    def close(self):
+        self.stub.__exit__()
+
+
+def port_over(tc, tmp, upstream, *, concurrency=1, sleep=None, pacer=None, cap=1000, **kw):
+    live = Live(upstream)
+    tc.addCleanup(live.close)
+    tmp = Path(tmp)
+    b = Budget(tmp / "counter", cap)
+    p = mk.capped_port(margs(), tmp, b, runner=live.runner)
+    p._pacer = pacer                    # the run's pacer is tested on its own; unpaced otherwise
+    delays = []
+    port = ResilientPort(p, b, Journal(tmp / "journal.jsonl"), tmp / "STOP", sleep=sleep or delays.append, base_delay_s=1.0,
+                         concurrency=concurrency, **kw)
+    return b, port, delays
+
+
+def rows(tmp):
+    return [json.loads(l) for l in (Path(tmp) / "calls.jsonl").read_text().splitlines()]
+
+
+class Guards(unittest.TestCase):
+    def test_the_key_file_is_checked_by_metadata_only_and_never_opened(self):
+        a = margs()
+        opened = []
+        real_open, real_io_open = builtins.open, io.open
+
+        def spy(opener):
+            def o(file, *x, **k):
+                if isinstance(file, (str, os.PathLike)) and os.fspath(file) == a.key_file:
+                    opened.append(file)
+                return opener(file, *x, **k)
+            return o
+        with mock.patch("builtins.open", spy(real_open)), mock.patch("io.open", spy(real_io_open)):
+            self.assertEqual(mk.check(a), [])
+        self.assertEqual(opened, [])
+
+    def test_each_muse_setting_is_refused_for_its_own_reason(self):
+        for kw, word in ((dict(key_file=""), "exactly one key source"), (dict(key_file="/nonexistent/k"), "does not exist"),
+                         (dict(key_secret_project="p", key_secret_name="n"), "exactly one key source"),
+                         (dict(key_file="", key_secret_project="p"), "go together"),
+                         (dict(key_file="", key_secret_name="n"), "go together"),
+                         (dict(key_file=key_file(mode=0o644)), "mode 0600"), (dict(rpm=141), "--rpm"), (dict(rpm=0), "--rpm"),
+                         (dict(base_url="http://api.example"), "https"), (dict(model=""), "--model"),
+                         (dict(provider="other"), "--provider"), (dict(reasoning_effort=""), "--reasoning-effort"),
+                         (dict(reasoning_effort="none"), "--reasoning-effort"), (dict(reasoning_effort="max"), "not available"),
+                         (dict(max_tokens=0), "--max-tokens"), (dict(max_tokens=True), "--max-tokens")):
+            why = mk.check(margs(**kw))
+            self.assertTrue(why and all(word in w for w in why), (kw, why))
+        self.assertTrue(mk.check(margs(model_kind="other")))
+        self.assertEqual(mk.check(margs(key_file="", key_secret_project="p", key_secret_name="n")), [])
+        self.assertEqual(mk.EFFORTS, ma.REASONING_EFFORT)                   # one list of efforts, the port's
+
+    def test_the_stage_runners_take_the_muse_kind_and_refuse_a_resume_across_kinds_or_settings(self):
+        req = ["--dataset", "d", "--es-url", "u", "--es-ca", "c", "--es-pw-file", "p", "--run-dir", "r", "--stamp-registry", "s",
+               "--embed-dir", "e", "--model", MODEL, "--rates-from", "x", "--mem-proof", "m", "--approved-cap", "1",
+               "--approval-ref", "a", "--commit", "c", "--model-kind", "muse"]
+        a = rs.parser().parse_args(req + ["--key-file", "k", "--rpm", "70", "--reasoning-effort", "low", "--max-tokens", "8192"])
+        self.assertEqual((a.model_kind, a.provider, a.key_file, a.rpm, a.base_url, a.binary, a.reasoning_effort, a.max_tokens),
+                         ("muse", "openrouter", "k", 70, "", "", "low", 8192))
+        bare = rs.parser().parse_args(req)
+        self.assertEqual((bare.reasoning_effort, bare.max_tokens), ("", 0))          # no default hidden in code: check refuses
+        self.assertTrue(any("--reasoning-effort" in w for w in mk.check(bare)) and any("--max-tokens" in w for w in mk.check(bare)))
+        d = tempfile.mkdtemp()
+        old = {"stage": "S3", "commit": "abc1234", "cap": 6000, "n_questions": 102, "a0_fields": "strong", "shuffled_n": 50}
+
+        def why_with(stamp):
+            (Path(d) / "STAMP.json").write_text(json.dumps(stamp))
+            return run_h1.check_prereqs(hg.args(stage="S3", n_questions=102, shuffled_n=50, run_dir=d, resume=True, a0_fields="strong",
+                                                **vars(margs())), embed=hg.RealEmbed())
+        self.assertTrue(any("model_kind differs" in w for w in why_with(old)))                # a claude stamp
+        same = dict(old, **mk.record(margs()))
+        self.assertFalse(any("differs from the stamp" in w for w in why_with(same)), why_with(same))
+        for k, v in (("reasoning_effort", "high"), ("max_tokens", 2048), ("provider", "meta")):
+            self.assertTrue(any("%s differs" % k in w for w in why_with(dict(same, **{k: v}))), k)
+        stub = run_h1.check_prereqs(hg.args(stage="DEV-STUB", **vars(margs())))
+        self.assertTrue(any("only in S2 or S3" in w for w in stub), stub)
+
+
+class Port(unittest.TestCase):
+    def test_the_port_is_built_from_one_key_source_the_registered_settings_and_one_pacer_at_rpm(self):
+        made = []
+
+        class FakePort:
+            model = MODEL
+            def __init__(self, **kw): made.append(kw)
+            def argv(self): return ["muse-fake", "{}"]
+            def record(self): return {"provider": "openrouter"}
+        fake_mod = types.SimpleNamespace(MusePort=FakePort, MuseConfigError=ma.MuseConfigError)
+        import evalkit
+        for a, src in ((margs(rpm=70, api_timeout=45.0), "file"),
+                       (margs(rpm=70, api_timeout=45.0, key_file="", key_secret_project="P", key_secret_name="N"), "secret")):
+            with mock.patch.dict(sys.modules, {"evalkit.muse_api": fake_mod}), \
+                    mock.patch.object(evalkit, "muse_api", fake_mod, create=True):
+                p = mk.capped_port(a, Path(tempfile.mkdtemp()), Budget(Path(tempfile.mkdtemp()) / "counter", 10))
+            want = {"model": MODEL, "provider": "openrouter", "base_url": None, "timeout": 45.0, "max_tokens": 4096,
+                    "reasoning_effort": "low"}
+            want.update({"key_file": a.key_file} if src == "file" else {"key_secret": ("P", "N"), "gcloud": shutil.which("gcloud")})
+            self.assertEqual(made[-1], want)
+            self.assertEqual((p._pacer.rpm, p._argv, p.model_id), (70, ["muse-fake", "{}"], MODEL))
+
+    def test_the_real_port_is_recorded_without_its_key_source_and_a_bad_key_refuses_before_any_stamp(self):
+        a = margs(key_file=key_file(OR_KEY))
+        p = mk.prepare(a, Path(tempfile.mkdtemp()))
+        rec = mk.stamp_record(a, p)
+        self.assertEqual((rec["port"]["provider"], rec["port"]["reasoning_effort"], rec["port"]["max_tokens"], rec["rpm"]),
+                         ("openrouter", "low", 4096, 140))
+        text = json.dumps(rec) + json.dumps(p.argv)
+        self.assertFalse(any(x in text for x in (a.key_file, OR_KEY)), text)
+        with self.assertRaises(mk.PortUnavailable) as e:
+            mk.prepare(margs(), Path(tempfile.mkdtemp()))                  # a file without an OpenRouter key
+        self.assertNotIn("NOT-A-KEY-MARKER", str(e.exception))
+        base, s3, man, run = t6.setup_dirs()
+        rc = rs.run(t6.args(base, s3, run, **vars(margs())), embedder=t6.RealEmbed(), loader=lambda _a: t6.rel.QS,
+                    tenant_factory=t6.factory(run), registered_pool=t6.POOL, registered_fresh=t6.rel.REG, manifest_path=man)
+        self.assertEqual((rc, json.loads((run / "STATE.json").read_text())["state"]), (2, "REFUSED"))
+        self.assertFalse(any((run / f).exists() for f in ("STAMP.json", "PREBUILD.json", "counter", "calls.jsonl")))
+
+    def test_an_answer_records_its_tokens_model_and_upstream_and_sends_the_registered_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            up = Upstream()
+            b, port, _ = port_over(self, tmp, up)
+            self.assertTrue(port.call(Task.ROUTE, route_inputs(1)).ok)
+            r = rows(tmp)[0]
+            self.assertEqual((r["prompt_tokens"], r["completion_tokens"], r["reasoning_tokens"], r["cached_tokens"], r["http_status"]),
+                             (1200, 340, 7, 200, 200))
+            self.assertEqual((r["model_reported"], r["upstream_provider"], r["finish_reason"], r["schema_ok"]), (MODEL, "Meta", "stop", True))
+            self.assertEqual(up.systems, [cc.SYSTEM_PROMPT])
+            self.assertEqual((up.bodies[0]["max_tokens"], up.bodies[0]["reasoning_effort"], up.bodies[0]["provider"]["allow_fallbacks"]),
+                             (4096, "low", False))
+
+    def test_a_429_503_or_in_flight_402_backs_off_at_least_retry_after_and_is_asked_again(self):
+        for kind in ("throttle", "unavailable", "inflight"):
+            with tempfile.TemporaryDirectory() as tmp:
+                b, port, delays = port_over(self, tmp, Upstream(retry_after=42, **{kind: (1,)}))
+                self.assertTrue(port.call(Task.ROUTE, route_inputs(1)).ok, kind)
+                self.assertEqual(delays, [42.0], kind)                  # base delay 1 s; Retry-After is the floor
+                self.assertEqual(b.count(), 2)
+                self.assertTrue(rows(tmp)[0]["throttled"])
+
+    def test_a_retry_after_above_the_back_off_cap_is_waited_in_full(self):
+        # review3: Retry-After is a minimum; only the exponential back-off is capped (600 s here)
+        with tempfile.TemporaryDirectory() as tmp:
+            b, port, delays = port_over(self, tmp, Upstream(retry_after=1200, throttle=(1,)))
+            self.assertTrue(port.call(Task.ROUTE, route_inputs(1)).ok)
+            self.assertEqual((delays, b.count()), ([1200.0], 2))
+
+    def test_a_retry_after_above_the_ceiling_stops_the_stage_resumably_without_a_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            up = Upstream(retry_after=7200, throttle=(1,))
+            b, port, delays = port_over(self, tmp, up)
+            with self.assertRaises(cc.StagePaused) as e:
+                port.call(Task.ROUTE, route_inputs(1))
+            self.assertIn("above the ceiling", str(e.exception))
+            self.assertEqual(e.exception.retry_after_s, 7200.0)
+            self.assertEqual((delays, b.count(), up.n), ([], 1, 1))       # no retry burnt, nothing waited
+            with self.assertRaises(cc.StagePaused):                           # every worker is halted
+                port.call(Task.ROUTE, route_inputs(2))
+            self.assertEqual(b.count(), 1)
+
+    def test_a_stop_file_ends_a_long_back_off_at_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            up = Upstream(retry_after=1200, throttle=(1,))
+            live = Live(up)
+            self.addCleanup(live.close)
+            b = Budget(Path(tmp) / "counter", 1000)
+            p = mk.capped_port(margs(), Path(tmp), b, runner=live.runner)
+            p._pacer = None
+            port = ResilientPort(p, b, Journal(Path(tmp) / "journal.jsonl"), Path(tmp) / "STOP", base_delay_s=1.0)   # the real wait
+            t, box = started(lambda: port.call(Task.ROUTE, route_inputs(1)))
+            for _ in range(100):
+                if up.n:
+                    break
+                time.sleep(0.05)
+            time.sleep(0.3)                                                   # inside the 1,200 s back-off now
+            (Path(tmp) / "STOP").write_text("")
+            t.join(5)
+            self.assertFalse(t.is_alive())
+            self.assertIsInstance(box.get("err"), StageStopped)
+            self.assertEqual((b.count(), up.n), (1, 1))
+
+    def test_throttles_never_count_as_failures_of_the_streak(self):
+        with tempfile.TemporaryDirectory() as tmp:          # 6 calls, each throttled once then answered: more than the streak of 5
+            b, port, _ = port_over(self, tmp, Upstream(throttle=(1, 3, 5, 7, 9, 11)))
+            self.assertTrue(all(port.call(Task.ROUTE, route_inputs(i)).ok for i in range(6)))
+        with tempfile.TemporaryDirectory() as tmp:          # 5 429s in a row on one call, no answer between, do not stop the stage
+            b, port, _ = port_over(self, tmp, Upstream(throttle=range(1, 6)), max_retries=6)
+            self.assertTrue(port.call(Task.ROUTE, route_inputs(1)).ok)
+        with tempfile.TemporaryDirectory() as tmp:          # 5 real API errors in a row still stop the stage
+            b, port, _ = port_over(self, tmp, Upstream(error=range(1, 100)))
+            with self.assertRaises(cc.StageLimited):
+                for i in range(10):
+                    port.call(Task.ROUTE, route_inputs(i))
+
+    def test_an_answer_cut_by_the_output_limit_is_a_failed_call_never_an_answer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b, port, _ = port_over(self, tmp, Upstream(length=range(1, 100)))
+            r = port.call(Task.ROUTE, route_inputs(1))
+            self.assertFalse(r.ok)
+            self.assertEqual((rows(tmp)[0]["error"], rows(tmp)[0]["api_error"], rows(tmp)[0]["finish_reason"]),
+                             ("api_error", "finish_length", "length"))
+            with self.assertRaises(cc.StageLimited):        # and five in a row stop the stage
+                for i in range(2, 10):
+                    port.call(Task.ROUTE, route_inputs(i))
+
+    def test_a_reported_model_mismatch_stops_the_stage_at_once_and_is_not_retried(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            up = Upstream(mismatch=(2,))
+            b, port, delays = port_over(self, tmp, up, concurrency=4, adaptive=True, start_concurrency=4)
+            self.assertTrue(port.scoped("q").call(Task.ROUTE, route_inputs(1)).ok)
+            with self.assertRaises(cc.StageLimited) as e:
+                port.scoped("q").call(Task.ROUTE, route_inputs(2))
+            self.assertNotIsInstance(e.exception, cc.AllowanceRefused)
+            self.assertEqual((b.count(), delays, up.n), (2, [], 2))
+            self.assertEqual(rows(tmp)[1]["error"], "model_mismatch")
+
+    def test_a_402_or_a_403_budget_refusal_stops_the_stage_at_once_even_at_adaptive_concurrency(self):
+        for kind in ("quota", "budget"):
+            with tempfile.TemporaryDirectory() as tmp:
+                up = Upstream(**{kind: (1,)})
+                b, port, delays = port_over(self, tmp, up, concurrency=4, adaptive=True, start_concurrency=4)
+                with self.assertRaises(cc.StageLimited) as e:
+                    port.scoped("q").call(Task.ROUTE, route_inputs(1))
+                self.assertNotIsInstance(e.exception, cc.AllowanceRefused, kind)            # not the retried kind
+                self.assertEqual((b.count(), delays, up.n), (1, [], 1), kind)
+                self.assertTrue(rows(tmp)[0]["limited"])
+
+    def test_one_pacer_spaces_every_request_of_the_run_before_its_charge(self):
+        t, slept = [0.0], []
+
+        def sleep(s):
+            slept.append(round(s, 6))
+        pacer = cc.Pacer(60, clock=lambda: t[0], sleep=sleep)
+        with tempfile.TemporaryDirectory() as tmp:
+            b, port, _ = port_over(self, tmp, Upstream(), concurrency=4, pacer=pacer)
+            errs = in_threads([lambda w=w: port.scoped("q%d" % w).call(Task.ROUTE, route_inputs(w)) for w in range(4)])
+            self.assertEqual(errs, [None] * 4)
+            self.assertEqual(b.count(), 4)
+        # 60 per minute: starts 1 s apart, shared across the 4 workers (waits of 1, 2 and 3 s), each slept in slices the halt gate
+        # checks between (review F1)
+        self.assertEqual((pacer.waited, round(sum(slept), 6)), (6.0, 6.0))
+        self.assertTrue(slept and max(slept) <= cc.Pacer.SLICE_S)
+
+
+class FirstHeld(Upstream):
+    """The first request is held at the upstream until the test releases it: that worker is in flight, charged, while others queue."""
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.first_in, self.first_go, self._seen = threading.Event(), threading.Event(), False
+
+    def reply(self, path, headers, body):
+        with self.lock:
+            first, self._seen = not self._seen, True
+        if first:
+            self.first_in.set()
+            self.first_go.wait(10)
+        return super().reply(path, headers, body)
+
+
+def started(fn, name=None):
+    box = {}
+
+    def run():
+        try:
+            fn()
+        except BaseException as e:          # inspected by the test
+            box["err"] = e
+    t = threading.Thread(target=run, daemon=True, name=name)
+    t.start()
+    return t, box
+
+
+class PacedHalt(unittest.TestCase):
+    """Review F1: a worker waiting in the pacer when another worker's call stops the stage (a billing refusal, a reported model
+    mismatch, the cap) or the stop file appears is never charged and sends nothing: the pacer wait is part of the shared halt gate,
+    and admission is checked again immediately before the charge."""
+    def scene(self, tmp, cond, pacer):
+        up = FirstHeld(**({cond: (1,)} if cond in ("quota", "mismatch") else {}))
+        b, port, _ = port_over(self, tmp, up, concurrency=3, cap=1 if cond == "cap" else 1000)
+        port._inner._pacer = pacer                             # the first request starts at once, the next one waits
+        a, abox = started(lambda: port.scoped("qa").call(Task.ROUTE, route_inputs(1)))
+        self.assertTrue(up.first_in.wait(10))                  # A is charged and in flight
+        bt, bbox = started(lambda: port.scoped("qb").call(Task.ROUTE, route_inputs(2)))
+        return up, b, port, a, abox, bt, bbox
+
+    def trigger(self, tmp, cond, up, a):
+        if cond == "stop":
+            (Path(tmp) / "STOP").write_text("")
+        up.first_go.set()                                      # A's answer: the refusal or mismatch that stops the stage, or an answer
+        a.join(10)
+
+    def nothing_more(self, tmp, cond, up, b, bbox, port):
+        self.assertEqual((b.count(), up.n), (1, 1), cond)                       # no second charge and no second request
+        self.assertEqual((port.limited, port.throttled), (int(cond in ("quota", "mismatch")), 0), cond)   # B's halt is not its own
+        self.assertEqual(len(rows(tmp)), 1, cond)
+        self.assertIsInstance(bbox.get("err"), (cc.StageLimited, BudgetExceeded, StageStopped), cond)
+        qb = [json.loads(l) for l in (Path(tmp) / "journal.jsonl").read_text().splitlines() if json.loads(l)["key"].startswith("qb|")]
+        self.assertNotIn("charged", [r["t"] for r in qb], cond)                 # a resume asks it again; it was never charged
+
+    def test_a_worker_released_from_the_pacer_after_a_stop_is_not_charged_and_sends_nothing(self):
+        for cond in ("quota", "mismatch", "stop", "cap"):      # "cap" is a guard: the durable counter refused it before this fix too
+            with self.subTest(cond=cond), tempfile.TemporaryDirectory() as tmp:
+                held, release = threading.Event(), threading.Event()
+
+                def hold(s):
+                    held.set()
+                    release.wait(10)
+                # 240 a minute on a still clock: B's wait is one slice, held here, so it is the check AFTER the wait that refuses it
+                up, b, port, a, abox, bt, bbox = self.scene(tmp, cond, cc.Pacer(240, clock=lambda: 0.0, sleep=hold))
+                if cond != "cap":
+                    self.assertTrue(held.wait(10), cond)       # B is waiting in the pacer
+                self.trigger(tmp, cond, up, a)
+                release.set()                                  # B leaves the pacer after the stop
+                bt.join(10)
+                self.assertFalse(bt.is_alive(), cond)
+                self.nothing_more(tmp, cond, up, b, bbox, port)
+
+    def test_a_stop_ends_a_pacer_wait_at_once(self):
+        for cond in ("quota", "stop"):
+            with self.subTest(cond=cond), tempfile.TemporaryDirectory() as tmp:
+                up, b, port, a, abox, bt, bbox = self.scene(tmp, cond, cc.Pacer(1))   # 1 a minute: a real wait of about 60 s for B
+                self.trigger(tmp, cond, up, a)
+                bt.join(5)
+                self.assertFalse(bt.is_alive(), cond)          # it does not sleep out the minute
+                self.nothing_more(tmp, cond, up, b, bbox, port)
+
+    def race(self, port):
+        """A's call holds the charge lock while it records its outcome; B is started then and blocks on that lock. Returns
+        (A's error, B's error) once both end. When A releases the lock, B must already see the stage's decision."""
+        inner, b_at_lock, box = port._inner, threading.Event(), {}
+
+        class AtLock:
+            def __init__(self, real):
+                self.real = real
+
+            def __enter__(self):
+                if threading.current_thread().name == "B":
+                    b_at_lock.set()
+                return self.real.__enter__()
+
+            def __exit__(self, *x):
+                return self.real.__exit__(*x)
+        inner._lock = AtLock(inner._lock)
+        append = inner._append
+
+        def a_records(row):
+            if threading.current_thread().name == "A" and "bt" not in box:
+                box["bt"], box["bbox"] = started(lambda: port.scoped("qb").call(Task.ROUTE, route_inputs(2)), "B")
+                self.assertTrue(b_at_lock.wait(10))
+                time.sleep(0.3)
+            append(row)
+        inner._append = a_records
+        a, abox = started(lambda: port.scoped("qa").call(Task.ROUTE, route_inputs(1)), "A")
+        a.join(10)
+        box["bt"].join(10)
+        return abox.get("err"), box["bbox"].get("err")
+
+    def test_a_call_that_stops_the_stage_halts_the_others_before_its_charge_lock_is_released(self):
+        # every outcome that stops the stage: a billing refusal, a mismatch, a wait above the ceiling, a throttle past its retries
+        for cond in ("quota", "mismatch", "ceiling", "exhausted"):
+            with self.subTest(cond=cond), tempfile.TemporaryDirectory() as tmp:
+                up = (Upstream(retry_after=7200, throttle=(1,)) if cond == "ceiling" else Upstream(throttle=(1,)) if cond == "exhausted"
+                      else Upstream(**{cond: (1,)}))
+                stop = cc.StagePaused if cond in ("ceiling", "exhausted") else cc.StageLimited
+                b, port, _ = port_over(self, tmp, up, concurrency=2, max_retries=0 if cond == "exhausted" else 3)
+                aerr, berr = self.race(port)
+                self.assertIsInstance(aerr, stop, cond)
+                self.assertIsInstance(berr, stop, cond)
+                self.assertEqual((b.count(), up.n), (1, 1), cond)
+
+    def test_a_cli_allowance_refusal_halts_the_others_before_its_charge_lock_is_released(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp, sent = Path(tmp), []
+            b = Budget(tmp / "counter", 1000)
+
+            def refuses(prompt):
+                sent.append(1)
+                return cc.RunOut(1, "", "You've hit your usage limit", 0.01)
+            inner = cc.CappedPort(refuses, b, tmp / "calls.jsonl", model_id="m")
+            port = ResilientPort(inner, b, Journal(tmp / "journal.jsonl"), tmp / "STOP", concurrency=2, sleep=lambda s: None)
+            aerr, berr = self.race(port)
+            self.assertIsInstance(aerr, cc.AllowanceRefused)
+            self.assertIsInstance(berr, cc.AllowanceRefused)
+            self.assertEqual((b.count(), len(sent)), (1, 1))
+
+    def test_each_allowance_refusal_is_decided_once(self):
+        # adaptive, max_retries 2: two refusals then an answer go on; counted twice, the second would halt the stage
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp, sent = Path(tmp), []
+            b = Budget(tmp / "counter", 1000)
+            ok = cc.CappedPort(SafeRunner(), b, tmp / "x.jsonl", model_id="m")._run
+
+            def refuses_twice(prompt):
+                sent.append(1)
+                return cc.RunOut(1, "", "You've hit your usage limit", 0.01) if len(sent) <= 2 else ok(prompt)
+            inner = cc.CappedPort(refuses_twice, b, tmp / "calls.jsonl", model_id="m")
+            port = ResilientPort(inner, b, Journal(tmp / "journal.jsonl"), tmp / "STOP", concurrency=4, adaptive=True,
+                                 start_concurrency=4, max_retries=2, sleep=lambda s: None)
+            self.assertTrue(port.scoped("q").call(Task.ROUTE, route_inputs(1)).ok)
+            self.assertEqual((port.limited, b.count(), len(sent)), (2, 3, 3))
+
+    def test_a_call_held_by_a_back_off_takes_a_new_pacer_turn_before_its_charge(self):
+        # workers released together from a back-off must not charge in one unpaced burst
+        with tempfile.TemporaryDirectory() as tmp:
+            up = Upstream()
+            b, port, _ = port_over(self, tmp, up, concurrency=2)
+            turns, held, release = [], threading.Event(), threading.Event()
+
+            class Turns:
+                def wait(self, check=None):
+                    turns.append(1)
+                    if len(turns) == 1:
+                        held.set()
+                        release.wait(10)
+            port._inner._pacer = Turns()
+            t, box = started(lambda: port.scoped("q").call(Task.ROUTE, route_inputs(1)))
+            self.assertTrue(held.wait(10))
+            with port._gate:
+                port._backing_off = 1                  # another worker's back-off begins while this one waits its pacer turn
+            release.set()
+            time.sleep(0.4)
+            self.assertEqual((len(turns), up.n, b.count()), (1, 0, 0))   # held at admission, nothing charged
+            with port._gate:
+                port._backing_off = 0
+                port._gate.notify_all()
+            t.join(10)
+            self.assertIsNone(box.get("err"))
+            self.assertEqual((len(turns), up.n, b.count()), (2, 1, 1))   # a new pacer turn, then the one charge
+
+    def backoff_scene(self, tmp):
+        """Review F3 of goodqa#16562: A's first request is throttled and its back-off is held until the test ends it; worker B is
+        watched for its first charge or its first wait at the gate. Returns the counter, the port, the upstream and the events."""
+        ev = {k: threading.Event() for k in ("b_charged", "b_waiting", "in_backoff", "end_backoff")}
+
+        def held(delay):
+            ev["in_backoff"].set()
+            ev["end_backoff"].wait(10)
+        up = Upstream(throttle=(1,))
+        b, port, _ = port_over(self, tmp, up, concurrency=2, sleep=held)
+
+        class Gate(threading.Condition):
+            def wait(self, timeout=None):
+                if threading.current_thread().name == "B":
+                    ev["b_waiting"].set()
+                return super().wait(timeout)
+        port._gate = Gate()
+        append = port.journal.append
+
+        def journal(row):
+            append(row)
+            if row.get("t") == "charged" and threading.current_thread().name == "B":
+                ev["b_charged"].set()
+            hook = getattr(port, "_test_on_row", None)
+            if hook is not None:
+                hook(row)
+        port.journal.append = journal
+        return b, port, up, ev
+
+    @staticmethod
+    def first_of(ev):
+        for _ in range(400):
+            for k in ("b_charged", "b_waiting"):
+                if ev[k].is_set():
+                    return k
+            time.sleep(0.025)
+        return None
+
+    def both_answered_after(self, ev, a, abox, bt, bbox, b, up):
+        ev["end_backoff"].set()
+        a.join(10)
+        bt.join(10)
+        self.assertFalse(a.is_alive() or bt.is_alive())
+        self.assertIsNone(abox.get("err"))
+        self.assertIsNone(bbox.get("err"))
+        self.assertEqual((b.count(), up.n), (3, 3))          # A's throttled request, A's retry and B, each charged once
+
+    def test_no_worker_charges_between_a_throttle_leaving_the_charge_lock_and_its_back_off(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b, port, up, ev = self.backoff_scene(tmp)
+            box = {}
+
+            def on_row(row):
+                # A's throttle has left the charge lock and is recorded; B starts here and must not charge before A's back-off
+                if row.get("t") == "throttled" and threading.current_thread().name == "A" and "bt" not in box:
+                    box["bt"], box["bbox"] = started(lambda: port.scoped("qb").call(Task.ROUTE, route_inputs(2)), "B")
+                    box["first"], box["count"] = self.first_of(ev), b.count()
+            port._test_on_row = on_row
+            a, abox = started(lambda: port.scoped("qa").call(Task.ROUTE, route_inputs(1)), "A")
+            self.assertTrue(ev["in_backoff"].wait(10))
+            self.assertEqual((box["first"], box["count"]), ("b_waiting", 1))
+            self.assertEqual(b.count(), 1)                    # still nothing more during the back-off
+            self.both_answered_after(ev, a, abox, box["bt"], box["bbox"], b, up)
+
+    def test_a_worker_past_its_blocking_admission_does_not_charge_during_a_back_off_that_began_after_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b, port, up, ev = self.backoff_scene(tmp)
+            inner, b_passed, b_go = port._inner, threading.Event(), threading.Event()
+            real = inner.admit
+
+            def admit(block):
+                r = real(block)
+                if block and threading.current_thread().name == "B" and not b_passed.is_set():
+                    b_passed.set()                        # B passed its blocking admission: no back-off then
+                    b_go.wait(10)
+                return r
+            inner.admit = admit
+            turns = []
+
+            class Turns:
+                def wait(self, check=None):
+                    turns.append(threading.current_thread().name)
+            inner._pacer = Turns()
+            bt, bbox = started(lambda: port.scoped("qb").call(Task.ROUTE, route_inputs(2)), "B")
+            self.assertTrue(b_passed.wait(10))
+            a, abox = started(lambda: port.scoped("qa").call(Task.ROUTE, route_inputs(1)), "A")
+            self.assertTrue(ev["in_backoff"].wait(10))       # A was throttled and its back-off has begun
+            b_go.set()                                         # B now reaches the charge lock
+            self.assertEqual((self.first_of(ev), b.count()), ("b_waiting", 1))
+            self.both_answered_after(ev, a, abox, bt, bbox, b, up)
+            self.assertEqual(turns.count("B"), 2)             # held at the lock, B waited the back-off out and took a new turn
+
+    def test_every_worker_halted_by_a_pause_sees_its_requested_wait(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b, port, _ = port_over(self, tmp, Upstream(), concurrency=2)
+            port.halt(cc.StagePaused("asked to wait", retry_after_s=7200.0))
+            with self.assertRaises(cc.StagePaused) as e:
+                port.scoped("q").call(Task.ROUTE, route_inputs(1))
+            self.assertEqual((e.exception.retry_after_s, b.count()), (7200.0, 0))
+
+
+@mock.patch.object(rs, "EXPECTED_LEAVES", 1)
+class Stage(unittest.TestCase):
+    def go(self, n):
+        base, s3, man, run = t6.setup_dirs()
+        a = t6.args(base, s3, run, concurrency=n, concurrency_reason="test" if n > 2 else "", **vars(margs(rpm=10 ** 6)))
+        live = Live(Upstream())
+        self.addCleanup(live.close)
+        with seeded_node_ids():
+            rc = rs.run(a, embedder=t6.RealEmbed(), runner=live.runner, loader=lambda _a: t6.rel.QS,
+                        tenant_factory=t6.factory(run), registered_pool=t6.POOL, registered_fresh=t6.rel.REG, manifest_path=man)
+        self.assertEqual(rc, 0)
+        return run, live
+
+    def test_the_muse_kind_gives_the_same_ledger_at_one_and_four_workers_and_records_the_model(self):
+        (r1, live), (r4, _) = self.go(1), self.go(4)
+        self.assertEqual((r4 / "done.jsonl").read_bytes(), (r1 / "done.jsonl").read_bytes())
+        led = [json.loads(l) for l in (r1 / "done.jsonl").read_text().splitlines()]
+        ident = ("muse", MODEL, "openrouter", "low", 4096)
+        self.assertTrue(led and all(tuple(x[k] for k in mk.IDENTITY) == ident for x in led))
+        stamp = json.loads((r1 / "STAMP.json").read_text())
+        self.assertEqual(tuple(stamp[k] for k in mk.IDENTITY), ident)
+        self.assertEqual((stamp["rpm"], stamp["port"]["provider"], stamp["port"]["reasoning_effort"]), (10 ** 6, "openrouter", "low"))
+        self.assertFalse(any(k.startswith("key") for k in stamp))
+        self.assertFalse(any(x in (r1 / "STAMP.json").read_text() for x in (live.key, OR_KEY)))
+        state = json.loads((r1 / "STATE.json").read_text())
+        self.assertEqual((state["models_reported"], state["providers_reported"]), ([MODEL], ["Meta"]))
+        calls = [json.loads(l) for l in (r1 / "calls.jsonl").read_text().splitlines()]
+        self.assertTrue(calls and all((c["reasoning_tokens"], c["upstream_provider"]) == (7, "Meta") for c in calls))
+
+    def test_the_journal_keys_are_the_same_at_one_and_four_workers(self):
+        (r1, _), (r4, _) = self.go(1), self.go(4)
+        keys = [{json.loads(l)["key"] for l in (r / "journal.jsonl").read_text().splitlines()} for r in (r1, r4)]
+        self.assertEqual(keys[0], keys[1])                         # review F2: one key scheme, so any resume replays what was answered
+        self.assertTrue(keys[0] and all("|" in k for k in keys[0]))
+
+    def test_a_retry_after_above_the_ceiling_pauses_s6h1_and_says_why(self):
+        base, s3, man, run = t6.setup_dirs()
+        a = t6.args(base, s3, run, concurrency=4, concurrency_reason="test", **vars(margs(rpm=10 ** 6)))
+        live = Live(Upstream(retry_after=7200, throttle=(1,)))
+        self.addCleanup(live.close)
+        with seeded_node_ids():
+            rc = rs.run(a, embedder=t6.RealEmbed(), runner=live.runner, loader=lambda _a: t6.rel.QS, tenant_factory=t6.factory(run),
+                        registered_pool=t6.POOL, registered_fresh=t6.rel.REG, manifest_path=man)
+        self.assertEqual(rc, 75)
+        state = json.loads((run / "STATE.json").read_text())
+        self.assertEqual((state["state"], state["retry_after_s"]), ("PAUSED_THROTTLE", 7200.0))
+        self.assertIn("above the ceiling", state["error"])
+
+    def test_an_early_build_on_another_kind_or_setting_is_refused_to_the_stamped_run(self):
+        base, s3, man, run = t6.setup_dirs()
+        for pre_kw, now_kw, word in (({}, None, "model_kind"), ({}, {"reasoning_effort": "high"}, "reasoning_effort"),
+                                     ({}, {"max_tokens": 2048}, "max_tokens")):
+            pre = rs._prebuild_now(t6.args(base, s3, run, **vars(margs(**pre_kw))), rs.fz.ROOT)
+            (run / "PREBUILD.json").write_text(json.dumps(pre))
+            now = t6.args(base, s3, run) if now_kw is None else t6.args(base, s3, run, **vars(margs(**now_kw)))
+            why = rs.check_prereqs(now, embed=t6.RealEmbed(), manifest_path=man, mem_available=lambda: 64000.0)
+            self.assertTrue(any("early build's %s" % word in w for w in why), (word, why))
+
+    def test_an_early_build_rerun_or_a_stamped_resume_with_another_setting_is_refused(self):
+        base, s3, man, run = t6.setup_dirs()
+        low = t6.args(base, s3, run, **vars(margs()))
+        (run / "PREBUILD.json").write_text(json.dumps(rs._prebuild_now(low, rs.fz.ROOT)))
+        self.assertFalse([w for w in rs._prebuild_prereqs(low, run, rs.fz.ROOT) if "early build must continue" in w])
+        high = t6.args(base, s3, run, **vars(margs(reasoning_effort="high")))
+        why = rs._prebuild_prereqs(high, run, rs.fz.ROOT)
+        self.assertTrue(any("same reasoning_effort as PREBUILD.json" in w for w in why), why)
+        (run / "PREBUILD.json").unlink()
+        stamp = {k: getattr(low, k) for k in ("commit", "a0_fields", "model")}
+        stamp.update(mk.stamp_record(low), cap=low.approved_cap, approval_ref=low.approval_ref, release_ref=low.release_ref)
+        (run / "STAMP.json").write_text(json.dumps(stamp))
+        for a, bad in ((t6.args(base, s3, run, resume=True, **vars(margs())), False),
+                       (t6.args(base, s3, run, resume=True, **vars(margs(max_tokens=2048))), True)):
+            why = rs._stamped_prereqs(a, run, man, rs.fz.ROOT)
+            self.assertEqual(any("max_tokens differs from the stamp" in w for w in why), bad, why)
+
+
+@mock.patch.dict(run_h1.REGISTERED_N, {"S3": 10})          # the synthetic S3 of test_run_s3_parallel: 10 questions, SHUFFLED on 4
+@mock.patch.dict(run_h1.SHUFFLED_N, {"S3": 4})
+class S3OnMuse(unittest.TestCase):
+    def test_s3_runs_on_the_real_port_and_its_summaries_and_ledger_carry_the_model(self):
+        d = Path(tempfile.mkdtemp())
+        live = Live(Upstream())
+        self.addCleanup(live.close)
+        a = s3p.args(d, concurrency=4, concurrency_reason="test", **vars(margs(rpm=10 ** 6)))
+        with seeded_node_ids():
+            rc = run_s2.run(a, run_h1.pick_questions, embedder=t6.RealEmbed(), runner=live.runner, loader=s3p.loader,
+                            tenant_factory=t6.factory(d))
+        self.assertEqual(rc, 0)
+        summ = json.loads((d / "results" / "summaries.json").read_text())
+        for task in ("route", "build_l1"):
+            self.assertGreater(summ["by_task"][task]["input_tokens"], 0, task)        # prompt tokens, cached part included
+            self.assertGreater(summ["by_task"][task]["output_tokens"], 0, task)
+        self.assertEqual(summ["by_task"]["route"]["input_tokens"], 1200 * summ["by_task"]["route"]["calls"])
+        state = json.loads((d / "STATE.json").read_text())
+        self.assertEqual((state["state"], state["models_reported"], state["providers_reported"]), ("COMPLETE", [MODEL], ["Meta"]))
+        led = [json.loads(l) for l in (d / "done.jsonl").read_text().splitlines()]
+        self.assertEqual(len(led), 10)
+        self.assertTrue(all(tuple(r[k] for k in mk.IDENTITY) == ("muse", MODEL, "openrouter", "low", 4096) for r in led))
+        stamp = json.loads((d / "STAMP.json").read_text())
+        self.assertEqual((stamp["model_kind"], stamp["reasoning_effort"], stamp["port"]["provider"]), ("muse", "low", "openrouter"))
+
+    def test_a_retry_after_above_the_ceiling_pauses_the_stage_and_says_why(self):
+        d = Path(tempfile.mkdtemp())
+        live = Live(Upstream(retry_after=7200, throttle=(1,)))
+        self.addCleanup(live.close)
+        with seeded_node_ids():
+            rc = run_s2.run(s3p.args(d, **vars(margs(rpm=10 ** 6))), run_h1.pick_questions, embedder=t6.RealEmbed(),
+                            runner=live.runner, loader=s3p.loader, tenant_factory=t6.factory(d))
+        self.assertEqual(rc, run_s2.RC["PAUSED_THROTTLE"])
+        state = json.loads((d / "STATE.json").read_text())
+        self.assertIn("above the ceiling", state["error"])
+        self.assertEqual(state["retry_after_s"], 7200.0)
+
+    def test_a_long_or_dated_retry_after_from_the_real_port_pauses_the_stage_after_one_charged_request(self):
+        # delta review F2: the port kept only integer values up to 86,400 s, so 172,800 or an HTTP date reached the ceiling as None
+        import email.utils
+        for header, low in (("172800", 172800.0), (email.utils.formatdate(time.time() + 7200, usegmt=True), 7000.0)):
+            with self.subTest(header=header):
+                d = Path(tempfile.mkdtemp())
+                up = Upstream(retry_after=header, throttle=(1,))
+                live = Live(up)
+                self.addCleanup(live.close)
+                with seeded_node_ids():
+                    rc = run_s2.run(s3p.args(d, **vars(margs(rpm=10 ** 6))), run_h1.pick_questions, embedder=t6.RealEmbed(),
+                                    runner=live.runner, loader=s3p.loader, tenant_factory=t6.factory(d))
+                self.assertEqual(rc, run_s2.RC["PAUSED_THROTTLE"])
+                state = json.loads((d / "STATE.json").read_text())
+                self.assertIn("resume after", state["error"])
+                self.assertTrue(low <= state["retry_after_s"] <= low + 400, state["retry_after_s"])
+                self.assertEqual((up.n, int((d / "counter").read_text())), (1, 1))      # one charged request, no retry
+
+    def test_a_torn_last_call_row_is_set_aside_on_resume_and_the_summaries_still_read(self):
+        d = Path(tempfile.mkdtemp())
+        live = Live(Upstream())
+        self.addCleanup(live.close)
+        a = s3p.args(d, **vars(margs(rpm=10 ** 6)))
+        with seeded_node_ids():
+            self.assertEqual(run_s2.run(a, run_h1.pick_questions, embedder=t6.RealEmbed(), runner=live.runner, loader=s3p.loader,
+                                        tenant_factory=t6.factory(d)), 0)
+        with open(d / "calls.jsonl", "a") as f:
+            f.write('{"n": 99999, "task": "rou')                 # the write that never finished
+        (d / "done.jsonl").write_text("")                         # a resume that has questions to ask again
+        with seeded_node_ids():
+            self.assertEqual(run_s2.run(s3p.args(d, resume=True, **vars(margs(rpm=10 ** 6))), run_h1.pick_questions,
+                                        embedder=t6.RealEmbed(), runner=live.runner, loader=s3p.loader, tenant_factory=t6.factory(d)), 0)
+        self.assertTrue(json.loads((d / "results" / "summaries.json").read_text())["calls"] > 0)
+        self.assertEqual(len(list(d.glob("calls.jsonl.torn.*"))), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

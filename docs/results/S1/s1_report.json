@@ -1,0 +1,441 @@
+{
+ "argv": [
+  "claude",
+  "-p",
+  "--model",
+  "sonnet",
+  "--output-format",
+  "json",
+  "--no-session-persistence",
+  "--tools",
+  "",
+  "--disable-slash-commands",
+  "--strict-mcp-config",
+  "--settings",
+  "{\"disableAllHooks\":true}",
+  "--system-prompt",
+  "You are one component of a memory-retrieval pipeline. Reply with exactly one JSON object and nothing else: no prose, no code fences. The JSON must match the schema stated in the user message."
+ ],
+ "calls_total": 22,
+ "cap": 25,
+ "commit": "924c9f6",
+ "counter": 22,
+ "fixture": "synthetic nonsense-word notes; token counts per character are higher than English",
+ "model_requested": "claude-sonnet-5-5",
+ "models_reported": [
+  "claude-sonnet-5-5"
+ ],
+ "num_turns": [
+  "1"
+ ],
+ "per_task": {
+  "answer_judge": {
+   "cache_creation_per_call": [
+    687
+   ],
+   "cache_read_per_call": [
+    0
+   ],
+   "calls": 1,
+   "consumer_strict_valid": 1,
+   "errors": [],
+   "input_tokens_total_per_call": [
+    689
+   ],
+   "input_tokens_uncached_per_call": [
+    2
+   ],
+   "latency_s_median": 1.88,
+   "latency_s_per_call": [
+    1.882
+   ],
+   "output_tokens_per_call": [
+    9
+   ],
+   "prompt_chars_per_call": [
+    178
+   ],
+   "schema_valid": 1,
+   "strict_problems": [],
+   "throttled": 0
+  },
+  "ask": {
+   "cache_creation_per_call": [
+    1558
+   ],
+   "cache_read_per_call": [
+    0
+   ],
+   "calls": 1,
+   "consumer_strict_valid": 1,
+   "errors": [],
+   "input_tokens_total_per_call": [
+    1560
+   ],
+   "input_tokens_uncached_per_call": [
+    2
+   ],
+   "latency_s_median": 2.81,
+   "latency_s_per_call": [
+    2.809
+   ],
+   "output_tokens_per_call": [
+    107
+   ],
+   "prompt_chars_per_call": [
+    1861
+   ],
+   "schema_valid": 1,
+   "strict_problems": [],
+   "throttled": 0
+  },
+  "build_l1": {
+   "cache_creation_per_call": [
+    2401,
+    2420,
+    2442,
+    2390
+   ],
+   "cache_read_per_call": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "calls": 4,
+   "consumer_strict_valid": 4,
+   "errors": [],
+   "input_tokens_total_per_call": [
+    2403,
+    2422,
+    2444,
+    2392
+   ],
+   "input_tokens_uncached_per_call": [
+    2,
+    2,
+    2,
+    2
+   ],
+   "latency_s_median": 10.44,
+   "latency_s_per_call": [
+    10.563,
+    10.315,
+    9.269,
+    10.706
+   ],
+   "output_tokens_per_call": [
+    1776,
+    1723,
+    1559,
+    1836
+   ],
+   "prompt_chars_per_call": [
+    3806,
+    3804,
+    3791,
+    3799
+   ],
+   "schema_valid": 4,
+   "strict_problems": [],
+   "throttled": 0
+  },
+  "build_upper": {
+   "cache_creation_per_call": [
+    2088
+   ],
+   "cache_read_per_call": [
+    0
+   ],
+   "calls": 1,
+   "consumer_strict_valid": 1,
+   "errors": [],
+   "input_tokens_total_per_call": [
+    2090
+   ],
+   "input_tokens_uncached_per_call": [
+    2
+   ],
+   "latency_s_median": 3.0,
+   "latency_s_per_call": [
+    3.0
+   ],
+   "output_tokens_per_call": [
+    176
+   ],
+   "prompt_chars_per_call": [
+    3605
+   ],
+   "schema_valid": 1,
+   "strict_problems": [],
+   "throttled": 0
+  },
+  "judge_relevance": {
+   "cache_creation_per_call": [
+    1556
+   ],
+   "cache_read_per_call": [
+    0
+   ],
+   "calls": 1,
+   "consumer_strict_valid": 1,
+   "errors": [],
+   "input_tokens_total_per_call": [
+    1558
+   ],
+   "input_tokens_uncached_per_call": [
+    2
+   ],
+   "latency_s_median": 2.03,
+   "latency_s_per_call": [
+    2.028
+   ],
+   "output_tokens_per_call": [
+    18
+   ],
+   "prompt_chars_per_call": [
+    1870
+   ],
+   "schema_valid": 1,
+   "strict_problems": [],
+   "throttled": 0
+  },
+  "organise": {
+   "cache_creation_per_call": [
+    1251,
+    1257
+   ],
+   "cache_read_per_call": [
+    0,
+    0
+   ],
+   "calls": 2,
+   "consumer_strict_valid": 2,
+   "errors": [],
+   "input_tokens_total_per_call": [
+    1253,
+    1259
+   ],
+   "input_tokens_uncached_per_call": [
+    2,
+    2
+   ],
+   "latency_s_median": 3.8,
+   "latency_s_per_call": [
+    3.942,
+    3.656
+   ],
+   "output_tokens_per_call": [
+    427,
+    380
+   ],
+   "prompt_chars_per_call": [
+    1024,
+    1024
+   ],
+   "schema_valid": 2,
+   "strict_problems": [],
+   "throttled": 0
+  },
+  "query_variants": {
+   "cache_creation_per_call": [
+    680
+   ],
+   "cache_read_per_call": [
+    0
+   ],
+   "calls": 1,
+   "consumer_strict_valid": 1,
+   "errors": [],
+   "input_tokens_total_per_call": [
+    682
+   ],
+   "input_tokens_uncached_per_call": [
+    2
+   ],
+   "latency_s_median": 2.37,
+   "latency_s_per_call": [
+    2.369
+   ],
+   "output_tokens_per_call": [
+    69
+   ],
+   "prompt_chars_per_call": [
+    158
+   ],
+   "schema_valid": 1,
+   "strict_problems": [],
+   "throttled": 0
+  },
+  "reader_answer": {
+   "cache_creation_per_call": [
+    1538
+   ],
+   "cache_read_per_call": [
+    0
+   ],
+   "calls": 1,
+   "consumer_strict_valid": 1,
+   "errors": [],
+   "input_tokens_total_per_call": [
+    1540
+   ],
+   "input_tokens_uncached_per_call": [
+    2
+   ],
+   "latency_s_median": 2.49,
+   "latency_s_per_call": [
+    2.494
+   ],
+   "output_tokens_per_call": [
+    78
+   ],
+   "prompt_chars_per_call": [
+    1821
+   ],
+   "schema_valid": 1,
+   "strict_problems": [],
+   "throttled": 0
+  },
+  "route": {
+   "cache_creation_per_call": [
+    2912,
+    2867,
+    2715,
+    2970,
+    2909,
+    2864,
+    2712,
+    2967
+   ],
+   "cache_read_per_call": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "calls": 8,
+   "consumer_strict_valid": 8,
+   "errors": [],
+   "input_tokens_total_per_call": [
+    2914,
+    2869,
+    2717,
+    2972,
+    2911,
+    2866,
+    2714,
+    2969
+   ],
+   "input_tokens_uncached_per_call": [
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2
+   ],
+   "latency_s_median": 2.09,
+   "latency_s_per_call": [
+    2.088,
+    2.096,
+    3.343,
+    2.212,
+    2.085,
+    2.059,
+    2.052,
+    4.325
+   ],
+   "output_tokens_per_call": [
+    24,
+    24,
+    253,
+    24,
+    24,
+    24,
+    24,
+    391
+   ],
+   "prompt_chars_per_call": [
+    5094,
+    5011,
+    4403,
+    5206,
+    5094,
+    5011,
+    4403,
+    5206
+   ],
+   "schema_valid": 8,
+   "strict_problems": [],
+   "throttled": 0
+  },
+  "synthetic_queries": {
+   "cache_creation_per_call": [
+    1524
+   ],
+   "cache_read_per_call": [
+    0
+   ],
+   "calls": 1,
+   "consumer_strict_valid": 1,
+   "errors": [],
+   "input_tokens_total_per_call": [
+    1526
+   ],
+   "input_tokens_uncached_per_call": [
+    2
+   ],
+   "latency_s_median": 2.96,
+   "latency_s_per_call": [
+    2.964
+   ],
+   "output_tokens_per_call": [
+    138
+   ],
+   "prompt_chars_per_call": [
+    1819
+   ],
+   "schema_valid": 1,
+   "strict_problems": [],
+   "throttled": 0
+  },
+  "type_edges": {
+   "cache_creation_per_call": [
+    1840
+   ],
+   "cache_read_per_call": [
+    0
+   ],
+   "calls": 1,
+   "consumer_strict_valid": 1,
+   "errors": [],
+   "input_tokens_total_per_call": [
+    1842
+   ],
+   "input_tokens_uncached_per_call": [
+    2
+   ],
+   "latency_s_median": 2.54,
+   "latency_s_per_call": [
+    2.535
+   ],
+   "output_tokens_per_call": [
+    115
+   ],
+   "prompt_chars_per_call": [
+    2475
+   ],
+   "schema_valid": 1,
+   "strict_problems": [],
+   "throttled": 0
+  }
+ },
+ "stage": "S1"
+}
