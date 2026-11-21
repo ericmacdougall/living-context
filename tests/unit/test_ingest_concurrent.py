@@ -18,6 +18,7 @@ from living_context.ingest.subjects import Guard, TokenSource
 from living_context.ingest.writer import Writer, WriterError
 from living_context.keystore import Keystore
 from living_context.policy import Principal, Role
+from tests.unit.fake_es import behind, doc_answer
 
 T = "ingc"
 DOC = re.compile(r"^/([^/]+)/_doc/([^?]+)(?:\?(.*))?$")
@@ -43,9 +44,10 @@ class MemEs:
                 key = (idx, did)
                 if method == "GET":
                     if key not in self.docs:
-                        return 404, {}
+                        return doc_answer("GET", behind(idx), did, False)
                     seq, src = self.docs[key]
-                    return 200, {"_seq_no": seq, "_primary_term": 1, "_source": json.loads(json.dumps(src))}
+                    st, r = doc_answer("GET", behind(idx), did, True, json.loads(json.dumps(src)))
+                    return st, dict(r, _seq_no=seq)
                 if method == "PUT":
                     if q.get("op_type") == "create" and key in self.docs:
                         return 409, {}
@@ -53,7 +55,8 @@ class MemEs:
                         return 409, {}
                     self.seq += 1
                     self.docs[key] = (self.seq, json.loads(json.dumps(body)))
-                    return 201, {"_seq_no": self.seq}
+                    st, r = doc_answer("PUT", behind(idx), did, True, created=True)
+                    return st, dict(r, _seq_no=self.seq)
             if path.endswith("/_refresh"):
                 return 200, {}
             raise AssertionError("unexpected request %s %s" % (method, path))
