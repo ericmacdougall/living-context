@@ -143,9 +143,12 @@ changed after this partial run.
 - The tree build stopped at call 1,536 of about 5,211. The confirmatory run is
   paused pending API credit and build-host disk space.
 
-Thresholds for this run were pre-registered in `docs/EXPERIMENT.md` (on
-`feat/parallel-calls`) before any run, and results never move a threshold. The
-pilot figures above must not be presented as the outcome of H1.
+The plan (`docs/EXPERIMENT.md` on `feat/parallel-calls`) was first committed on
+2026-11-19 and its sections 1 to 13 have not changed since; six dated
+amendments are appended in its section 14. One threshold will change after
+seeing pilot data: condition (c), which is vacuous as written, will be tightened
+by a labelled amendment before the confirmatory questions run. The pilot figures
+above must not be presented as the outcome of H1.
 
 ## Not measured yet
 
