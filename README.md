@@ -14,7 +14,7 @@ from evidence, adopting a change only if replay shows it helps.
 |---|---|
 | Stage | **Experimental.** The method is **not proven**. |
 | Measured | Exploratory development runs on the LongMemEval-S (cleaned) pilot split: tree recall fused with flat hybrid search (A1) against flat hybrid search alone (A0), plus controls, cost and latency. |
-| Not measured | The pre-registered confirmatory run (S6-H1, 312 fresh questions) has **not happened**: its tree build stopped at call 1,536 of ~5,211 and is paused pending API credit and build-host disk space. Also not measured: H1b, H2 (cross-links), H3 (reorganisation loop), H4 (reflection/reverse audit), comparisons C1/C2, any public benchmark besides LongMemEval-S (e.g. LoCoMo), end-to-end answer accuracy, and end-to-end recall latency. |
+| Not measured | The pre-registered confirmatory run (S6-H1, 312 fresh questions) has **not happened**: its tree build stopped at call 1,536 of ~5,211 on a provider quota refusal. The S6-H1 build resumed on 2026-11-21; its question run has not started, so there are no S6-H1 numbers. Also not measured: H1b, H2 (cross-links), H3 (reorganisation loop), H4 (reflection/reverse audit), comparisons C1/C2, any public benchmark besides LongMemEval-S (e.g. LoCoMo), end-to-end answer accuracy, and end-to-end recall latency. |
 | Claim allowed today | None about the method. The pilot shows a small recall gain that is not statistically separated from zero, at a large cost in model calls. |
 
 Every figure below is an **exploratory development figure**, not a confirmatory
@@ -132,6 +132,10 @@ The reproduction guide is `bench/README.md`, and runnable examples are in
 `examples/` (arriving with the integration PR). The guide describes how to
 rebuild the pilot pool and re-run the arms. Until it lands, nothing here should
 be taken as reproducible by following this README alone. Contribution and test instructions: [CONTRIBUTING.md](CONTRIBUTING.md).
+
+**CI runs locally.** The GitHub Actions workflow is manual-trigger only, so CI
+is run on your own machine with `make ci` (or `tools/ci_local.sh`). Both arrive
+with the integration PR.
 
 ## License
 

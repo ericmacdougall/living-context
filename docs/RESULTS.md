@@ -144,8 +144,9 @@ changed after this partial run.
 
 - Design: 312 fresh questions; whole-pool build of 78,154 leaves in 3 levels
   (4,885 / 306 / 20); expected about 21-27k calls; cap 35,574.
-- The tree build stopped at call 1,536 of about 5,211. The confirmatory run is
-  paused pending API credit and build-host disk space.
+- The tree build stopped at call 1,536 of about 5,211 on a provider quota
+  refusal. The S6-H1 build resumed on 2026-11-21; its question run has not
+  started, so there are no S6-H1 numbers.
 
 The plan (`docs/EXPERIMENT.md` on `feat/parallel-calls`) was first committed on
 2026-11-19 and its sections 1 to 13 have not changed since; six dated
