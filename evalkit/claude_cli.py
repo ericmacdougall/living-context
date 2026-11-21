@@ -53,6 +53,11 @@ class StageLimited(Exception):
     """The allowance is exhausted or the CLI keeps failing: the stage stops with its state file. Never retried, never scored."""
 
 
+class AllowanceRefused(StageLimited):
+    """An allowance or usage-limit response (LIMIT). `ResilientPort` with an adaptive concurrency halves and backs off a bounded number
+    of times before it stops the stage; a fixed concurrency stops at once."""
+
+
 class StagePaused(Exception):
     """A throttle response: the stage pauses, the event is recorded, and it is not a scored failure."""
 
@@ -237,6 +242,7 @@ class CappedPort:
         self._fail_streak = 0
         self.spawned = 0
         self.rows: List[dict] = []
+        self.row_extra: Callable[[], dict] = dict        # set by ResilientPort: the effective concurrency at the time of the call
         self._log.parent.mkdir(parents=True, exist_ok=True)
 
     def _check_prompt(self, prompt: str) -> None:
@@ -264,7 +270,7 @@ class CappedPort:
             self.spawned += 1
         ro = self._run(prompt)                # several processes may run at once (the caller bounds how many: `ResilientPort`)
         with self._lock:
-            row = {"n": n, "task": name, "prompt_chars": len(prompt), "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:16],
+            row = {**self.row_extra(), "n": n, "task": name, "prompt_chars": len(prompt), "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:16],
                    "latency_s": round(ro.latency_s, 3), "rc": ro.rc, "stdout_chars": len(ro.stdout), "argv": self._argv,
                    "prompt_version": PROMPT_VERSION}
             env0 = self._envelope(ro.stdout)
@@ -273,7 +279,7 @@ class CappedPort:
             if refused and LIMIT.search("%s\n%s\n%s" % (ro.stderr or "", res_text, ro.stdout if ro.rc != 0 else "")):
                 row.update(limited=True, error="limit")
                 self._append(row)
-                raise StageLimited("allowance limit response at call %d" % n)
+                raise AllowanceRefused("allowance limit response at call %d" % n)
             self._fail_streak = self._fail_streak + 1 if ro.rc != 0 else 0
             if self._fail_streak >= MAX_CLI_FAILURE_STREAK:
                 row.update(error="cli_error")

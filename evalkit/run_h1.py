@@ -149,6 +149,9 @@ def main(argv: Optional[list] = None) -> int:
     ap.add_argument("--concurrency", type=int, default=par.REGISTERED_CONCURRENCY,
                     help="model calls at once (registered %d); questions run concurrently, outputs do not depend on it" % par.REGISTERED_CONCURRENCY)
     ap.add_argument("--concurrency-reason", default="", help="required above the registered value; recorded in starts.jsonl")
+    ap.add_argument("--fixed-concurrency", action="store_true",
+                    help="keep --concurrency fixed (default above 1: start at 2, halve on a throttle or allowance refusal, double after "
+                         "a clean window, never above --concurrency)")
     ap.add_argument("--amendment-ref", default="", help="a recorded deviation amendment that lets a built run with no question done "
                     "resume under a new commit")
     a = ap.parse_args(argv)

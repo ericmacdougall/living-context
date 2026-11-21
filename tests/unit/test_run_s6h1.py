@@ -181,6 +181,7 @@ class MemTenant:
     """In-memory stand-in for EvalTenant: the same calls, the real builder and fan-out, MemDirect for the flat list."""
     def __init__(self, root):
         self.root, self.tree, self.mc, self.ingested = root, None, None, 0
+        self.admin = object()                     # the shared Elasticsearch client (another tenant's index is read through it)
 
     def ingest(self, pool):
         self.mc = corpus.MemCorpus(pool)
@@ -292,6 +293,22 @@ class Body(unittest.TestCase):
         self.assertEqual((run2 / "done.jsonl").read_bytes(), (run / "done.jsonl").read_bytes())
         row = json.loads((run2 / "starts.jsonl").read_text().splitlines()[-1])
         self.assertEqual((row["ingest_writers"], row["embed_workers"]), (3, 2))
+
+    def test_reuse_reads_the_named_tenant_checks_the_vectors_and_is_recorded(self):
+        from evalkit import embed_pool
+        base, s3, man, run = setup_dirs()
+        seen = {}
+
+        def index_reuse(admin, tenant, keep, **_kw):
+            seen.update(admin=admin, tenant=tenant)
+            texts = [t for _h, turns in rs.whole_pool(rel.QS) for t in corpus.session_leaf_texts(turns)]
+            return {embed_pool.text_key(t): RealEmbed().passage(t) for t in [x for x in texts if keep(x)][:3]}
+        with mock.patch.object(embed_pool, "index_reuse", index_reuse), \
+                mock.patch.object(embed_pool, "one_window", lambda _e, _t: True):
+            self.assertEqual(self.go(base, s3, run, man, reuse_from_tenant="s3h1"), 0)
+        self.assertEqual(seen["tenant"], "s3h1")
+        row = json.loads((run / "starts.jsonl").read_text().splitlines()[-1])
+        self.assertEqual((row["reused"], row["reuse_checked"], row["reuse_from"]), (3, 3, "s3h1"))
 
     def test_more_leaves_than_the_proven_size_is_refused_before_any_call(self):
         base, s3, man, run = setup_dirs()

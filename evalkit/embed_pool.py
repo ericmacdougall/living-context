@@ -81,3 +81,51 @@ def exact_reuse(window_count: int) -> bool:
     """A vector read back from the leaf index (float32) equals the one ingest held only for a leaf of one embedding window: E5 returns
     float32 values widened to float64, while a multi-window leaf's vector is a float64 mean of window vectors (eval_tenant.load_leaves)."""
     return window_count == 1
+
+
+def one_window(embedder, text: str) -> bool:
+    """True when the pinned embedder embeds `text` as a passage in one window (480 text tokens or fewer). Uses the embedder's own
+    tokenizer, the same call `E5Embedder._encode_inner` makes."""
+    from living_context.embed import e5
+    ids = embedder._tok(text, add_special_tokens=False, truncation=False)["input_ids"]
+    return len(e5.windows(ids)) == 1
+
+
+def index_reuse(admin, tenant: str, keep: Callable[[str], bool], *, cls: str = "base", page: int = 500) -> Dict[str, List[float]]:
+    """{sha256(text): vector} from another tenant's leaf index, READ ONLY, for the texts `keep` accepts (one-window leaves: the index's
+    float32 values, widened, are exactly what ingest held for them). The vector is cast through float32 as `load_leaves` does."""
+    import numpy as np
+    out: Dict[str, List[float]] = {}
+    after = None
+    while True:
+        body = {"size": page, "sort": [{"src_seq": "asc"}], "query": {"match_all": {}}, "_source": ["text", "embedding"]}
+        if after is not None:
+            body["search_after"] = after
+        st, r = admin.request("POST", "/lc-%s-%s-leaf/_search" % (tenant, cls), body)
+        if st != 200:
+            raise RuntimeError("could not read the %s leaf index (status %s)" % (tenant, st))
+        hits = r["hits"]["hits"]
+        if not hits:
+            return out
+        for h in hits:
+            s = h["_source"]
+            if isinstance(s.get("text"), str) and s.get("embedding") and keep(s["text"]):
+                out[text_key(s["text"])] = np.asarray(s["embedding"], dtype=np.float32).astype(np.float64).tolist()
+        after = hits[-1]["sort"]
+
+
+def verify_reuse(reuse: Mapping[str, Sequence[float]], texts: Sequence[str], embedder, sample: int = 20) -> int:
+    """Re-embed up to `sample` reused texts in-process (first ones in input order) and require byte equality; returns how many were
+    checked. Raises when any differs, so a wrong reuse map never reaches the tenant."""
+    import json
+    checked = 0
+    for t in texts:
+        v = reuse.get(text_key(t))
+        if v is None:
+            continue
+        if json.dumps(list(v)) != json.dumps(embedder.passage(t)):
+            raise RuntimeError("a reused vector differs from the pinned embedder's (text %d checked)" % (checked + 1))
+        checked += 1
+        if checked >= sample:
+            break
+    return checked

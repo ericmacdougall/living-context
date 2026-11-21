@@ -228,6 +228,7 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
 
     consts = Constants()
     ingest_writers, embed_workers = int(getattr(a, "ingest_writers", 1) or 1), int(getattr(a, "embed_workers", 1) or 1)
+    ingest_info: dict = {}
     built = run_dir / "BUILT.json"
     resumed_built = built.exists()
     ingested = (run_dir / "tenant_state.json").exists()
@@ -242,13 +243,25 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
             et.load_leaves(n_leaves)
     else:
         t0 = time.time()
-        if ingest_writers > 1 or embed_workers > 1:
+        reuse_from = (getattr(a, "reuse_from_tenant", "") or "").strip()
+        if ingest_writers > 1 or embed_workers > 1 or reuse_from:
             from . import embed_pool
             factory = embed_factory or (embed_pool.E5Factory(a.embed_dir, a.threads) if embed_workers > 1 else (lambda: embedder))
             report = lambda i, n: (i % 2000 == 0 or i == n) and print("embedded %d/%d leaf texts in %.0fs" % (i, n, time.time() - t0),
                                                                       flush=True)
-            n_leaves = et.ingest_concurrent(pool, writers=ingest_writers, embed_many=lambda texts: embed_pool.passages(
-                texts, factory, workers=embed_workers, progress=report))
+
+            def embed_many(texts):
+                reuse = {}
+                if reuse_from:          # another tenant's one-window vectors, read only, checked against the pinned embedder first
+                    wanted = {embed_pool.text_key(t) for t in texts}
+                    reuse = embed_pool.index_reuse(et.admin, reuse_from, keep=lambda t: embed_pool.text_key(t) in wanted
+                                                   and embed_pool.one_window(embedder, t))
+                    ingest_info.update(reused=len(reuse), reuse_checked=embed_pool.verify_reuse(reuse, texts, embedder),
+                                       reuse_from=reuse_from)
+                    print("reusing %d one-window vectors of tenant %s (%d re-embedded and equal)"
+                          % (len(reuse), reuse_from, ingest_info["reuse_checked"]), flush=True)
+                return embed_pool.passages(texts, factory, workers=embed_workers, reuse=reuse, progress=report)
+            n_leaves = et.ingest_concurrent(pool, writers=ingest_writers, embed_many=embed_many)
         else:
             n_leaves = et.ingest(pool)
         et.save_state(run_dir / "tenant_state.json")
@@ -280,11 +293,12 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
     budget = Budget(run_dir / "counter", a.approved_cap)
     inner = claude_cli.CappedPort(runner, budget, run_dir / "calls.jsonl", model_id=a.model, argv_record=getattr(runner, "argv", lambda: [])())
     journal = Journal(run_dir / "journal.jsonl")
+    adaptive = n_par > 1 and not getattr(a, "fixed_concurrency", False)
     port = ResilientPort(inner, budget, journal, run_dir / "STOP", max_retries=a.max_retries, base_delay_s=a.base_delay,
-                         concurrency=n_par)
+                         concurrency=n_par, adaptive=adaptive, start_concurrency=min(n_par, 2) if adaptive else None)
     with open(run_dir / "starts.jsonl", "a") as f:      # every start or resume, with its concurrency (outputs do not depend on it)
         f.write(json.dumps({"at": time.time(), "commit": a.commit, "concurrency": n_par, "cluster_workers": cluster_workers,
-                            "ingest_writers": ingest_writers, "embed_workers": embed_workers,
+                            "ingest_writers": ingest_writers, "embed_workers": embed_workers, **ingest_info, "adaptive": adaptive,
                             "concurrency_reason": getattr(a, "concurrency_reason", "") or ""}, sort_keys=True) + "\n")
     ledger = s2_stage.Ledger(run_dir / "done.jsonl")
     shuffled_qids = st.shuffled_subset(fs, vals["thresholds"]["shuffled_n"])
@@ -323,7 +337,8 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
         et.close()
         raise
     extra.update(counter=budget.count(), cap=a.approved_cap, questions_done=len(ledger.rows), questions=len(fs.questions),
-                 leaves=n_leaves, replayed=port.replayed, fresh=port.fresh, lost_in_flight=port.lost, throttled=port.throttled)
+                 leaves=n_leaves, replayed=port.replayed, fresh=port.fresh, lost_in_flight=port.lost, throttled=port.throttled,
+                 limited=port.limited, concurrency_now=port.slots.limit, concurrency_changes=port.slots.changes)
     if state == "COMPLETE":
         dec = st.decide(ledger, fs, clusters, shuffled_qids=shuffled_qids, shuffled_min=vals["thresholds"]["shuffled_min_point"])
         pool_label = "whole pool (%d contents, %d leaves)" % (len(pool), n_leaves)
@@ -366,6 +381,11 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--embed-workers", type=int, default=1,
                     help="embedding processes of --threads torch threads each, before the writes (a vector depends on the text, the "
                          "model and --threads only)")
+    ap.add_argument("--fixed-concurrency", action="store_true",
+                    help="keep --concurrency fixed (default above 1: start at 2, halve on a throttle or allowance refusal, double after "
+                         "a clean window, never above --concurrency)")
+    ap.add_argument("--reuse-from-tenant", default="",
+                    help="read this tenant's leaf index (read only) and reuse its vectors of one-window leaves with the same text")
     ap.add_argument("--cluster-workers", type=int, default=1,
                     help="clusterer threads (the groups do not depend on it); the memory proof must have used at least as many")
     return ap

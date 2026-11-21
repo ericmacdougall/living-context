@@ -80,6 +80,95 @@ def in_threads(fns):
     return errs
 
 
+class LimitAt(SafeRunner):
+    """Allowance refusals (the CLI's headless envelope) at the given call numbers; records (in flight, limit) at every call."""
+    def __init__(self, at=(), **kw):
+        super().__init__(**kw)
+        self.at, self.port, self.seen = set(at), None, []
+
+    def __call__(self, prompt):
+        with self.lock:
+            k = self.n + 1
+            if self.port is not None:
+                self.seen.append((self.inflight + 1, self.port.slots.limit))
+        if k in self.at:
+            with self.lock:
+                self.n += 1
+            return cc.RunOut(1, json.dumps({"type": "result", "is_error": True, "result": "You've hit your session limit"}), "", 0.01)
+        return super().__call__(prompt)
+
+
+def adaptive_port(tmp, runner, ceiling=8, **kw):
+    b, inner, port = capped(tmp, runner, concurrency=ceiling, adaptive=True, start_concurrency=2, **kw)
+    runner.port = port
+    return b, inner, port
+
+
+def run_workers(port, workers=12, per=10):
+    return in_threads([lambda w=w: [port.scoped("q%d" % w).call(Task.ROUTE, route_inputs(w * 100 + i)) for i in range(per)]
+                       for w in range(workers)])
+
+
+class Adaptive(unittest.TestCase):
+    def test_it_ramps_from_two_to_the_ceiling_and_never_exceeds_its_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = LimitAt(scale_ms=40)
+            b, inner, port = adaptive_port(tmp, r)
+            self.assertEqual(run_workers(port), [None] * 12)
+            self.assertEqual(port.slots.changes[:2], [(2, 4, "clean window"), (4, 8, "clean window")])
+            self.assertEqual(port.slots.limit, 8)
+            self.assertTrue(all(inflight <= limit for inflight, limit in r.seen), max(r.seen))
+            rows = [json.loads(l) for l in (Path(tmp) / "calls.jsonl").read_text().splitlines()]
+            self.assertEqual({x["concurrency"] for x in rows}, {2, 4, 8})          # every call row records the effective concurrency
+            self.assertGreater(r.max_inflight, 4)
+
+    def test_the_ramp_stops_at_a_ceiling_that_is_not_a_power_of_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = LimitAt(scale_ms=8)
+            b, inner, port = adaptive_port(tmp, r, ceiling=3)
+            self.assertEqual(run_workers(port), [None] * 12)
+            self.assertEqual(port.slots.changes, [(2, 3, "clean window")])
+            self.assertTrue(all(inflight <= 3 for inflight, _limit in r.seen), max(r.seen))
+
+    def test_a_throttle_halves_it_and_a_clean_window_brings_it_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = LimitAt(scale_ms=8, throttle=(40,))
+            b, inner, port = adaptive_port(tmp, r)
+            self.assertEqual(run_workers(port), [None] * 12)
+            i = port.slots.changes.index((8, 4, "throttle"))
+            self.assertIn((4, 8, "clean window"), port.slots.changes[i:])
+            self.assertEqual(b.count(), 120 + 1)                                   # the throttled call charged once, then asked again
+
+    def test_an_allowance_refusal_halves_and_backs_off_a_bounded_number_of_times(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = LimitAt(at=(30,), scale_ms=8)
+            b, inner, port = adaptive_port(tmp, r)
+            self.assertEqual(run_workers(port), [None] * 12)
+            self.assertEqual(port.limited, 1)
+            self.assertTrue(any(c[2] == "allowance refusal" for c in port.slots.changes))
+            self.assertEqual(b.count(), 120 + 1)
+        with tempfile.TemporaryDirectory() as tmp:                                # refusals that persist stop the stage
+            r = LimitAt(at=range(30, 400), scale_ms=8)
+            b, inner, port = adaptive_port(tmp, r)
+            errs = run_workers(port)
+            self.assertTrue(all(isinstance(e, cc.StageLimited) for e in errs if e is not None))
+            self.assertTrue(any(e is not None for e in errs))
+            self.assertLessEqual(port.limited, 1 + 3 + 8)          # the retries of one call, plus calls already in flight
+
+    def test_a_fixed_concurrency_stops_at_the_first_allowance_refusal_and_a_failing_cli_always_stops(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = LimitAt(at=(10,), scale_ms=8)
+            b, inner, port = capped(tmp, r, concurrency=4)
+            errs = run_workers(port, workers=4)
+            self.assertTrue(any(isinstance(e, cc.AllowanceRefused) for e in errs))
+            self.assertEqual(port.limited, 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            r = SafeRunner(crash_from=5)
+            b, inner, port = adaptive_port(tmp, r)
+            errs = run_workers(port, workers=4)
+            self.assertTrue(any(isinstance(e, cc.StageLimited) and not isinstance(e, cc.AllowanceRefused) for e in errs))
+
+
 # ---- ordered commits -----------------------------------------------------------------------------------------------------------------
 class Ordered(unittest.TestCase):
     def test_commits_follow_item_order_whatever_finishes_first(self):

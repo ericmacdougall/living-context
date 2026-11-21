@@ -255,5 +255,50 @@ class UpFrontEmbedding(unittest.TestCase):
         self.assertFalse(embed_pool.exact_reuse(2))
 
 
+class IndexAdmin:
+    """Another tenant's leaf index, paged by search_after on src_seq; records every request (reads only)."""
+    def __init__(self, docs):
+        self.docs, self.calls = docs, []
+
+    def request(self, method, path, body=None):
+        self.calls.append((method, path))
+        assert method == "POST" and path == "/lc-s3h1-base-leaf/_search", path
+        start = body.get("search_after", [0])[0]
+        page = [d for d in self.docs if d["src_seq"] > start][:body["size"]]
+        return 200, {"hits": {"hits": [{"_source": {"text": d["text"], "embedding": d["embedding"]}, "sort": [d["src_seq"]]}
+                                       for d in page]}}
+
+
+class Reuse(unittest.TestCase):
+    def docs(self):
+        import numpy as np
+        out = []
+        for i in range(7):
+            v = [float(np.float32(0.1 * (i + 1) + 1e-9 * k)) for k in range(4)]       # float32-valued, as the index holds them
+            out.append({"src_seq": i + 1, "text": "leaf %d %s" % (i, "long " * (600 if i == 3 else 1)), "embedding": v})
+        return out
+
+    def test_only_one_window_leaves_of_wanted_texts_are_reused_through_float32(self):
+        import numpy as np
+        docs = self.docs()
+        docs[0]["embedding"] = [0.1, 0.2, 0.3, 0.4]                                     # not float32-valued: must come back cast
+        admin = IndexAdmin(docs)
+        one = lambda t: len(t.split()) <= 480
+        got = embed_pool.index_reuse(admin, "s3h1", keep=one, page=3)
+        self.assertEqual(len(got), 6)                                                  # the 600-word leaf is left out
+        self.assertNotIn(embed_pool.text_key(docs[3]["text"]), got)
+        self.assertEqual(got[embed_pool.text_key(docs[0]["text"])], np.asarray([0.1, 0.2, 0.3, 0.4], np.float32).astype(float).tolist())
+        self.assertTrue(all(m == "POST" for m, _ in admin.calls))
+        self.assertEqual(len(admin.calls), 4)                                         # three pages of 3 and the empty end
+
+    def test_a_reused_vector_that_differs_from_the_embedder_is_refused(self):
+        texts = ["alpha", "beta", "gamma"]
+        reuse = {embed_pool.text_key(t): Embed().passage(t) for t in texts}
+        self.assertEqual(embed_pool.verify_reuse(reuse, texts, Embed()), 3)
+        reuse[embed_pool.text_key("beta")] = [0.0] * len(reuse[embed_pool.text_key("beta")])
+        with self.assertRaises(RuntimeError):
+            embed_pool.verify_reuse(reuse, texts, Embed())
+
+
 if __name__ == "__main__":
     unittest.main()

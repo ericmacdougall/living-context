@@ -108,12 +108,13 @@ def run(a, pick_questions, *, embedder=None, runner=None, loader=None, tenant_fa
     inner = claude_cli.CappedPort(runner, budget, run_dir / "calls.jsonl", model_id=a.model, argv_record=getattr(runner, "argv", lambda: [])())
     journal = Journal(run_dir / "journal.jsonl")
     n_par = int(getattr(a, "concurrency", 1) or 1)
+    adaptive = n_par > 1 and not getattr(a, "fixed_concurrency", False)
     port = ResilientPort(inner, budget, journal, run_dir / "STOP", max_retries=a.max_retries, base_delay_s=a.base_delay,
-                         concurrency=n_par)
+                         concurrency=n_par, adaptive=adaptive, start_concurrency=min(n_par, 2) if adaptive else None)
     with open(run_dir / "starts.jsonl", "a") as f:      # every start or resume, with its concurrency (outputs do not depend on it)
         f.write(json.dumps({"at": time.time(), "commit": a.commit, "concurrency": n_par,
                             "concurrency_reason": getattr(a, "concurrency_reason", "") or "",
-                            "amendment_ref": getattr(a, "amendment_ref", "") or ""}, sort_keys=True) + "\n")
+                            "amendment_ref": getattr(a, "amendment_ref", "") or "", "adaptive": adaptive}, sort_keys=True) + "\n")
     ledger = s2_stage.Ledger(run_dir / "done.jsonl")
     state, extra = "COMPLETE", {}
     try:
@@ -166,7 +167,8 @@ def run(a, pick_questions, *, embedder=None, runner=None, loader=None, tenant_fa
         et.close()
         raise
     extra.update(counter=budget.count(), cap=a.approved_cap, questions_done=len(ledger.rows), questions=len(dev), replayed=port.replayed,
-                 fresh=port.fresh, lost_in_flight=port.lost, throttled=port.throttled)
+                 fresh=port.fresh, lost_in_flight=port.lost, throttled=port.throttled,
+                 limited=port.limited, concurrency_now=port.slots.limit, concurrency_changes=port.slots.changes)
     if state == "COMPLETE":
         qids = [q.qid for q in dev if q.gold_session_ids and not q.is_abstention]
         out = run_dir / "results"

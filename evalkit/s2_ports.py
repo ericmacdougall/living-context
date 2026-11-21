@@ -42,7 +42,7 @@ from living_context.model.budget import Budget, BudgetExceeded
 from living_context.model.port import CallContext, CallResult, Task
 
 from . import claude_cli
-from .claude_cli import StageLimited, StagePaused
+from .claude_cli import AllowanceRefused, StageLimited, StagePaused
 
 __all__ = ["Journal", "ResilientPort", "ScopedPort", "ScopeRequired", "StageStopped", "StagePaused", "StageLimited", "BudgetExceeded"]
 
@@ -101,12 +101,56 @@ class ScopedPort:
         return self._port.stop_requested()
 
 
+class AdaptiveSlots:
+    """In-flight slots whose limit moves between 1 and `ceiling`: it starts at `start` (a ramp), halves on a throttle or an allowance
+    refusal, and doubles (up to the ceiling) after a clean window of max(8, 2 x limit) answered calls since the last change. A fixed
+    limit (`adaptive=False`) never moves."""
+    def __init__(self, ceiling: int, *, adaptive: bool = False, start: Optional[int] = None):
+        self.ceiling, self.adaptive = int(ceiling), bool(adaptive)
+        self.limit = max(1, min(self.ceiling, int(start))) if (adaptive and start) else self.ceiling
+        self._inflight, self._clean = 0, 0
+        self._cv = threading.Condition()
+        self.changes: List[tuple] = []          # (old, new, reason)
+
+    def acquire(self) -> None:
+        with self._cv:
+            while self._inflight >= self.limit:
+                self._cv.wait(0.5)
+            self._inflight += 1
+
+    def release(self) -> None:
+        with self._cv:
+            self._inflight -= 1
+            self._cv.notify_all()
+
+    def _set(self, new: int, why: str) -> None:
+        if new != self.limit:
+            self.changes.append((self.limit, new, why))
+            self.limit = new
+        self._clean = 0
+        self._cv.notify_all()
+
+    def clean(self) -> None:
+        with self._cv:
+            if not self.adaptive:
+                return
+            self._clean += 1
+            if self.limit < self.ceiling and self._clean >= max(8, 2 * self.limit):
+                self._set(min(self.ceiling, 2 * self.limit), "clean window")
+
+    def halve(self, why: str) -> None:
+        with self._cv:
+            if self.adaptive:
+                self._set(max(1, self.limit // 2), why)
+
+
 class ResilientPort:
     def __init__(self, inner, budget: Budget, journal: Journal, stop_file: Path, *, max_retries: int = 3, base_delay_s: float = 30.0,
                  max_delay_s: float = 600.0, sleep: Callable[[float], None] = time.sleep,
                  render: Callable[[str, Mapping[str, Any]], str] = claude_cli.render,
                  retry_failed: tuple = ("build_l1", "build_upper"), failure_retries: int = 2,
-                 clock: Callable[[], float] = time.time, concurrency: int = 1):
+                 clock: Callable[[], float] = time.time, concurrency: int = 1, adaptive: bool = False,
+                 start_concurrency: Optional[int] = None):
         if int(concurrency) < 1:
             raise ValueError("concurrency must be at least 1")
         self._inner, self._budget, self.journal, self._stop = inner, budget, journal, Path(stop_file)
@@ -119,7 +163,9 @@ class ResilientPort:
         # every call must come through `scoped(ref)` instead, because one shared attribute is one shared occurrence key
         self.scope: Optional[str] = None
         self._lock = threading.Lock()                           # occurrence counts, lost keys and the statistics below
-        self._slots = threading.BoundedSemaphore(self.concurrency)
+        self.slots = AdaptiveSlots(self.concurrency, adaptive=adaptive, start=start_concurrency)
+        if hasattr(inner, "row_extra"):                         # every call row records the effective concurrency
+            inner.row_extra = lambda: {"concurrency": self.slots.limit}
         self._gate = threading.Condition()                      # the shared back-off and halt gate
         self._backing_off = 0
         self._halt: Optional[BaseException] = None
@@ -221,12 +267,23 @@ class ResilientPort:
         attempt = 0
         while True:
             self._wait_gate()
-            with self._slots:
+            self.slots.acquire()
+            try:
                 self._wait_gate()                 # a halt or back-off may have started while this worker waited for a slot
                 self.journal.append({"t": "pending", "key": key, "task": name, "count_before": self._budget.count(),
-                                     "ts": self._clock()})
+                                     "concurrency": self.slots.limit, "ts": self._clock()})
                 try:
                     res = self._inner.call(task, inputs, ctx=ctx)
+                except AllowanceRefused as e:
+                    with self._lock:
+                        self.limited += 1
+                    self.journal.append({"t": "limited", "key": key, "task": name, "attempt": attempt, "ts": self._clock()})
+                    attempt += 1
+                    if not self.slots.adaptive or attempt > self._retries:
+                        self.halt(e)              # a fixed concurrency stops at once; an adaptive one after its bounded retries
+                        raise
+                    self.slots.halve("allowance refusal")
+                    paused = True
                 except StageLimited as e:
                     # an allowance refusal or a failing CLI: the refused call is not answered, so a resume asks it again (it is charged
                     # again, honestly); nothing is retried here, and no other worker charges after it
@@ -243,6 +300,7 @@ class ResilientPort:
                     if attempt > self._retries:
                         self.halt(e)
                         raise
+                    self.slots.halve("throttle")
                     paused = True
                 except BudgetExceeded as e:
                     # nothing was charged beyond the cap and nothing is retried; no other worker charges after it
@@ -250,6 +308,8 @@ class ResilientPort:
                     raise
                 else:
                     paused = False
+            finally:
+                self.slots.release()
             if paused:
                 # the throttled call was charged once by the inner port; the retry below is one new charged call. Every other
                 # worker waits at the gate meanwhile, so a throttle never multiplies into charged retries across workers
@@ -267,6 +327,7 @@ class ResilientPort:
                 continue
             with self._lock:
                 self.fresh += 1
+            self.slots.clean()
             self.journal.append({"t": "result", "key": key, "task": name, "ok": res.ok, "output": res.output, "error": res.error,
                                  "ts": self._clock()})
             return res

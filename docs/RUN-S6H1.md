@@ -71,7 +71,21 @@ python -m evalkit.run_s6h1 --dataset <dataset> --es-url <es-url> --es-ca <es-ca>
   byte), then T threads write the leaves through the real writer with the tenant's `src_seq` range reserved in one compare-and-set,
   so the leaves, their order and their `src_seq` are those of the one-at-a-time ingest. Each embedding process needs about 1 GB
   (MEASURED 761 to 800 MB); the memory gate counts them. Writes cost about 61 ms per leaf one at a time (MEASURED: pilot ingest
-  4,813.7 s, of which 3,606.8 s embedding, 19,605 leaves); concurrent write throughput on Elasticsearch is NOT measured yet.
+  4,813.7 s, of which 3,606.8 s embedding, 19,605 leaves). MEASURED on the H1 Elasticsearch (tenant `s6probe`, 360 synthetic
+  leaves, stub vectors): one at a time 21.2 leaves/s, 4 writers 75.5, 8 writers 89.4, 16 writers 87.8, each the same sequence as one
+  at a time. Embedding (run host, 480 synthetic texts): in-process at 6 threads 71 to 78 s; 6 processes of 6 threads 59 s; 24
+  processes of 1 thread 22 s, byte-equal to the in-process vectors at 6 threads (and 1 thread equals 6 threads on all 480).
+- `--reuse-from-tenant T` (default none): before embedding, read tenant T's leaf index (search only, nothing written) and reuse its
+  vector for a leaf whose text is the same and which the pinned tokenizer embeds in ONE window (480 text tokens or fewer); the index
+  holds float32 values and one window's vector is float32 widened, so the reused vector is exactly what embedding gives. A multi-window
+  leaf (a float64 mean) is always embedded. Up to 20 reused texts are re-embedded at the start and must be byte-equal, or the run
+  stops before any write. `starts.jsonl` records `reused`, `reuse_checked` and `reuse_from`. MEASURED: S3's index holds 18,120
+  leaves, 4,850 of them one window; 50 checked equal.
+- Adaptive concurrency (default above `--concurrency 1`; `--fixed-concurrency` turns it off): model calls start 2 at once, halve on a
+  throttle or an allowance refusal, and double after a clean window of max(8, 2 x the limit) answered calls, never above
+  `--concurrency`. An allowance refusal is backed off and asked again up to `--max-retries` times before the stage stops
+  (LIMIT_REACHED); at a fixed concurrency it stops at once. Every call row and journal `pending` row records the concurrency at the
+  time; STATE records `limited`, `concurrency_now` and `concurrency_changes`. Outputs do not depend on the concurrency.
 
 ## Watch, stop, resume
 
