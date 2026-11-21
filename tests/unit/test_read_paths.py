@@ -1,139 +1,144 @@
-"""Class guard (a), review C1/C7: every Elasticsearch request of the decision modules is a validated read or a commented exception.
+"""Class guard, pools reviews C1/C7 (rounds 3 to 6): no Elasticsearch answer is accepted on its HTTP status.
 
-The universe is enumerated, not listed: an AST walk over every module of the package finds every `<client>.request(...)` call.
+The universe is enumerated, not listed: an AST walk over EVERY module of the package finds every `<client>.request(...)` call (and every
+`.request` attribute that is not called, so the method cannot be passed around and called under another name). Each call site is one of
 
-* A module with a request call is either GUARDED (the authz, erasure, verifier, start-up, pool, gateway and ingest modules: they take
-  authorization, revocation, erasure, residue and repair decisions from what Elasticsearch answers) or on EXCLUDED with its reason. A
-  new module with a request call fails the test until it is classified.
-* In a GUARDED module each call site is VALIDATED: its answer goes straight into a validator (`reads.complete_hits`,
-  `reads.complete_count`, or in the verifier, which shares no read path with the gateway by DESIGN 14.7, its own `_complete` and
-  `_refreshed`), or is assigned to `(status, body)` names that the same function passes to one. Or it is on ALLOWED, keyed by
-  (module, function, HTTP method), with the number of such calls and the reason. A `checked` reason is itself verified: the status the
-  call returns must be compared in the function. The match is exact: an unlisted call site fails, and so does a stale entry.
+* ROUTED: the call is itself the starred argument of a validator, `v(*client.request(...), ...)`, where `v` is one of
+  `gateway.reads.VALIDATORS` imported from gateway/reads.py into that module (or, in verifier/check.py, which shares no read path with
+  the gateway by DESIGN 14.7, one of its own VERIFIER_VALIDATORS defined there). The raw answer is never bound to a name, so no path
+  of the caller can read it unchecked. A local function with a validator's name does not count.
+* ALLOWED: on the per-site allow-list below, keyed by (module, function, HTTP method), with the exact number of such calls and the
+  reason a status-only answer there cannot change an authorization, erasure, verifier, taint, journal-retention or durability decision.
 
-No decision module may page with a `_doc` sort (review F12: it is unique only inside one shard); multi-page reads go through
-`reads.scan` (a PIT and `_shard_doc`).
+Nothing else passes. There is no "the status is compared" pass (round 5 permitted the F18 and F19 sites on exactly that ground), no
+module-level exclusion (a new call site in any module needs a decision), and a method that is not a string literal fails. An allow-list
+entry that no longer matches a call site fails too, so the list cannot rot.
 
-Document answers (review round 5, the F11 class: a malformed answer never certifies an erasure, a removal or an absence): no decision
-module sends a DELETE itself outside reads.py; a document delete goes through `reads.delete_doc`, which owns the request and accepts
-only HTTP 200 `deleted` or a verified absence about exactly the index and id sent. The only other DELETE is on RAW_DELETES with its
-reason. In the erasure modules a document read and a compare-and-set rewrite go through `reads.read_doc` and `reads.put_doc` too.
+Every validator and every request-owning helper of reads.py must also refuse the malformed-answer matrix of
+tests/unit/test_reads_contract.py, so a new status-only helper inside reads.py cannot pass either.
 
-The planted-bypass tests run the same checker over a copy of a guarded module with one extra unvalidated search, a validator call
-removed, a status discarded, a `_doc` cursor, or a new unclassified module, and require each to be reported.
+No decision module may page with a `_doc` sort (review F12: it is unique only inside one shard); multi-page reads go through `reads.scan`.
+
+`inventory()` is the enumeration the handoff reports (python3 -m tests.unit.test_read_paths --inventory).
 """
 import ast
+import sys
 import unittest
 from pathlib import Path
 
 PKG = Path(__file__).resolve().parents[2] / "living_context"
+READS = "gateway/reads.py"
+VERIFIER = "verifier/check.py"
+VERIFIER_VALIDATORS = ("_complete", "_refreshed", "_listed")
+CURSOR_DIRS = ("erasure", "verifier", "gateway")
+CURSOR_FILES = ("ingest/writer.py",)
 
-GUARDED_DIRS = ("erasure", "verifier", "gateway")
-GUARDED_FILES = ("ingest/writer.py",)
+_AFTER_BOUNDARY = ("after the erasure's boundary (the tombstone journal append, fsynced, is what a restart and a restore replay): this "
+                   "document is a write-only mirror that no code reads (no reader of `tb:` or kind `tomb` in the package), so its answer "
+                   "decides nothing, and raising here would leave an erasure that is journalled but not applied in memory")
+_DERIVED = ("derived structure (DESIGN 5-7: summary trees, members, edges, generations): every document carries lineage, so the "
+            "erasure closure finds it by `lin_*` scan whatever this answer said; no authorization, erasure, taint, journal-retention "
+            "or durability decision is taken from it")
+_RANKED = ("a recall read: a partial, failed or malformed answer gives fewer or other ranked candidates of the same class index, which "
+           "the caller's key already may read; no authorization, erasure, taint or durability decision is taken from it")
 
-# Modules with request calls that take no authorization, revocation, erasure, residue or repair decision from a read. The pools review
-# (C1/C7) scoped the class to the decision modules above; these are recall and structure-building paths, where a partial answer
-# changes a ranked result or a derived structure, not who may see what or what was erased.
-EXCLUDED = {
-    "feedback/log.py": "protocol-log rows: create-only writes and a flag update; no read decides anything",
-    "feedback/reflection.py": "note writer: a create-only write",
-    "graph/edges.py": "edge versioning and link jobs (derived structure; its CAS writes carry if_seq_no)",
-    "graph/expand.py": "recall-time graph expansion: a ranked answer",
-    "model/cache.py": "model-call cache: a miss on a failed read recomputes",
-    "recall/direct.py": "class recall search: a ranked answer",
-    "recall/lookup.py": "class lookup reads: a ranked answer",
-    "recall/view.py": "recall view reads: a ranked answer",
-    "structure/placement.py": "structure placement reads (derived structure)",
-    "structure/publish.py": "structure publication (derived structure)",
-    "structure/rebuild.py": "structure rebuild (derived structure; generations are gated)",
-    "structure/retention.py": "structure retention (derived structure)",
-    "structure/watermark.py": "write-path watermark (its CAS writes carry if_seq_no)",
-}
-
-VALIDATORS = {"complete_hits", "complete_count"}
-
-# The only DELETE requests a decision module may send itself (outside reads.py), with the reason: none of them is a document delete.
-RAW_DELETES = {
-    ("gateway/keyowner.py", "invalidate"): "API-key invalidation (`/_security/api_key`): the invalidated ids are read from the answer",
-}
-# A request whose method is a parameter: (module, function) -> (forwarder name, position of the method among its call arguments, reason).
-# Every call of the forwarder in the module must pass a literal method other than DELETE.
-DYNAMIC_METHODS = {
-    ("gateway/class_reader.py", "ClassReader._send"): ("_send", 2, "the class reader's one request: its callers pass GET or POST"),
-}
-ERASURE_DIR = "erasure"
-VERIFIER_VALIDATORS = {"_complete", "_refreshed"}   # the verifier's own (DESIGN 14.7), accepted only in verifier/check.py
-
-# (module, function, method) -> (number of call sites, kind, reason). kind "checked": the status is compared in the function (verified);
-# "write": a document write or delete; "best-effort": the result is intentionally not used.
+# (module, function, method) -> (number of call sites, reason). Reviewed per site in round 6; see the handoff enumeration.
 ALLOWED = {
-    # --- reads.py: the helpers themselves ----------------------------------------------------------------------------------------
-    ("gateway/reads.py", "refresh", "POST"): (1, "checked", "the checked refresh: status and _shards.failed are verified"),
-    ("gateway/reads.py", "aliases", "GET"): (1, "checked", "the checked exact-name alias lookup: a well-formed 200 about the name, or a 404 naming it, else it raises"),
-    ("gateway/reads.py", "scan", "POST"): (1, "checked", "opening the PIT: status, id and _shards are verified (the page search is validated)"),
-    ("gateway/reads.py", "scan", "DELETE"): (1, "best-effort", "closing the PIT: an unclosed PIT expires after keep_alive"),
-    ("gateway/reads.py", "delete_doc", "DELETE"): (1, "checked",
-        "THE document delete: HTTP 200 `deleted` or a verified absence (404 `not_found` or `absent`) about exactly the index and id sent"),
-    ("gateway/reads.py", "read_doc", "GET"): (1, "checked",
-        "THE document read: 200 `found` about exactly the index and id sent, None only for a verified absence, else it raises"),
-    ("gateway/reads.py", "put_doc", "PUT"): (1, "checked",
-        "THE checked document write: 200/201 `created`/`updated` about exactly the index and id sent, 409 is False, else it raises"),
-    # --- erasure ------------------------------------------------------------------------------------------------------------------
-    ("erasure/executor.py", "Executor.erase_subject", "POST"): (2, "best-effort",
-        "refreshes: the first is redundant (every closure read is scan.find, which runs the checked reads.refresh); the second makes "
-        "the tb: mirror visible, and the journal append before it is the durable boundary"),
-    ("erasure/executor.py", "Executor.erase_subject", "PUT"): (1, "best-effort",
-        "the tb: document mirrors the tombstone journal record appended just before it, which is the durable boundary"),
-    ("erasure/executor.py", "Executor.replay", "POST"): (2, "best-effort", "as erase_subject: redundant refresh, then the tb: mirror"),
-    ("erasure/executor.py", "Executor.replay", "PUT"): (1, "best-effort", "as erase_subject: the tb: mirror of the journal record"),
-    ("erasure/executor.py", "Executor.relabel_erase", "POST"): (1, "best-effort", "redundant: class_closure reads through scan.find"),
-    ("erasure/executor.py", "Executor.replay_relabel", "POST"): (1, "best-effort", "redundant: class_closure reads through scan.find"),
-    ("erasure/executor.py", "Executor._record_and_publish", "PUT"): (1, "best-effort", "the tb: mirror of the journal record"),
-    ("erasure/executor.py", "Executor._record_and_publish", "POST"): (1, "best-effort", "makes the tb: mirror visible"),
-    ("erasure/executor.py", "Executor._physical.one", "POST"): (1, "best-effort",
-        "refresh before a purge; the purge reports what is left (checked stats read) and the verifier decides residue"),
-    ("erasure/executor.py", "Executor._physical", "POST"): (1, "best-effort", "redundant: the residue read after it is scan.find"),
-    ("erasure/purge.py", "deleted_count", "GET"): (1, "checked", "a failed stats read raises PurgeError"),
-    ("erasure/purge.py", "ensure_expunge_threshold", "PUT"): (1, "checked", "if refused, the setting is read back and must be 0"),
-    ("erasure/purge.py", "ensure_expunge_threshold", "GET"): (1, "checked", "the read-back; anything but 0 raises PurgeError"),
-    ("erasure/purge.py", "purge_index", "POST"): (3, "checked",
-        "refresh and flush are best effort before the merge; the forcemerge status is checked and the deleted count is read back"),
-    ("erasure/scan.py", "find_text", "POST"): (2, "best-effort",
-        "NOT the closure: the string-search demonstration of E2, used only by the executor's broken variant"),
-    # --- verifier -------------------------------------------------------------------------------------------------------------------
-    ("verifier/check.py", "pool_residue", "GET"): (1, "checked",
-        "the index listing (_resolve): anything but 200 with an `indices` list raises VerifierError"),
+    # --- reads.py --------------------------------------------------------------------------------------------------------------------
+    ("gateway/reads.py", "scan", "DELETE"): (1, "closing the PIT after the scan has ended (best effort): an unclosed PIT expires after "
+                                               "keep_alive; the scan's result was already validated page by page"),
+    # --- erasure: after the boundary, best effort by design ------------------------------------------------------------------------
+    ("erasure/executor.py", "Executor.erase_subject", "PUT"): (1, "the tb: mirror " + _AFTER_BOUNDARY),
+    ("erasure/executor.py", "Executor.erase_subject", "POST"): (1, "refresh of the tb: mirror " + _AFTER_BOUNDARY),
+    ("erasure/executor.py", "Executor.replay", "PUT"): (1, "the tb: mirror of a restore " + _AFTER_BOUNDARY),
+    ("erasure/executor.py", "Executor.replay", "POST"): (1, "refresh of the tb: mirror of a restore " + _AFTER_BOUNDARY),
+    ("erasure/executor.py", "Executor._record_and_publish", "PUT"): (1, "the tb: mirror of a relabel " + _AFTER_BOUNDARY),
+    ("erasure/executor.py", "Executor._record_and_publish", "POST"): (1, "refresh of the tb: mirror of a relabel " + _AFTER_BOUNDARY),
+    ("erasure/purge.py", "purge_index", "POST"): (2,
+        "the refresh and flush before the expunge passes (best effort): the purge's `ok` is decided only by the validated deleted-docs "
+        "readback after each validated force merge, so a refresh or flush that did nothing can only leave `ok` false"),
     # --- gateway --------------------------------------------------------------------------------------------------------------------
-    ("gateway/boot.py", "grant_persister.persist", "PUT"): (1, "checked", "a failed grant write raises"),
-    ("gateway/handler.py", "Gateway._lookup", "POST"): (1, "checked",
-        "class lookup by id (_mget): ids of the caller's read set; a failed read answers unavailable, a missing doc is not offered"),
-    ("gateway/keyowner.py", "provision_owner", "PUT"): (2, "checked", "administrator provisioning of the key owner: a failure raises"),
-    ("gateway/keyowner.py", "_owned_key_ids", "GET"): (1, "checked", "a failed key listing raises RotationError"),
-    ("gateway/keyowner.py", "invalidate", "DELETE"): (1, "checked", "a failed invalidation raises RotationError"),
-    ("gateway/keyowner.py", "rotate", "GET"): (1, "checked", "the key owner's identity read; a failure raises RotationError"),
-    ("gateway/keyowner.py", "rotate", "POST"): (1, "checked", "a failed key creation raises RotationError"),
-    ("gateway/pool_admin.py", "PoolService._authz_put", "PUT"): (1, "checked", "a failed authz write is reported to the caller"),
-    ("gateway/pool_admin.py", "PoolService.create", "PUT"): (1, "write",
-        "the pool manifest; a failure is caught by create's handler, which drops the pool and answers unavailable"),
-    ("gateway/pool_boot.py", "token_persister.persist", "PUT"): (1, "checked", "a failed token write raises"),
-    ("gateway/pool_tools.py", "PoolTools._leaf", "GET"): (1, "checked", "anything but 200 is no leaf: every caller then fails closed"),
-    ("gateway/pool_tools.py", "PoolTools._pool_candidates", "POST"): (1, "checked",
-        "recall candidates (_msearch): a ranked answer; a failed or partial response gives fewer candidates, never wider access"),
-    ("gateway/provision.py", "provision_tenant", "GET"): (2, "checked", "administrator provisioning: a failure raises"),
-    ("gateway/provision.py", "provision_tenant", "PUT"): (2, "checked", "administrator provisioning: a failure raises"),
-    ("gateway/provision.py", "provision_tenant", "POST"): (1, "checked", "administrator provisioning: a failure raises"),
-    ("gateway/session_state.py", "es_persist.persist", "GET"): (1, "checked", "the taint CAS read; 404 is a fresh record, anything else raises"),
-    ("gateway/session_state.py", "es_persist.persist", "PUT"): (1, "checked", "the taint CAS write; a conflict or failure raises"),
+    ("gateway/keyowner.py", "provision_owner", "PUT"): (2,
+        "operator provisioning of the key owner's role and user with the bootstrap credential: nothing is granted, certified or "
+        "invalidated on this answer; a role or user that was not created makes the owner's first call (the validated key listing of "
+        "rotate or invalidate_all) fail, which raises RotationError"),
+    ("gateway/keyowner.py", "rotate", "GET"): (1,
+        "BROKEN variant only (broken_needs_superuser): its answer is used for nothing but raising RotationError"),
+    ("gateway/pool_tools.py", "PoolTools._pool_candidates", "POST"): (1,
+        "recall candidates (_msearch) on the pool's own leaf index: every candidate is re-checked (its `pool` field, its head through the "
+        "validated class-reader multi-get: live and current version) and the send hand-off re-checks the live grant, so a partial, "
+        "failed or malformed answer only yields fewer candidates, never a wider, a staler or a retracted one"),
+    ("gateway/provision.py", "provision_tenant", "GET"): (1,
+        "the shard-budget estimate (_cat/shards), a capacity check and not an authorization one: a failed listing counts as the full "
+        "budget (refused); a short one can only let an administrator provision over the budget, which the cluster bounds itself"),
     # --- ingest ---------------------------------------------------------------------------------------------------------------------
-    ("ingest/writer.py", "Writer._put", "PUT"): (1, "checked", "the one document write: a failure raises WriterError"),
-    ("ingest/writer.py", "Writer._get", "GET"): (1, "checked", "404 is None; anything else but 200 raises"),
-    ("ingest/writer.py", "Writer._remember", "POST"): (1, "best-effort", "refresh after a projection write (visibility only)"),
-    ("ingest/writer.py", "Writer.quarantine_list", "POST"): (1, "best-effort", "refresh before the validated quarantine listing"),
-    ("ingest/writer.py", "Writer._hold_tainted", "POST"): (1, "best-effort", "refresh after a hold write (visibility only)"),
-    ("ingest/writer.py", "Writer._release_held", "POST"): (1, "best-effort", "refresh after a release write (visibility only)"),
-    ("ingest/writer.py", "Writer.repair", "POST"): (2, "checked",
-        "the source lookup (_mget): status, shape and every per-document answer are verified, only found:false deletes; and the "
-        "trailing refresh (visibility only; the scans before it use the checked reads.refresh)"),
+    ("ingest/writer.py", "Writer._remember", "POST"): (1,
+        "visibility refresh after a projection whose write was validated (reads.doc_written): durability does not depend on it; a "
+        "following read of the leaf goes by id, and the repair scans run the checked reads.refresh"),
+    ("ingest/writer.py", "Writer._hold_tainted", "POST"): (1, "visibility refresh after a hold write validated by reads.doc_written"),
+    ("ingest/writer.py", "Writer._release_held", "POST"): (1, "visibility refresh after a release write validated by reads.doc_written"),
+    ("ingest/writer.py", "Writer.repair", "POST"): (1,
+        "the trailing visibility refresh after every repair step was validated (the scans before it run the checked reads.refresh)"),
+    # --- feedback (protocol log, notes): create-only rows and a flag update ---------------------------------------------------------
+    ("feedback/log.py", "ProtocolLog._put", "PUT"): (1,
+        "a protocol-log row (create-only): a row that did not land is counted in write_failures and is simply absent; it carries "
+        "lineage, so the erasure closure finds it if it exists; no decision reads the write's answer"),
+    ("feedback/log.py", "ProtocolLog._flip", "POST"): (1,
+        "a usage flag (`opened`, `asked`) on a protocol-log row: feedback statistics only; no authorization, erasure or durability "
+        "decision"),
+    ("feedback/reflection.py", "NoteWriter.write", "PUT"): (1, "a reflection note (create-only, counted on failure); it carries lineage, "
+                                                               "so the erasure closure finds it if it exists"),
+    # --- model cache ----------------------------------------------------------------------------------------------------------------
+    ("model/cache.py", "EsCacheStore.get", "GET"): (1,
+        "the model-call cache of one class index (stub backend only): a miss recomputes; the entry is the output of the same call, read "
+        "with the class's own key; no authorization, erasure, taint or durability decision"),
+    ("model/cache.py", "EsCacheStore.put", "PUT"): (1,
+        "a cache entry with the call's lineage: one that did not land is a later miss; the erasure closure finds the ones that did"),
+    # --- recall -----------------------------------------------------------------------------------------------------------------------
+    ("recall/direct.py", "DirectSearch.search", "POST"): (1, "class recall (_msearch): " + _RANKED),
+    ("recall/lookup.py", "EsLeafStore._search", "POST"): (1, "class leaf lookup: " + _RANKED),
+    ("recall/lookup.py", "EsLeafStore._node_answer", "POST"): (1, "tree node answer: " + _RANKED),
+    ("recall/view.py", "EsView._get", "GET"): (1, "a pinned generation's manifest or node by id: " + _RANKED),
+    ("recall/view.py", "EsView._feeders", "POST"): (1, "the feeders of a pinned view: " + _RANKED),
+    ("recall/view.py", "EsView.pending", "POST"): (1, "the pending members of a view: " + _RANKED),
+    # --- graph and structure ---------------------------------------------------------------------------------------------------------
+    ("graph/edges.py", "EdgeStore._next_version", "GET"): (1, "edge version counter: " + _DERIVED),
+    ("graph/edges.py", "EdgeStore._next_version", "PUT"): (2, "edge version counter compare-and-set: " + _DERIVED),
+    ("graph/edges.py", "EdgeStore.live_exists", "GET"): (2, "edge liveness: " + _DERIVED),
+    ("graph/edges.py", "EdgeStore.degree", "POST"): (1, "edge degree count: " + _DERIVED),
+    ("graph/edges.py", "EdgeStore._supersedes_reaches", "POST"): (1, "supersession reachability: " + _DERIVED),
+    ("graph/edges.py", "EdgeStore.link", "PUT"): (1, "an edge (create-only): " + _DERIVED),
+    ("graph/edges.py", "EdgeStore.retire", "POST"): (1, "an edge retirement: " + _DERIVED),
+    ("graph/edges.py", "LinkJob._search", "POST"): (1, "link-job candidates: " + _DERIVED),
+    ("graph/edges.py", "LinkJob.run", "GET"): (1, "link-job source read: " + _DERIVED),
+    ("graph/expand.py", "Expander._edges", "POST"): (1, "recall-time graph expansion: " + _RANKED),
+    ("graph/expand.py", "Expander._degrees", "POST"): (1, "recall-time graph expansion: " + _RANKED),
+    ("graph/expand.py", "Expander._leaves", "POST"): (1, "recall-time graph expansion: " + _RANKED),
+    ("graph/expand.py", "Expander._add_partners", "POST"): (1, "recall-time graph expansion: " + _RANKED),
+    ("structure/watermark.py", "WritePath.advance", "POST"): (1,
+        "the refresh of the `wp` document after its compare-and-set was validated (reads.doc_written): P is read back by GET by id, which "
+        "is real time, so whether `wp` is searchable decides nothing; the barrier refreshes before the advance are the checked "
+        "reads.refresh"),
+    ("structure/placement.py", "Placer._get", "GET"): (1, "placement read: " + _DERIVED),
+    ("structure/publish.py", "Publisher._put", "PUT"): (1, "tree publication: " + _DERIVED),
+    ("structure/publish.py", "Publisher._get", "GET"): (1, "tree publication read: " + _DERIVED),
+    ("structure/publish.py", "Publisher.publish", "POST"): (1, "tree publication refresh: " + _DERIVED),
+    ("structure/publish.py", "Publisher.publish", "DELETE"): (1, "tree publication cleanup: " + _DERIVED),
+    ("structure/rebuild.py", "Rebuilder._release", "DELETE"): (1, "rebuild lease release: " + _DERIVED),
+    ("structure/rebuild.py", "Rebuilder.leaf_recs", "POST"): (1, "rebuild input read: " + _DERIVED),
+    ("structure/rebuild.py", "Rebuilder.bootstrap", "POST"): (1, "rebuild refresh: " + _DERIVED),
+    ("structure/rebuild.py", "Rebuilder._pending", "POST"): (1, "rebuild pending read: " + _DERIVED),
+    ("structure/rebuild.py", "Rebuilder._forwards", "POST"): (1, "rebuild forwards read: " + _DERIVED),
+    ("structure/rebuild.py", "Rebuilder._attempt", "POST"): (1, "rebuild refresh: " + _DERIVED),
+    ("structure/rebuild.py", "Rebuilder._write", "POST"): (1, "rebuild member update: " + _DERIVED),
+    ("structure/rebuild.py", "Rebuilder._flip", "POST"): (1, "rebuild refresh before the head flip: " + _DERIVED),
+    ("structure/rebuild.py", "Rebuilder._discard", "DELETE"): (1, "a discarded generation's document: " + _DERIVED),
+    ("structure/rebuild.py", "Rebuilder._discard", "POST"): (3, "a discarded generation's refresh and member update: " + _DERIVED),
+    ("structure/retention.py", "Retention.expire", "DELETE"): (1, "generation retention: " + _DERIVED),
+    ("structure/retention.py", "Retention.expire", "POST"): (1, "generation retention refresh: " + _DERIVED),
+    ("structure/retention.py", "Retention._drop_dead_members", "POST"): (2, "generation retention: " + _DERIVED),
+    ("structure/retention.py", "Retention.discard_generation", "DELETE"): (1, "generation discard: " + _DERIVED),
+    ("structure/retention.py", "Retention.discard_generation", "POST"): (6, "generation discard: " + _DERIVED),
 }
 
 
@@ -141,260 +146,238 @@ def rel(p: Path) -> str:
     return p.relative_to(PKG).as_posix()
 
 
-def request_modules() -> dict:
-    return {rel(p): p.read_text() for p in sorted(PKG.rglob("*.py")) if ".request(" in p.read_text()}
+def package_modules() -> dict:
+    """{relative path: source} of EVERY module of the package (no substring prefilter)."""
+    return {rel(p): p.read_text() for p in sorted(PKG.rglob("*.py"))}
 
 
-def guarded(module: str) -> bool:
-    return module.split("/")[0] in GUARDED_DIRS or module in GUARDED_FILES
+def reads_validators() -> tuple:
+    import living_context.gateway.reads as r
+    return tuple(r.VALIDATORS)
 
 
-def _name(f) -> str:
-    return f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else ""
+def _module_package(module: str) -> list:
+    return ["living_context"] + module[:-3].split("/")[:-1]
 
 
-def _binds(node) -> set:
-    """Names an assignment-like statement binds."""
-    targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, (ast.AugAssign, ast.AnnAssign, ast.For)) else []
-    return {n.id for t in targets for n in ast.walk(t) if isinstance(n, ast.Name)}
+def _absolute(module: str, node: ast.ImportFrom) -> str:
+    if not node.level:
+        return node.module or ""
+    base = _module_package(module)[: len(_module_package(module)) - (node.level - 1)]
+    return ".".join(base + ([node.module] if node.module else []))
 
 
-def local_validators(tree, base: set) -> set:
-    """`base` plus every function of the module that passes its first two parameters, in order, to a validator (a wrapper such as
-    the writer's `_page`), transitively."""
-    out, grew = set(base), True
-    while grew:
-        grew = False
-        for f in ast.walk(tree):
-            if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef)) and f.name not in out:
-                params = [a.arg for a in f.args.args if a.arg not in ("self", "cls")][:2]
-                if len(params) == 2 and any(isinstance(n, ast.Call) and _name(n.func) in out and len(n.args) >= 2
-                                            and all(isinstance(a, ast.Name) for a in n.args[:2]) and [a.id for a in n.args[:2]] == params
-                                            for n in ast.walk(f)):
-                    out.add(f.name)
-                    grew = True
-    return out
+def bindings(module: str, tree) -> tuple:
+    """(names bound to a reads validator in `module`, names bound to the reads module itself)."""
+    validators, mods = set(reads_validators()), set()
+    names = {}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ImportFrom):
+            src = _absolute(module, n)
+            for a in n.names:
+                if src == "living_context.gateway.reads" and a.name in validators:
+                    names[a.asname or a.name] = a.name
+                if src == "living_context.gateway" and a.name == "reads":
+                    mods.add(a.asname or "reads")
+        elif isinstance(n, ast.Import):
+            for a in n.names:
+                if a.name == "living_context.gateway.reads" and a.asname:
+                    mods.add(a.asname)
+    if module == READS:
+        names.update({v: v for v in validators})
+    if module == VERIFIER:
+        names.update({v: v for v in VERIFIER_VALIDATORS})
+    return names, mods
 
 
-def call_sites(module: str, source: str) -> list:
-    """(qualname, method, validated, status_compared) of every `.request(` call of the module."""
+def _is_validator(func, names: dict, mods: set) -> bool:
+    if isinstance(func, ast.Name):
+        return func.id in names
+    return isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id in mods \
+        and func.attr in reads_validators()
+
+
+def sites(module: str, source: str) -> list:
+    """(qualname, method, line, routed, problem) for every `.request` of the module."""
     tree = ast.parse(source)
-    validators = local_validators(tree, VALIDATORS | (VERIFIER_VALIDATORS if module == "verifier/check.py" else set()))
+    names, mods = bindings(module, tree)
+    parent = {c: p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
     out = []
 
-    def visit(node, qual, fn):
-        for child in ast.iter_child_nodes(node):
-            q, f = qual, fn
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                q = qual + [child.name]
-                f = child if not isinstance(child, ast.ClassDef) else fn
-            if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute) and child.func.attr == "request":
-                out.append(classify(child, q, f, validators))
-            visit(child, q, f)
+    def qual_of(node):
+        q, p = [], parent.get(node)
+        while p is not None:
+            if isinstance(p, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                q.append(p.name)
+            p = parent.get(p)
+        return ".".join(reversed(q))
 
-    visit(tree, [], None)
+    for n in ast.walk(tree):
+        if not (isinstance(n, ast.Attribute) and n.attr == "request"):
+            continue
+        if isinstance(n.value, ast.Name) and n.value.id == "urllib":
+            continue   # the standard-library module (gateway/es.py, the client itself)
+        call = parent.get(n)
+        if not (isinstance(call, ast.Call) and call.func is n):
+            out.append((qual_of(n), "?", n.lineno, False, "a `.request` attribute that is not called: the method escapes the guard"))
+            continue
+        method = call.args[0].value if call.args and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str) else "?"
+        star, vcall = parent.get(call), parent.get(parent.get(call))
+        routed = isinstance(star, ast.Starred) and isinstance(vcall, ast.Call) and star in vcall.args \
+            and _is_validator(vcall.func, names, mods)
+        problem = "" if method != "?" else "a request whose method is not a string literal"
+        out.append((qual_of(call), method, call.lineno, routed, problem))
     return out
 
 
-def classify(call, qual, fn, validators):
-    """A call is validated when its answer goes straight into a validator, or when it is assigned to `(status, body)` names and a
-    validator call with exactly those names follows it before either name is bound again."""
-    method = call.args[0].value if call.args and isinstance(call.args[0], ast.Constant) else "?"
-    nodes = list(ast.walk(fn)) if fn is not None else []
-    validated, status = False, None
-    for n in nodes:
-        if isinstance(n, ast.Call) and _name(n.func) in validators and any(call in list(ast.walk(a)) for a in n.args):
-            validated = True
-    assign = next((n for n in nodes if isinstance(n, ast.Assign) and n.value is call and isinstance(n.targets[0], ast.Tuple)
-                   and len(n.targets[0].elts) == 2 and all(isinstance(e, ast.Name) for e in n.targets[0].elts)), None)
-    if assign is not None:
-        status, body = (e.id for e in assign.targets[0].elts)
-        at = (assign.end_lineno, assign.end_col_offset)
-        rebinds = sorted((n.end_lineno, n.end_col_offset) for n in nodes if n is not assign and _binds(n) & {status, body}
-                         and (n.end_lineno, n.end_col_offset) > at)   # a statement binds once its value is evaluated
-        until = rebinds[0] if rebinds else (10 ** 9, 0)
-        for m in nodes:
-            if isinstance(m, ast.Call) and _name(m.func) in validators and len(m.args) >= 2 and \
-                    all(isinstance(a, ast.Name) for a in m.args[:2]) and [a.id for a in m.args[:2]] == [status, body] and \
-                    at < (m.lineno, m.col_offset) < until:
-                validated = True
-    compared = status is not None and status != "_" and any(
-        isinstance(n, ast.Compare) and any(isinstance(x, ast.Name) and x.id == status for x in [n.left, *n.comparators])
-        for n in nodes)
-    return ".".join(qual), method, validated, compared
-
-
-def _path_text(call) -> str:
-    """The literal parts of a request call's path argument (an f-string's constant pieces), for the document-answer rules."""
-    a = call.args[1] if len(call.args) > 1 else None
-    if isinstance(a, ast.Constant) and isinstance(a.value, str):
-        return a.value
-    if isinstance(a, ast.JoinedStr):
-        return "".join(v.value for v in a.values if isinstance(v, ast.Constant) and isinstance(v.value, str))
-    return ""
-
-
-def request_calls(source: str) -> list:
-    """(qualname, method, literal path text, line) of every `.request(` call of a module."""
-    out = []
-
-    def visit(node, qual):
-        for child in ast.iter_child_nodes(node):
-            q = qual + [child.name] if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) else qual
-            if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute) and child.func.attr == "request":
-                method = child.args[0].value if child.args and isinstance(child.args[0], ast.Constant) else "?"
-                out.append((".".join(q), method, _path_text(child), child.lineno))
-            visit(child, q)
-
-    visit(ast.parse(source), [])
-    return out
-
-
-def doc_answer_findings(modules: dict) -> list:
-    """Round 5: no raw DELETE in a decision module outside reads.py (except RAW_DELETES), and no raw document read or compare-and-set
-    rewrite in an erasure module: those go through `reads.delete_doc`, `reads.read_doc` and `reads.put_doc`."""
-    bad = []
-    for module in sorted(m for m in modules if guarded(m) and m != "gateway/reads.py"):
-        for qual, method, path, line in request_calls(modules[module]):
-            if method == "?" and (module, qual) in DYNAMIC_METHODS:
-                fwd, pos, _ = DYNAMIC_METHODS[(module, qual)]
-                for n in ast.walk(ast.parse(modules[module])):
-                    if isinstance(n, ast.Call) and _name(n.func) == fwd and not (
-                            len(n.args) > pos and isinstance(n.args[pos], ast.Constant) and n.args[pos].value in ("GET", "POST", "PUT")):
-                        bad.append(f"{module}:{n.lineno}: a call of {fwd} without a literal GET, POST or PUT method")
-                continue
-            if method in ("DELETE", "?") and (module, qual) not in RAW_DELETES:
-                bad.append(f"{module}:{line}: {qual} sends a DELETE itself: a document delete goes through reads.delete_doc")
-            if module.split("/")[0] == ERASURE_DIR and "/_doc/" in path and (method == "GET" or (method == "PUT" and "if_seq_no" in path)):
-                bad.append(f"{module}:{line}: {qual} reads or rewrites a document itself: use reads.read_doc / reads.put_doc")
-    for module, qual in sorted(RAW_DELETES):
-        if module in modules and not any(q == qual and m == "DELETE" for q, m, _, _ in request_calls(modules[module])):
-            bad.append(f"{(module, qual)}: on RAW_DELETES but sends no DELETE (stale entry)")
-    return bad
+def verifier_validators_defined(source: str) -> list:
+    tree = ast.parse(source)
+    have = {f.name for f in tree.body if isinstance(f, ast.FunctionDef)}
+    return [v for v in VERIFIER_VALIDATORS if v not in have]
 
 
 def findings(modules: dict) -> list:
     """Every violation of the guard over `modules` ({relative path: source})."""
-    bad = doc_answer_findings(modules)
-    for module in sorted(set(modules) - set(EXCLUDED)):
-        if not guarded(module):
-            bad.append(f"{module}: has ES requests but is neither guarded nor on EXCLUDED")
-    for module in sorted(EXCLUDED):
-        if module not in modules:
-            bad.append(f"{module}: on EXCLUDED but has no ES request (stale entry)")
-        elif guarded(module):
-            bad.append(f"{module}: a decision module cannot be excluded")
-    for module in sorted(m for m in modules if guarded(m)):   # the cursor rule (F12): no `_doc` sort in a decision module
+    bad, seen = [], {}
+    import living_context.gateway.reads as r
+    for v in r.VALIDATORS:
+        f = getattr(r, v, None)
+        if not callable(f):
+            bad.append(f"reads.VALIDATORS names {v}, which reads.py does not define")
+    if VERIFIER in modules:
+        bad += [f"{VERIFIER}: validator {v} is not defined there" for v in verifier_validators_defined(modules[VERIFIER])]
+    for module in sorted(modules):
+        for qual, method, line, routed, problem in sites(module, modules[module]):
+            if problem:
+                bad.append(f"{module}:{line}: {qual}: {problem}")
+            elif not routed:
+                seen.setdefault((module, qual, method), []).append(line)
+    for key, lines in sorted(seen.items()):
+        if key not in ALLOWED:
+            bad.append(f"{key[0]}:{lines[0]}: {key[1]} {key[2]}: an answer that is neither validated as it returns "
+                       f"(v(*client.request(...)) with v from reads.VALIDATORS) nor on ALLOWED")
+            continue
+        n, reason = ALLOWED[key]
+        if n != len(lines):
+            bad.append(f"{key}: ALLOWED says {n} call sites, found {len(lines)} (lines {lines})")
+        if not isinstance(reason, str) or len(reason) < 40:
+            bad.append(f"{key}: an ALLOWED entry needs its reason")
+    for key in sorted(set(ALLOWED) - set(seen)):
+        if key[0] in modules:
+            bad.append(f"{key}: on ALLOWED but no such unvalidated call site (stale entry)")
+    for module in sorted(m for m in modules if m.split("/")[0] in CURSOR_DIRS or m in CURSOR_FILES):   # F12
         for n in ast.walk(ast.parse(modules[module])):
             if isinstance(n, ast.Dict) and any(isinstance(k, ast.Constant) and k.value == "_doc" for k in n.keys):
                 bad.append(f"{module}:{n.lineno}: a `_doc` sort (not unique across shards or indices): use reads.scan")
-    seen = {}
-    for module in sorted(m for m in modules if guarded(m)):
-        for qual, method, validated, compared in call_sites(module, modules[module]):
-            if validated:
-                continue
-            key = (module, qual, method)
-            seen.setdefault(key, []).append(compared)
-    for key, comps in sorted(seen.items()):
-        if key not in ALLOWED:
-            bad.append(f"{key}: an unvalidated ES request that is not on ALLOWED")
-            continue
-        n, kind, _ = ALLOWED[key]
-        if n != len(comps):
-            bad.append(f"{key}: ALLOWED says {n} call sites, found {len(comps)}")
-        if kind == "checked" and not any(comps):
-            bad.append(f"{key}: listed as checked but no status of these calls is compared")
-    for key, (n, _, _) in ALLOWED.items():
-        if n and key not in seen and key[0] in modules:
-            bad.append(f"{key}: on ALLOWED but no such unvalidated call site (stale entry)")
     return bad
 
 
-class ReadPaths(unittest.TestCase):
-    def test_every_request_of_the_decision_modules_is_validated_or_allowed(self):
-        self.assertEqual(findings(request_modules()), [])
+def inventory(modules: dict = None) -> list:
+    """One row per call site: module:line, function, method, and how its answer is judged."""
+    modules = modules or package_modules()
+    rows = []
+    for module in sorted(modules):
+        tree = ast.parse(modules[module])
+        parent = {c: p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
+        calls = {n.lineno: n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                 and n.func.attr == "request"}
+        for qual, method, line, routed, problem in sites(module, modules[module]):
+            how = problem
+            if routed:
+                v = parent[parent[calls[line]]].func
+                how = "validated: " + (v.id if isinstance(v, ast.Name) else f"{v.value.id}.{v.attr}")
+            elif not problem:
+                how = "ALLOWED: " + ALLOWED.get((module, qual, method), (0, "NOT LISTED"))[1][:90]
+            rows.append(f"{module}:{line}\t{qual}\t{method}\t{how}")
+    return rows
 
-    def test_the_universe_is_not_empty(self):
-        mods = request_modules()
-        sites = [s for m in mods if guarded(m) for s in call_sites(m, mods[m])]
-        self.assertGreater(len(sites), 60)
-        self.assertGreaterEqual(sum(1 for s in sites if s[2]), 8)   # validated call sites exist, so `validated` is not always False
+
+class ReadPaths(unittest.TestCase):
+    def test_every_request_of_the_package_is_validated_or_allowed(self):
+        self.assertEqual(findings(package_modules()), [])
+
+    def test_the_universe_is_the_whole_package(self):
+        mods = package_modules()
+        every = [(m, s) for m in mods for s in sites(m, mods[m])]
+        self.assertGreater(len(every), 100)
+        self.assertGreaterEqual(sum(1 for _, s in every if s[3]), 35)   # validated sites exist, so `routed` is not always False
+        self.assertTrue({m.split("/")[0] for m, _ in every} >= {"gateway", "erasure", "verifier", "ingest", "structure", "recall"})
+
+    def plant(self, module, code, **extra):
+        mods = package_modules()
+        return findings(dict(mods, **{module: mods[module] + code}, **extra))
+
+    def test_a_status_comparison_is_never_a_pass(self):
+        # the F18 form (pool_admin._authz_put at 4e7ee85) and the F19 form (session_state.es_persist at 4e7ee85)
+        for module, code in (
+                ("gateway/pool_admin.py", "\n\ndef planted(c):\n    st, _ = c.request('PUT', '/lc-t-authz/_doc/x', {})\n"
+                                          "    if st not in (200, 201):\n        raise RuntimeError\n"),
+                ("gateway/session_state.py", "\n\ndef planted(c):\n    st, cur = c.request('GET', '/lc-t-ctl/_doc/x')\n"
+                                             "    if st == 200 and cur.get('found'):\n        return cur\n")):
+            with self.subTest(module):
+                self.assertTrue(any(f.startswith(module + ":") and "planted" in f and "neither validated" in f
+                                    for f in self.plant(module, code)))
+
+    def test_a_validator_applied_after_binding_the_answer_is_not_a_pass(self):
+        code = ("\n\ndef planted(es, idx):\n    st, r = es.request('POST', f'/{idx}/_search', {})\n"
+                "    if st == 200:\n        return r['hits']['hits']\n    return complete_hits(st, r)\n")
+        self.assertTrue(any("planted" in f for f in self.plant("ingest/writer.py", code)))
 
     def test_planted_unvalidated_search_is_caught(self):
-        mods = request_modules()
-        planted = dict(mods)
-        planted["erasure/scan.py"] = mods["erasure/scan.py"] + (
-            "\n\ndef planted(er, pattern, body):\n"
-            "    st, r = er.request('POST', f'/{pattern}/_search', body)\n"
-            "    if st != 200:\n"
-            "        raise RuntimeError\n"
-            "    return r['hits']['hits']\n")
-        self.assertIn("('erasure/scan.py', 'planted', 'POST'): an unvalidated ES request that is not on ALLOWED", findings(planted))
+        code = "\n\ndef planted(er, pattern, body):\n    return er.request('POST', f'/{pattern}/_search', body)[1]['hits']['hits']\n"
+        self.assertTrue(any(f.startswith("erasure/scan.py:") and "planted POST" in f for f in self.plant("erasure/scan.py", code)))
 
-    def test_planted_removed_validator_is_caught(self):
-        mods = request_modules()
-        src = mods["verifier/check.py"]
-        self.assertIn('return _complete(st, r, "direct read")["hits"]["hits"]', src)
-        planted = dict(mods, **{"verifier/check.py": src.replace('return _complete(st, r, "direct read")["hits"]["hits"]',
-                                                                  'return r["hits"]["hits"]')})
-        self.assertTrue(any("verifier/check.py', 'Verifier._search'" in f for f in findings(planted)))
+    def test_a_local_function_named_like_a_validator_is_not_a_pass(self):
+        code = ("\n\ndef complete_hits(st, r):\n    return []\n\n\ndef planted(es):\n"
+                "    return complete_hits(*es.request('POST', '/x/_search', {}))\n")
+        self.assertTrue(any("planted POST" in f for f in self.plant("recall/direct.py", code)))
 
-    def test_planted_doc_cursor_is_caught(self):
-        mods = request_modules()
-        planted = dict(mods, **{"gateway/pool_boot.py": mods["gateway/pool_boot.py"] + "\nBODY = {'sort': [{'_doc': 'asc'}]}\n"})
-        self.assertTrue(any(f.startswith("gateway/pool_boot.py:") and "`_doc` sort" in f for f in findings(planted)))
+    def test_a_routed_site_with_its_validator_removed_is_caught(self):
+        mods = package_modules()
+        for module, routed in (("gateway/pool_tools.py", "doc_read(*self.es_for(cls).request("),
+                               ("gateway/handler.py", "mget_items(*self._es.client(tenant, f\"read-{cls}\").request(")):
+            with self.subTest(module):
+                src = mods[module]
+                self.assertIn(routed, src)
+                planted = dict(mods, **{module: src.replace(routed, "(lambda *a: a[1])(*" + routed.split("(*", 1)[1], 1)})
+                self.assertTrue(any(f.startswith(module + ":") and "neither validated" in f for f in findings(planted)))
 
     def test_planted_new_module_is_caught(self):
-        mods = dict(request_modules(), **{"recall/planted.py": "def f(es):\n    return es.request('GET', '/x/_doc/1')\n"})
-        self.assertIn("recall/planted.py: has ES requests but is neither guarded nor on EXCLUDED", findings(mods))
+        mods = dict(package_modules(), **{"recall/planted.py": "def f(es):\n    return es.request('GET', '/x/_doc/1')\n"})
+        self.assertTrue(any(f.startswith("recall/planted.py:") for f in findings(mods)))
 
-    def test_a_listed_checked_site_must_compare_its_status(self):
-        mods = request_modules()
-        src = mods["erasure/purge.py"]
-        line = 'st, r = es.request("GET", f"/{index}/_stats/docs")'
-        self.assertIn(line, src)
-        planted = dict(mods, **{"erasure/purge.py": src.replace(line, 'r = es.request("GET", f"/{index}/_stats/docs")[1]; st = 200')})
-        self.assertIn("('erasure/purge.py', 'deleted_count', 'GET'): listed as checked but no status of these calls is compared",
-                      findings(planted))
+    def test_an_escaping_request_method_and_a_dynamic_method_are_caught(self):
+        self.assertTrue(any("not called" in f for f in self.plant("gateway/pool_boot.py", "\n\ndef planted(c):\n    send = c.request\n"
+                                                                                          "    return send('GET', '/x/_doc/1')\n")))
+        self.assertTrue(any("not a string literal" in f for f in self.plant(
+            "gateway/pool_boot.py", "\n\ndef planted(c, m):\n    from .reads import doc_read\n"
+                                    "    return doc_read(*c.request(m, '/x/_doc/1'), 'x', '1')\n")))
 
-    def test_planted_raw_document_delete_is_caught_even_when_it_checks_the_status(self):
-        # the f16ea94 form of scan.delete: it compares the status (200 or 404), so the checked-status rule alone would pass it
-        mods = request_modules()
-        raw = ("\n\ndef planted(es, index, doc_id):\n"
-               "    st, _ = es.request(\"DELETE\", f\"/{index}/_doc/{doc_id}\")\n"
-               "    if st not in (200, 404):\n"
-               "        raise ScanError(st)\n"
-               "    return st == 200\n")
-        for module in ("erasure/scan.py", "gateway/pool_admin.py", "ingest/writer.py"):
-            with self.subTest(module):
-                planted = dict(mods, **{module: mods[module] + raw})
-                self.assertTrue(any(f.startswith(module + ":") and "planted sends a DELETE itself" in f for f in findings(planted)),
-                                findings(planted))
+    def test_stale_and_miscounted_allow_list_entries_are_caught(self):
+        mods = package_modules()
+        src = mods["model/cache.py"]
+        self.assertIn('self._es_fn().request("GET"', src)
+        gone = dict(mods, **{"model/cache.py": src.replace('self._es_fn().request("GET"', 'self._es_fn().fetch("GET"')})
+        self.assertIn("('model/cache.py', 'EsCacheStore.get', 'GET'): on ALLOWED but no such unvalidated call site (stale entry)",
+                      findings(gone))
+        two = self.plant("model/cache.py", "\n\nclass EsCacheStore(EsCacheStore):\n    def get(self, cls, key):\n"
+                                           "        return self._es_fn().request('GET', '/x/_doc/1')\n")
+        self.assertTrue(any("ALLOWED says 1 call sites, found 2" in f for f in two), two)
 
-    def test_planted_raw_erasure_document_read_or_rewrite_is_caught(self):
-        mods = request_modules()
-        for name, body in (("read", 'code, doc = st.request("GET", f"/{h.index}/_doc/{h.id}")'),
-                           ("rewrite", 'code, _ = st.request("PUT", f"/{h.index}/_doc/{h.id}?if_seq_no={n}&if_primary_term={t}", s)')):
-            with self.subTest(name):
-                planted = dict(mods, **{"erasure/executor.py": mods["erasure/executor.py"] +
-                                        f"\n\ndef planted(st, h, s, n, t):\n    {body}\n    return code\n"})
-                self.assertTrue(any(f.startswith("erasure/executor.py:") and "planted reads or rewrites a document itself" in f
-                                    for f in findings(planted)), findings(planted))
+    def test_planted_doc_cursor_is_caught(self):
+        self.assertTrue(any(f.startswith("gateway/pool_boot.py:") and "`_doc` sort" in f
+                            for f in self.plant("gateway/pool_boot.py", "\nBODY = {'sort': [{'_doc': 'asc'}]}\n")))
 
-    def test_a_forwarded_delete_method_is_caught(self):
-        mods = request_modules()
-        src = mods["gateway/class_reader.py"]
-        line = 'self._send(cls, kind, "GET", f"/{{index}}/_doc/{doc_id}", None, pool, search=False)'
-        self.assertIn(line, src)
-        planted = dict(mods, **{"gateway/class_reader.py": src.replace(line, line.replace('"GET"', '"DELETE"'))})
-        self.assertTrue(any("a call of _send without a literal GET, POST or PUT method" in f for f in findings(planted)), findings(planted))
-
-    def test_the_document_helpers_are_the_only_document_delete_and_erasure_read(self):
-        mods = request_modules()
-        self.assertEqual(doc_answer_findings(mods), [])
-        reads_calls = {(q, m) for q, m, _, _ in request_calls(mods["gateway/reads.py"])}
-        self.assertTrue({("delete_doc", "DELETE"), ("read_doc", "GET"), ("put_doc", "PUT")} <= reads_calls)
+    def test_a_verifier_validator_must_be_defined_in_the_verifier(self):
+        mods = package_modules()
+        src = mods[VERIFIER]
+        self.assertIn("def _listed(", src)
+        planted = dict(mods, **{VERIFIER: src.replace("def _listed(", "def _listed_gone(")})
+        self.assertIn(f"{VERIFIER}: validator _listed is not defined there", findings(planted))
 
 
 if __name__ == "__main__":
-    unittest.main()
+    if "--inventory" in sys.argv:
+        print("\n".join(inventory()))
+    else:
+        unittest.main()
