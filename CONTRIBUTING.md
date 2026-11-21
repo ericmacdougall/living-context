@@ -10,8 +10,7 @@ belongs to. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Development setup
 
-- Python 3 (recent; the code uses built-in generic type syntax, so 3.9 or
-  newer).
+- Developed and tested on Python 3.13; older versions are untested.
 - Create a virtual environment and install from the lockfile, not the `.in`
   file: `pip install -r requirements.lock`. The evaluation line also has
   `requirements-embed.lock` for the real embedding pool. Pin new dependencies
@@ -32,9 +31,9 @@ python -m unittest tests.unit.test_fusion
 python -m unittest discover -s tests/unit
 ```
 
-- A security test that needs a cluster **fails** when none is configured; it
-  never skips. `python tools/run_security.py [DIR ...]` runs the security
-  suite and exits non-zero on any failure, error, skip or empty run.
+- Run security tests through `python tools/run_security.py [DIR ...]`, which
+  exits non-zero on any failure, error, skip or empty run. Under plain
+  `unittest`, a few tests skip when no cluster or model is configured.
 - A test of changed behaviour must fail against the previous implementation (or
   a deliberately broken variant) and pass against yours. A test that cannot fail
   for the stated reason does not count.
