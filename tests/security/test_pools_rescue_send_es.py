@@ -40,9 +40,12 @@ class SendFenceE2E(SocketE2E):
         self.A, self.B = (m["pool"] for m in made)
         for p in (self.A, self.B):
             self.assertTrue(ln.call(self.adm, op="pool_grant", who="user-carol", pool=p, ops=["query", "save"])["ok"])
-        self.tok = self.scoped(b"user-carol", {self.A: ["query", "save"], self.B: ["query", "save"]}, "conv-fence")
-        self.pa = ln.call(self.tok, op="pool_save", pool=self.A, text=TEXT, key="fa")["pointer"]
-        self.pb = ln.call(self.tok, op="pool_save", pool=self.B, text=TEXT.replace("gannet", "puffin"), key="fb")["pointer"]
+        # a save key is scoped to (principal, conversation, key): each test saves in its own conversation
+        self.tok = self.scoped(b"user-carol", {self.A: ["query", "save"], self.B: ["query", "save"]}, f"conv-fence-{self.tag}")
+        saved = [ln.call(self.tok, op="pool_save", pool=self.A, text=TEXT, key="fa"),
+                 ln.call(self.tok, op="pool_save", pool=self.B, text=TEXT.replace("gannet", "puffin"), key="fb")]
+        self.assertTrue(all(x.get("ok") for x in saved), saved)
+        self.pa, self.pb = (x["pointer"] for x in saved)
         self.pausing = Pausing(self.app.server.handler)
         self.app.server.handler = self.pausing
         self.extra = []
@@ -147,7 +150,7 @@ class SendFenceE2E(SocketE2E):
         c = self.conn().call(self.adm, op="pool_create", cls="base", kind="team", label=f"fence carded {self.tag}", card=CARD)
         self.assertTrue(c.get("ok"), c)
         self.assertTrue(self.conn().call(self.adm, op="pool_grant", who="user-carol", pool=c["pool"], ops=["query", "save"])["ok"])
-        return c["pool"], self.scoped(b"user-carol", {c["pool"]: ["query", "save"], self.A: ["query", "save"]}, "conv-f16")
+        return c["pool"], self.scoped(b"user-carol", {c["pool"]: ["query", "save"], self.A: ["query", "save"]}, f"conv-f16-{self.tag}")
 
     def test_f16_a_fresh_describe_and_list_after_an_ungrant_over_the_product_path(self):
         pool, tok = self.carded()
