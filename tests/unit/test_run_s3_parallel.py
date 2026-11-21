@@ -37,6 +37,18 @@ class FirstRecallStop(SafeRunner):
         return super().__call__(prompt)
 
 
+class StopAfterQuestions(SafeRunner):
+    """Creates the stop file once the ledger holds `k` questions (the operator stopping S3 part way through its questions)."""
+    def __init__(self, ledger, k, **kw):
+        super().__init__(**kw)
+        self.ledger, self.k = Path(ledger), k
+
+    def __call__(self, prompt):
+        if self.stop_file is not None and self.ledger.exists() and len(self.ledger.read_text().splitlines()) >= self.k:
+            Path(self.stop_file).write_text("")
+        return super().__call__(prompt)
+
+
 @mock.patch.dict(run_h1.REGISTERED_N, {"S3": 10})          # the synthetic S3 is 10 questions with SHUFFLED on 4
 @mock.patch.dict(run_h1.SHUFFLED_N, {"S3": 4})
 class S3Parallel(unittest.TestCase):
@@ -94,6 +106,22 @@ class S3Parallel(unittest.TestCase):
         # the recall calls charged before the stop were journaled without a question scope and are asked again under it: exactly
         # those calls are charged twice (disclosed in the amendment); every build call was charged once
         self.assertEqual(len(rows) - n_ref, recall_before)
+
+    def test_a_run_stopped_with_questions_done_resumes_to_the_same_ledger_with_shuffled_on_the_same_questions(self):
+        ref = Path(tempfile.mkdtemp())
+        self.assertEqual(self.go(ref, SafeRunner(), concurrency=4, concurrency_reason="test"), 0)
+        d = Path(tempfile.mkdtemp())
+        rc = self.go(d, StopAfterQuestions(d / "done.jsonl", 2, stop_file=d / "STOP"), concurrency=4, concurrency_reason="test")
+        self.assertEqual(rc, 3)
+        done = len((d / "done.jsonl").read_text().splitlines())
+        self.assertTrue(0 < done < 10, done)                          # stopped part way, with questions already recorded
+        (d / "STOP").unlink()
+        self.assertEqual(self.go(d, SafeRunner(), resume=True, concurrency=4, concurrency_reason="test"), 0)
+        led = lambda x: [json.loads(l) for l in (x / "done.jsonl").read_text().splitlines()]
+        shuffled = lambda x: [r["qref"] for r in led(x) if "SHUFFLED" in r["arms"]]
+        self.assertEqual(shuffled(d), shuffled(ref))                  # the first 4 of the seeded order, before and after the stop
+        self.assertEqual(len(shuffled(ref)), 4)
+        self.assertEqual(self.outputs(d)[0], self.outputs(ref)[0])    # the ledger, byte for byte
 
     def test_the_amendment_does_not_open_an_unbuilt_or_started_run(self):
         d = Path(tempfile.mkdtemp())
