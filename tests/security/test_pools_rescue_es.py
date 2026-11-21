@@ -7,6 +7,12 @@ answers this cluster really gives, through the tenant's `erase` credential: an a
 an alias names itself, and a missing name is a 404 `index_not_found_exception` that names it (the one shape that reads as absence; the
 unit fake in tests/unit/fake_es.py answers the same shape). After the physical index is dropped, both names read as absent.
 
+Round 5 (the F11 class on single-document answers): `reads.delete_doc`, `read_doc` and `put_doc` accept the answers this cluster gives,
+through the erase credential: a document request names the concrete `_index` and the `_id`; through an alias the answer names the
+physical index (so a strict request through the alias refuses, which is why alias-addressed callers opt in); a missing document is a 404
+`not_found` (a read: `found: false`) about it; a missing index is a 404 `index_not_found_exception` naming it; a lost compare-and-set is
+a 409. The unit fakes answer the same shapes.
+
 The fresh indices are created under the tenant's prefix by the cluster administrator (one shard, no replica) and deleted after.
 Needs LC_TEST_ES_URL, LC_TEST_CA and LC_TEST_PW."""
 from unittest import mock
@@ -91,3 +97,31 @@ class AliasShapesES(Base):
         self.assertEqual(reads.aliases(self.er, self.alias), [])             # the alias went with its only index
         self.assertEqual(reads.aliases(self.er, self.phys), [])
         self.assertEqual(reads.scan(self.er, self.alias, {"query": {"match_all": {}}}, missing_ok=True), [])
+
+    def test_round5_single_document_answers_read_the_real_shapes(self):
+        er, adm = self.er, self.admin
+        self.addCleanup(adm.request, "DELETE", f"/{self.missing}")   # in case a delete ever auto-created it (it must not)
+        for name, did in ((self.phys, "d1"), (self.phys, "d2"), (self.bare, "d3")):
+            st, r = adm.request("PUT", f"/{name}/_doc/{did}?refresh=true", {"tenant": T, "kind": "probe"})
+            self.assertIn(st, (200, 201), r)
+        got = reads.read_doc(er, self.phys, "d1")
+        self.assertEqual((got["_index"], got["_id"], got["found"]), (self.phys, "d1", True))
+        self.assertEqual(reads.read_doc(er, self.alias, "d1", alias=True)["_index"], self.phys)   # through the alias: the physical name
+        with self.assertRaises(reads.IncompleteRead):
+            reads.read_doc(er, self.alias, "d1")                                                  # strict: another name answered
+        self.assertIsNone(reads.read_doc(er, self.bare, "nope"))                                  # 404 found false about it
+        self.assertIsNone(reads.read_doc(er, self.missing, "nope"))                               # 404 index_not_found naming it
+        self.assertTrue(reads.put_doc(adm, self.bare, "d4", {"tenant": T, "kind": "probe"}))      # 201 created
+        cur = reads.read_doc(adm, self.bare, "d4")
+        cas = (f"if_seq_no={cur['_seq_no']}", f"if_primary_term={cur['_primary_term']}")
+        self.assertTrue(reads.put_doc(adm, self.bare, "d4", {"tenant": T, "kind": "probe2"}, *cas))   # 200 updated
+        self.assertFalse(reads.put_doc(adm, self.bare, "d4", {"tenant": T, "kind": "probe3"}, *cas))  # 409: the compare-and-set is lost
+        self.assertTrue(reads.delete_doc(er, self.alias, "d1", alias=True))                       # 200 deleted, through the alias
+        self.assertFalse(reads.delete_doc(er, self.alias, "d1", alias=True))                      # 404 not_found naming the physical index
+        self.assertFalse(reads.delete_doc(er, self.phys, "d1"))                                   # the same, by the concrete name (strict)
+        self.assertTrue(reads.delete_doc(er, self.bare, "d3"))
+        self.assertFalse(reads.delete_doc(er, self.missing, "x"))                                 # 404 index_not_found naming it
+        st, r = adm.request("GET", f"/{self.missing}")
+        self.assertEqual(st, 404, r)                                                              # the delete created nothing
+        with self.assertRaises(reads.IncompleteRead):
+            reads.delete_doc(er, self.alias, "d2")   # strict through the alias: the answer names the physical index and is refused
