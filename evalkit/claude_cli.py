@@ -59,7 +59,11 @@ class AllowanceRefused(StageLimited):
 
 
 class StagePaused(Exception):
-    """A throttle response: the stage pauses, the event is recorded, and it is not a scored failure."""
+    """A throttle response: the stage pauses, the event is recorded, and it is not a scored failure. `retry_after_s` carries an
+    API's Retry-After (seconds), which the back-off honours as a floor."""
+    def __init__(self, msg: str = "", retry_after_s: Optional[float] = None):
+        super().__init__(msg)
+        self.retry_after_s = retry_after_s
 
 
 class Throttled(Exception):
@@ -200,6 +204,47 @@ class RunOut:
     latency_s: float
 
 
+@dataclass
+class ApiReply:
+    """One HTTP model call (the `muse` model kind, `evalkit.model_kind`): the reply text, token counts, latency, and the outcome
+    flags the port maps: `throttled` (HTTP 429), `retryable` (503 or 504: retried as a throttle, bounded), `limited` (a quota or
+    billing refusal, HTTP 402: the stage stops at once, never retried), `model_mismatch` (the response reported another model than
+    the requested one: the stage stops at once, never retried), or another `error`. `model` is the model the response reported."""
+    text: Optional[str]
+    input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_tokens: int = 0
+    latency_s: float = 0.0
+    throttled: bool = False
+    retryable: bool = False
+    limited: bool = False
+    model_mismatch: bool = False
+    error: str = ""
+    status: Optional[int] = None
+    retry_after_s: Optional[float] = None
+    model: str = ""
+
+
+class Pacer:
+    """Request starts spaced at least 60/rpm seconds apart across every worker of one run (one pacer per run), so the run sits
+    under a requests-per-minute limit instead of living on 429s. It only delays: what is asked and answered does not change."""
+    def __init__(self, rpm: float, *, clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep):
+        if not rpm or rpm <= 0:
+            raise ValueError("rpm must be positive")
+        self.rpm, self.gap = float(rpm), 60.0 / float(rpm)
+        self._clock, self._sleep, self._lock, self._next = clock, sleep, threading.Lock(), None
+        self.waited = 0.0
+
+    def wait(self) -> None:
+        with self._lock:
+            now = self._clock()
+            at = now if self._next is None else max(now, self._next)
+            self._next = at + self.gap
+            self.waited += at - now
+        if at > now:
+            self._sleep(at - now)
+
+
 def argv_for(binary: str, model: str) -> List[str]:
     return [binary, "-p", "--model", model, "--output-format", "json", "--no-session-persistence", "--tools", "",
             "--disable-slash-commands", "--strict-mcp-config", "--settings", '{"disableAllHooks":true}',
@@ -234,14 +279,15 @@ class CappedPort:
     """Same call interface as `ModelPort`; every call goes through the durable counter first."""
 
     def __init__(self, runner: Callable[[str], RunOut], budget: Budget, log_path: Path, *, forbidden: Sequence[str] = (),
-                 model_id: str = "", argv_record: Sequence[str] = ()):
-        self._run, self._budget, self._log = runner, budget, Path(log_path)
+                 model_id: str = "", argv_record: Sequence[str] = (), pacer: Optional[Pacer] = None):
+        self._run, self._budget, self._log, self._pacer = runner, budget, Path(log_path), pacer
         self._forbidden, self.model_id, self._argv = tuple(forbidden), model_id, list(argv_record)
         self._lock = threading.Lock()
         self.port_calls = 0
         self._fail_streak = 0
         self.spawned = 0
         self.rows: List[dict] = []
+        self.models_reported: set = set()             # the API kind: every model id a response reported
         self.row_extra: Callable[[], dict] = dict        # set by ResilientPort: the effective concurrency at the time of the call
         self._log.parent.mkdir(parents=True, exist_ok=True)
 
@@ -264,11 +310,15 @@ class CappedPort:
         name = task.value
         prompt = render(name, inputs)
         self._check_prompt(prompt)            # before the counter: a refused prompt costs nothing
+        if self._pacer is not None:           # before the charge: a stop or halt during the wait costs nothing
+            self._pacer.wait()
         with self._lock:                      # the charge and its bookkeeping are atomic; the process itself runs outside the lock
             self.port_calls += 1
             n = self._budget.charge()         # BEFORE the process; raises BudgetExceeded at the cap, nothing is spawned
             self.spawned += 1
         ro = self._run(prompt)                # several processes may run at once (the caller bounds how many: `ResilientPort`)
+        if isinstance(ro, ApiReply):
+            return self._api(name, inputs, prompt, n, ro)
         with self._lock:
             row = {**self.row_extra(), "n": n, "task": name, "prompt_chars": len(prompt), "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:16],
                    "latency_s": round(ro.latency_s, 3), "rc": ro.rc, "stdout_chars": len(ro.stdout), "argv": self._argv,
@@ -292,18 +342,62 @@ class CappedPort:
             env = self._envelope(ro.stdout)
             row.update(self._usage(env))
             text = env.get("result") if isinstance(env, dict) else None
-            out = parse_model_json(text) if isinstance(text, str) else None
-            if out is not None and name == "judge_relevance" and isinstance(out.get("score"), int) and not isinstance(out.get("score"), bool):
-                out["score"] = float(out["score"])    # the port's schema wants a float; an integer 0 or 1 is the same number
-            row["parse_ok"] = out is not None
-            row["schema_ok"] = bool(out is not None and schema_ok(name, out))
-            probs = strict_problems(name, inputs, out) if row["schema_ok"] else ["not schema valid"]
-            row["strict_ok"] = not probs
-            row["strict_problems"] = probs[:5]
+            out = self._judge(name, inputs, text, row)
             if ro.rc != 0 or (isinstance(env, dict) and env.get("is_error")):
                 row["error"] = "cli_error" if ro.rc != 0 else "is_error"
             self._append(row)
             if ro.rc != 0 or not row["schema_ok"]:
+                return CallResult(False, error=row.get("error") or ("parse" if out is None else "schema"))
+            return CallResult(True, out)
+
+    @staticmethod
+    def _judge(name: str, inputs: Mapping[str, Any], text: Any, row: dict) -> Optional[dict]:
+        """Parse the reply text and record parse_ok, schema_ok, strict_ok and strict_problems in the row (both model kinds)."""
+        out = parse_model_json(text) if isinstance(text, str) else None
+        if out is not None and name == "judge_relevance" and isinstance(out.get("score"), int) and not isinstance(out.get("score"), bool):
+            out["score"] = float(out["score"])    # the port's schema wants a float; an integer 0 or 1 is the same number
+        row["parse_ok"] = out is not None
+        row["schema_ok"] = bool(out is not None and schema_ok(name, out))
+        probs = strict_problems(name, inputs, out) if row["schema_ok"] else ["not schema valid"]
+        row["strict_ok"] = not probs
+        row["strict_problems"] = probs[:5]
+        return out
+
+    def _api(self, name: str, inputs: Mapping[str, Any], prompt: str, n: int, rep: "ApiReply") -> CallResult:
+        """The HTTP model kind: the same charge, row, refusal and scoring rules as the CLI, from an `ApiReply`. A 429 or a 503/504
+        pauses (back-off, Retry-After honoured) and is not a failure of the streak; a quota refusal stops the stage at once."""
+        with self._lock:
+            row = {**self.row_extra(), "n": n, "task": name, "prompt_chars": len(prompt),
+                   "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:16], "latency_s": round(float(rep.latency_s or 0), 3),
+                   "argv": self._argv, "prompt_version": PROMPT_VERSION, "http_status": rep.status,
+                   "input_tokens": int(rep.input_tokens or 0), "output_tokens": int(rep.output_tokens or 0),
+                   "reasoning_tokens": int(rep.reasoning_tokens or 0), "model_reported": rep.model or "",
+                   "stdout_chars": len(rep.text or "")}
+            if rep.model:
+                self.models_reported.add(rep.model)
+            if rep.model_mismatch:
+                row.update(limited=True, error="model_mismatch")
+                self._append(row)
+                raise StageLimited("the response reported model %r, not the requested %r, at call %d" % (rep.model, self.model_id, n))
+            if rep.limited:
+                row.update(limited=True, error="limit")
+                self._append(row)
+                raise StageLimited("quota or billing refusal (HTTP %s) at call %d" % (rep.status, n))
+            if rep.throttled or rep.retryable:
+                row.update(throttled=True, error="throttled" if rep.throttled else "unavailable", retry_after_s=rep.retry_after_s)
+                self._append(row)
+                raise StagePaused("%s at call %d" % (row["error"], n), retry_after_s=rep.retry_after_s)
+            failed = bool(rep.error) or rep.text is None
+            self._fail_streak = self._fail_streak + 1 if failed else 0
+            if self._fail_streak >= MAX_CLI_FAILURE_STREAK:
+                row.update(error="api_error")
+                self._append(row)
+                raise StageLimited("%d consecutive API failures, last at call %d" % (self._fail_streak, n))
+            out = self._judge(name, inputs, rep.text, row)
+            if failed:
+                row["error"] = "api_error"
+            self._append(row)
+            if failed or not row["schema_ok"]:
                 return CallResult(False, error=row.get("error") or ("parse" if out is None else "schema"))
             return CallResult(True, out)
 

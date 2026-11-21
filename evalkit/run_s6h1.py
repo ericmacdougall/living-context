@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 from typing import Callable, List, Optional
 
-from . import dataset as ds, parallel as par, s6h1_budget as bud, s6h1_freeze as fz, s6h1_stage as st
+from . import dataset as ds, model_kind as mk, parallel as par, s6h1_budget as bud, s6h1_freeze as fz, s6h1_stage as st
 
 STAGE = "S6-H1"
 PREBUILD_STAGE = "S6-H1-prebuild"   # EXPERIMENT 14.5: the whole-pool tenant and tree built before the freeze, questions sealed
@@ -41,7 +41,7 @@ E5_WORKER_MB = 1_024                # one up-front embedding process (MEASURED: 
 RC = {"COMPLETE": 0, "STOPPED": 3, "CAP_REACHED": 4, "BUILD_FAILED": 5, "PAUSED_THROTTLE": 75, "LIMIT_REACHED": 76, "ERROR": 1,
       "REFUSED": 2, "PREBUILT": 0}
 STAMP_KEYS = ("commit", "cap", "approval_ref", "release_ref", "freeze_sha256", "a0_fields", "model")
-PREBUILD_KEYS = ("commit", "code_sha256", "cap", "approval_ref", "amendment_ref", "a0_fields", "model", "threads")
+PREBUILD_KEYS = ("commit", "code_sha256", "cap", "approval_ref", "amendment_ref", "a0_fields", "model", "model_kind", "threads")
 
 
 def _registry_rows(path) -> List[dict]:
@@ -98,8 +98,7 @@ def check_prereqs(a, *, embed=None, manifest_path: Path = fz.MANIFEST, root: Pat
     for k, name in refs:
         if not str(getattr(a, k, "") or "").strip():
             why.append("%s is required (--%s)" % (name, k.replace("_", "-")))
-    if a.model_kind != "claude":
-        why.append("S6-H1 uses the real model port (--model-kind claude)")
+    why += mk.check(a)
     try:
         e5.require_real(embed, stage=STAGE)
     except e5.PinError:
@@ -124,7 +123,8 @@ def prebuild_record(run_dir) -> Optional[dict]:
 
 def _prebuild_now(a, root: Path) -> dict:
     return {"commit": a.commit, "code_sha256": fz.code_digest(root), "cap": a.approved_cap, "approval_ref": a.approval_ref,
-            "amendment_ref": getattr(a, "amendment_ref", ""), "a0_fields": a.a0_fields, "model": a.model, "threads": a.threads}
+            "amendment_ref": getattr(a, "amendment_ref", ""), "a0_fields": a.a0_fields, "model": a.model,
+            "model_kind": getattr(a, "model_kind", "claude"), "threads": a.threads}
 
 
 def _prebuild_prereqs(a, rd: Path, root: Path) -> List[str]:
@@ -175,6 +175,8 @@ def _stamped_prereqs(a, rd: Path, manifest_path: Path, root: Path) -> List[str]:
         for k in STAMP_KEYS:
             if old.get(k) != now[k]:
                 why.append("--resume must continue the same run: %s differs from the stamp" % k)
+        if old.get("model_kind", "claude") != getattr(a, "model_kind", "claude"):
+            why.append("--resume must continue the same run: model_kind differs from the stamp")
     if a.resume and not stamp.exists():
         why.append("--resume needs the stamp of an earlier start in the run directory")
     if str(getattr(a, "stamp_registry", "") or "").strip():
@@ -190,7 +192,7 @@ def _stamped_prereqs(a, rd: Path, manifest_path: Path, root: Path) -> List[str]:
     pre = prebuild_record(rd)
     if pre is not None:                 # the early build (14.5) must be the code, fields and model under test
         now = _prebuild_now(a, root)
-        for k in ("commit", "code_sha256", "a0_fields", "model", "threads", "cap", "approval_ref"):
+        for k in ("commit", "code_sha256", "a0_fields", "model", "model_kind", "threads", "cap", "approval_ref"):
             if pre.get(k) != now[k]:
                 why.append("the early build's %s (%s) is not this run's: the prebuilt tree is not the one under test" % (k, PREBUILD_FILE))
     elif (rd / "BUILT.json").exists() and not stamp.exists():
@@ -375,7 +377,8 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
         et.close()
         return write_state(run_dir, "REFUSED", leaves=n_leaves, error=why[0])
     if prebuild and pre is None:
-        pre = dict(_prebuild_now(a, root), stage=PREBUILD_STAGE, pool_contents=len(pool), pool_sha256=pool_sha, leaves=n_leaves,
+        pre = dict(mk.record(a), **_prebuild_now(a, root), stage=PREBUILD_STAGE, pool_contents=len(pool), pool_sha256=pool_sha,
+                   leaves=n_leaves,
                    embed_workers=embed_workers, ingest_writers=ingest_writers, mem_proof_sha256=fz._sha(Path(a.mem_proof)),
                    started=time.time())
         (run_dir / PREBUILD_FILE).write_text(json.dumps(pre, sort_keys=True))
@@ -387,14 +390,13 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
                                      "release_ref": a.release_ref, "freeze_sha256": fsha, "a0_fields": a.a0_fields, "model": a.model,
                                      "beta": vals["beta"], "mem_proof_sha256": fz._sha(Path(a.mem_proof)), "leaves": n_leaves,
                                      "concurrency": n_par, "concurrency_reason": getattr(a, "concurrency_reason", "") or "",
-                                     "prebuild": pre, "started": time.time()}, sort_keys=True))
+                                     "prebuild": pre, **mk.record(a), "started": time.time()}, sort_keys=True))
         with open(a.stamp_registry, "a") as f:
             f.write(json.dumps({"stage": STAGE, "run_dir": os.path.realpath(a.run_dir), "commit": a.commit, "freeze_sha256": fsha,
                                 "at": time.time()}, sort_keys=True) + "\n")
 
-    runner = runner or claude_cli.CliRunner(a.binary, a.model, run_dir / "cwd")
     budget = Budget(run_dir / "counter", a.approved_cap)
-    inner = claude_cli.CappedPort(runner, budget, run_dir / "calls.jsonl", model_id=a.model, argv_record=getattr(runner, "argv", lambda: [])())
+    inner = mk.capped_port(a, run_dir, budget, runner=runner)
     journal = Journal(run_dir / "journal.jsonl")
     adaptive = n_par > 1 and not getattr(a, "fixed_concurrency", False)
     port = ResilientPort(inner, budget, journal, run_dir / "STOP", max_retries=a.max_retries, base_delay_s=a.base_delay,
@@ -404,7 +406,7 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
                             "concurrency": n_par, "cluster_workers": cluster_workers,
                             "ingest_writers": ingest_writers, "embed_workers": embed_workers, **ingest_info, "adaptive": adaptive,
                             "concurrency_reason": getattr(a, "concurrency_reason", "") or ""}, sort_keys=True) + "\n")
-    ledger = None if prebuild else s2_stage.Ledger(run_dir / "done.jsonl")
+    ledger = None if prebuild else s2_stage.Ledger(run_dir / "done.jsonl", extra=mk.record(a))
     shuffled_qids = None if prebuild else st.shuffled_subset(fs, vals["thresholds"]["shuffled_n"])
     state, extra = ("PREBUILT" if prebuild else "COMPLETE"), {}
     try:
@@ -448,7 +450,7 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
         extra.update(questions_done=len(ledger.rows), questions=len(fs.questions))
     extra.update(counter=budget.count(), cap=a.approved_cap, leaves=n_leaves, replayed=port.replayed, fresh=port.fresh,
                  lost_in_flight=port.lost, throttled=port.throttled, limited=port.limited, concurrency_now=port.slots.limit,
-                 concurrency_changes=port.slots.changes)
+                 models_reported=sorted(inner.models_reported), concurrency_changes=port.slots.changes)
     if state == "COMPLETE":
         dec = st.decide(ledger, fs, clusters, shuffled_qids=shuffled_qids, shuffled_min=vals["thresholds"]["shuffled_min_point"])
         pool_label = "whole pool (%d contents, %d leaves)" % (len(pool), n_leaves)
@@ -467,13 +469,14 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
 def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Stage S6-H1 (confirmatory H1). See docs/RUN-S6H1.md.")
     ap.add_argument("--stage", default=STAGE)
-    for k in ("--dataset", "--es-url", "--es-ca", "--es-pw-file", "--run-dir", "--stamp-registry", "--embed-dir",
-              "--binary", "--model"):
+    for k in ("--dataset", "--es-url", "--es-ca", "--es-pw-file", "--run-dir", "--stamp-registry", "--embed-dir", "--model"):
         ap.add_argument(k, required=True)
+    ap.add_argument("--binary", default="", help="the CLI (--model-kind claude)")
     ap.add_argument("--s3-run-dir", default="", help="S3's run directory (required for the stamped run)")
     ap.add_argument("--rates-from", nargs="+", required=True, help="run directories of S2 and S3 (measured calls per recall)")
     ap.add_argument("--mem-proof", required=True, help="the JSON report of evalkit.s6h1_mem on this code at the expected pool size")
-    ap.add_argument("--model-kind", choices=["claude"], default="claude")
+    ap.add_argument("--model-kind", choices=list(mk.KINDS), default="claude")
+    mk.add_arguments(ap, default_kind="claude")
     ap.add_argument("--approved-cap", type=int, required=True)
     ap.add_argument("--approval-ref", required=True)
     ap.add_argument("--release-ref", default="", help="the owner's release of the fresh set (required for the stamped run)")

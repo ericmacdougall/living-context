@@ -292,7 +292,7 @@ class ResilientPort:
                         self.halt(e)              # a fixed concurrency stops at once; an adaptive one after its bounded retries
                         raise
                     self.slots.halve("allowance refusal")
-                    paused = True
+                    paused, retry_after = True, None
                 except StageLimited as e:
                     # an allowance refusal or a failing CLI: the refused call is not answered, so a resume asks it again (it is charged
                     # again, honestly); nothing is retried here, and no other worker charges after it
@@ -310,7 +310,7 @@ class ResilientPort:
                         self.halt(e)
                         raise
                     self.slots.halve("throttle")
-                    paused = True
+                    paused, retry_after = True, getattr(e, "retry_after_s", None)
                 except BudgetExceeded as e:
                     # nothing was charged beyond the cap and nothing is retried; no other worker charges after it
                     self.halt(e)
@@ -322,7 +322,7 @@ class ResilientPort:
             if paused:
                 # the throttled call was charged once by the inner port; the retry below is one new charged call. Every other
                 # worker waits at the gate meanwhile, so a throttle never multiplies into charged retries across workers
-                delay = min(self._max, self._base * (2 ** (attempt - 1)))
+                delay = min(self._max, max(self._base * (2 ** (attempt - 1)), float(retry_after or 0)))   # Retry-After is a floor
                 with self._gate:
                     self._backing_off += 1
                 try:

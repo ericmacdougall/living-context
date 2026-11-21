@@ -58,8 +58,8 @@ def check_prereqs(a, *, embed=embed_stub.embed) -> List[str]:
                        "biases H1")
         if not (a.commit or "").strip():
             why.append("%s needs the commit under test (--commit)" % a.stage)
-        if a.model_kind != "claude":
-            why.append("%s uses the real model port (--model-kind claude)" % a.stage)
+        from . import model_kind as mk
+        why += ["%s: %s" % (a.stage, w) for w in mk.check(a)]
         if a.n_questions != REGISTERED_N[a.stage]:
             why.append("%s is registered on %d pilot questions" % (a.stage, REGISTERED_N[a.stage]))
         if int(getattr(a, "shuffled_n", 0) or 0) != SHUFFLED_N.get(a.stage, 0):
@@ -92,6 +92,9 @@ def check_prereqs(a, *, embed=embed_stub.embed) -> List[str]:
                 #               done may continue under an amendment; the stamp records the earlier commit (and the amendment)
             if old.get(k, 0 if k == "shuffled_n" else None) != now:
                 why.append("--resume must continue the same run: %s differs from the stamp (a new cap needs a new approval and a new run)" % k)
+        if old.get("model_kind", "claude") != getattr(a, "model_kind", "claude") or \
+                old.get("model", getattr(a, "model", "")) != getattr(a, "model", ""):
+            why.append("--resume must continue the same run: the model kind or model differs from the stamp (a new model is a new run)")
     if a.stage in ("S2", "S3"):
         n_par = getattr(a, "concurrency", 1)
         why += par.check_concurrency(n_par, getattr(a, "concurrency_reason", ""))
@@ -131,7 +134,7 @@ def main(argv: Optional[list] = None) -> int:
     ap.add_argument("--run-dir", required=True)
     ap.add_argument("--n-questions", type=int, default=3)
     ap.add_argument("--splits", nargs="+", default=["pilot"])
-    ap.add_argument("--model-kind", choices=["stub", "claude"], default="stub")
+    ap.add_argument("--model-kind", choices=["stub", "claude", "muse"], default="stub")
     ap.add_argument("--binary", default="")
     ap.add_argument("--model", default="")
     ap.add_argument("--approved-cap", type=int, default=0)
@@ -152,6 +155,8 @@ def main(argv: Optional[list] = None) -> int:
     ap.add_argument("--fixed-concurrency", action="store_true",
                     help="keep --concurrency fixed (default above 1: start at 2, halve on a throttle or allowance refusal, double after "
                          "a clean window, never above --concurrency)")
+    from . import model_kind as mk
+    mk.add_arguments(ap, default_kind="stub")
     ap.add_argument("--amendment-ref", default="", help="a recorded deviation amendment that lets a built run with no question done "
                     "resume under a new commit")
     a = ap.parse_args(argv)

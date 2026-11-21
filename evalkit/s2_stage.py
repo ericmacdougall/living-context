@@ -38,8 +38,9 @@ def qref(qid: str) -> str:
 
 
 class Ledger:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, extra: Optional[dict] = None):
         self.path = Path(path)
+        self.extra = dict(extra or {})          # recorded in every row (the model kind and model id)
         self.rows: Dict[str, dict] = {}
         if self.path.exists():
             for line in self.path.read_text().splitlines():
@@ -50,6 +51,7 @@ class Ledger:
                 self.rows[r["qref"]] = r
 
     def append(self, row: dict) -> None:
+        row = {**self.extra, **row}
         with open(self.path, "a") as f:
             f.write(json.dumps(row, sort_keys=True) + "\n")
             f.flush()

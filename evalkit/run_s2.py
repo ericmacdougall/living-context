@@ -27,7 +27,7 @@ from living_context.embed import e5
 from living_context.model.budget import Budget, BudgetExceeded
 from living_context.model.port import PortRefused
 
-from . import arms, claude_cli, dataset as ds, parallel as par, s2_stage
+from . import arms, claude_cli, dataset as ds, model_kind as mk, parallel as par, s2_stage
 from .s2_ports import Journal, ResilientPort, StageLimited, StagePaused, StageStopped
 
 RC = {"COMPLETE": 0, "STOPPED": 3, "CAP_REACHED": 4, "BUILD_FAILED": 5, "PAUSED_THROTTLE": 75, "LIMIT_REACHED": 76, "ERROR": 1}
@@ -50,7 +50,7 @@ def run(a, pick_questions, *, embedder=None, runner=None, loader=None, tenant_fa
     if not stamp.exists():
         stamp.write_text(json.dumps({"stage": a.stage, "commit": a.commit, "cap": a.approved_cap, "approval_ref": a.approval_ref,
                                      "n_questions": a.n_questions, "a0_fields": a.a0_fields, "shuffled_n": int(getattr(a, "shuffled_n", 0) or 0), "embedder": e5.MODEL_ID,
-                                     "started": time.time()}, sort_keys=True))
+                                     **mk.record(a), "started": time.time()}, sort_keys=True))
     else:
         old = json.loads(stamp.read_text())
         if old.get("commit") != a.commit:        # `check_prereqs` allows this only for a run that never charged a call, or under a
@@ -103,9 +103,8 @@ def run(a, pick_questions, *, embedder=None, runner=None, loader=None, tenant_fa
         print("ingested %d sessions as %d leaves in %.0fs; es leaf count %d" % (len(sessions), n_leaves, time.time() - t0,
                                                                               et.leaf_count_in_es()), flush=True)
 
-    runner = runner or claude_cli.CliRunner(a.binary, a.model, run_dir / "cwd")
     budget = Budget(run_dir / "counter", a.approved_cap)
-    inner = claude_cli.CappedPort(runner, budget, run_dir / "calls.jsonl", model_id=a.model, argv_record=getattr(runner, "argv", lambda: [])())
+    inner = mk.capped_port(a, run_dir, budget, runner=runner)
     journal = Journal(run_dir / "journal.jsonl")
     n_par = int(getattr(a, "concurrency", 1) or 1)
     adaptive = n_par > 1 and not getattr(a, "fixed_concurrency", False)
@@ -115,7 +114,7 @@ def run(a, pick_questions, *, embedder=None, runner=None, loader=None, tenant_fa
         f.write(json.dumps({"at": time.time(), "commit": a.commit, "concurrency": n_par,
                             "concurrency_reason": getattr(a, "concurrency_reason", "") or "",
                             "amendment_ref": getattr(a, "amendment_ref", "") or "", "adaptive": adaptive}, sort_keys=True) + "\n")
-    ledger = s2_stage.Ledger(run_dir / "done.jsonl")
+    ledger = s2_stage.Ledger(run_dir / "done.jsonl", extra=mk.record(a))
     state, extra = "COMPLETE", {}
     try:
         if not resumed_built:
@@ -168,7 +167,8 @@ def run(a, pick_questions, *, embedder=None, runner=None, loader=None, tenant_fa
         raise
     extra.update(counter=budget.count(), cap=a.approved_cap, questions_done=len(ledger.rows), questions=len(dev), replayed=port.replayed,
                  fresh=port.fresh, lost_in_flight=port.lost, throttled=port.throttled,
-                 limited=port.limited, concurrency_now=port.slots.limit, concurrency_changes=port.slots.changes)
+                 limited=port.limited, concurrency_now=port.slots.limit, models_reported=sorted(inner.models_reported),
+                 concurrency_changes=port.slots.changes)
     if state == "COMPLETE":
         qids = [q.qid for q in dev if q.gold_session_ids and not q.is_abstention]
         out = run_dir / "results"
