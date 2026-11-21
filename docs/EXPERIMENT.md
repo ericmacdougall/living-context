@@ -1453,7 +1453,7 @@ The rest of 10.3 (S6-H2 and the loop stages) is not restated here.
   - The S3 run (disclosure): S3 started at commit afd0155, before the fixes of review F1 and F2 and of the Retry-After cap. On
     that commit, at a stop, a worker already waiting in the pacer could still charge and send one call (at most one per worker);
     such a call is recorded and counted in the cap like any other. A Retry-After above 600 s is waited 600 s per retry. Main's
-    operating rule (2026-11-21): the run is resumed only with the same arguments, so its worker count never crosses between one
+    operating rule: the run is resumed only with the same arguments, so its worker count never crosses between one
     and several (the case of review F2). The S6-H1 early build and the stamped run start from a commit with the fixes.
 - Fallbacks under load (review finding F7): with a real model, a timeout or a port error under load becomes a route fallback inside
   a finished question, so a result could depend on the concurrency. Every ledger row records, per arm (A1 and SHUFFLED), the
