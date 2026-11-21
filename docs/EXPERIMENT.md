@@ -1435,7 +1435,9 @@ The rest of 10.3 (S6-H2 and the loop stages) is not restated here.
     `--max-retries` times per call. Only the exponential back-off is capped (600 s); Retry-After is a minimum and is waited in
     full. A Retry-After above 3,600 s (ASSUMPTION: the longest wait a run sits through) stops the stage resumably at once, with no
     retry spent (PAUSED_THROTTLE, exit 75; STATE.json records the requested wait and when to resume). Each retry is one charged
-    call, inside the cap. A throttle is not a failure of the five-failure streak.
+    call, inside the cap. A throttle is not a failure of the five-failure streak. Retry-After is read in seconds or as an HTTP
+    date. While a call backs off, no other worker is charged or sends: the back-off is in force from the moment it is decided, and
+    a worker already past its pacer waits it out and takes a new pacer turn (review F3 of goodqa#16562).
   - Stops: a billing or budget refusal stops the stage at once, never retried. So does a response that reports another model than
     the one requested (or its pinned snapshot name), and so does the stop file. "At once" means no further call is charged or sent:
     a worker waiting in the pacer, in a back-off or at the charge is stopped before its charge (review F1).

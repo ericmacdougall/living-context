@@ -145,7 +145,8 @@ S3 (restarted) and S6-H1 run on Muse Spark: in every command above, and in S3's 
 - A 429, a 503 or OpenRouter's in-flight 402 backs off for at least Retry-After (per call, `--max-retries`) and is not a failure
   of the five-failure streak. Only the exponential back-off is capped; a Retry-After above 3,600 s stops the stage resumably
   (exit 75, STATE `PAUSED_THROTTLE` with the reason and `retry_after_s`): resume after the time STATE names. A stop file ends a
-  back-off or a pacer wait at once, before any further charge. A billing or budget refusal (402, OpenRouter's 403 with a limit
+  back-off or a pacer wait at once, before any further charge. Retry-After counts in seconds or as an HTTP date; no worker is
+  charged while another call backs off. A billing or budget refusal (402, OpenRouter's 403 with a limit
   source) or a reported model other than `--model` stops the stage at once (LIMIT_REACHED, exit 76): no further call is charged
   or sent, and the refused call is asked again on the resume. A 504, a timeout, any other error, and an answer cut short by
   `--max-tokens` (finish reason `length`) are failed calls, never answers.
