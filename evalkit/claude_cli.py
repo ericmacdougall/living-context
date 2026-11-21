@@ -233,7 +233,11 @@ class ApiReply:
 
 class Pacer:
     """Request starts spaced at least 60/rpm seconds apart across every worker of one run (one pacer per run), so the run sits
-    under a requests-per-minute limit instead of living on 429s. It only delays: what is asked and answered does not change."""
+    under a requests-per-minute limit instead of living on 429s. It only delays: what is asked and answered does not change. With a
+    `check` (the run's halt gate), the wait is slept in slices of at most `SLICE_S` and `check` runs before each one, so a stop
+    during the wait ends it at once, before any charge (review F1)."""
+    SLICE_S = 0.25
+
     def __init__(self, rpm: float, *, clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep):
         if not rpm or rpm <= 0:
             raise ValueError("rpm must be positive")
@@ -241,14 +245,22 @@ class Pacer:
         self._clock, self._sleep, self._lock, self._next = clock, sleep, threading.Lock(), None
         self.waited = 0.0
 
-    def wait(self) -> None:
+    def wait(self, check: Optional[Callable[[], None]] = None) -> None:
         with self._lock:
             now = self._clock()
             at = now if self._next is None else max(now, self._next)
             self._next = at + self.gap
             self.waited += at - now
-        if at > now:
-            self._sleep(at - now)
+        left = at - now
+        if check is None:
+            if left > 0:
+                self._sleep(left)
+            return
+        while left > 0:
+            check()
+            s = min(left, self.SLICE_S)
+            self._sleep(s)
+            left -= s
 
 
 def argv_for(binary: str, model: str) -> List[str]:
@@ -297,6 +309,11 @@ class CappedPort:
         self.providers_reported: set = set()          # the API kind: every upstream provider a response reported
         self.row_extra: Callable[[], dict] = dict        # set by ResilientPort: the effective concurrency at the time of the call
         self.on_charge: Callable[[int], None] = lambda n: None   # set by ResilientPort: journals the charge of the call in this thread
+        # set by ResilientPort, the run's shared halt gate (review F1): `admit(block)` raises when the stage is halted or the stop file
+        # is present (with block, it also waits out a back-off); `on_halt(exc)` halts every worker, called under the charge lock by a
+        # call that stops the stage, so no worker charges after it
+        self.admit: Callable[[bool], None] = lambda block: None
+        self.on_halt: Callable[[BaseException], None] = lambda exc: None
         self._log.parent.mkdir(parents=True, exist_ok=True)
 
     def _check_prompt(self, prompt: str) -> None:
@@ -306,6 +323,11 @@ class CappedPort:
             raise PortRefused("a gold-style id is in the prompt")
         if any(m and m in prompt for m in self._forbidden):
             raise PortRefused("a forbidden marker is in the prompt")
+
+    def _halting(self, exc: BaseException) -> BaseException:
+        """A call that stops the stage halts every worker before its lock is released (the caller holds `_lock`)."""
+        self.on_halt(exc)
+        return exc
 
     def _append(self, row: dict) -> None:
         self.rows.append(row)
@@ -318,11 +340,17 @@ class CappedPort:
         name = task.value
         prompt = render(name, inputs)
         self._check_prompt(prompt)            # before the counter: a refused prompt costs nothing
-        if self._pacer is not None:           # before the charge: a stop or halt during the wait costs nothing
-            self._pacer.wait()
+        if self._pacer is not None:           # the wait is part of the halt gate: a stop or halt during it ends it, uncharged
+            self._pacer.wait(check=lambda: self.admit(False))
+        self.admit(True)                      # after the wait: a stop, a halt or a back-off that began meanwhile
         with self._lock:                      # the charge and its bookkeeping are atomic; the process itself runs outside the lock
+            self.admit(False)                 # immediately before the charge, under the lock every stopping call halts under
             self.port_calls += 1
-            n = self._budget.charge()         # BEFORE the process; raises BudgetExceeded at the cap, nothing is spawned
+            try:
+                n = self._budget.charge()     # BEFORE the process; raises BudgetExceeded at the cap, nothing is spawned
+            except BudgetExceeded as e:
+                self.on_halt(e)
+                raise
             self.spawned += 1
         self.on_charge(n)                     # journaled before the process: a kill from here on leaves a charged call with no outcome
         ro = self._run(prompt)                # several processes may run at once (the caller bounds how many: `ResilientPort`)
@@ -343,7 +371,7 @@ class CappedPort:
             if self._fail_streak >= MAX_CLI_FAILURE_STREAK:
                 row.update(error="cli_error")
                 self._append(row)
-                raise StageLimited("%d consecutive CLI failures, last at call %d" % (self._fail_streak, n))
+                raise self._halting(StageLimited("%d consecutive CLI failures, last at call %d" % (self._fail_streak, n)))
             if THROTTLE.search(ro.stderr or "") or (ro.rc != 0 and THROTTLE.search(ro.stdout or "")):
                 row.update(throttled=True, error="throttled")
                 self._append(row)
@@ -395,11 +423,12 @@ class CappedPort:
             if rep.model_mismatch:
                 row.update(limited=True, error="model_mismatch")
                 self._append(row)
-                raise StageLimited("the response reported model %r, not the requested %r, at call %d" % (rep.model, self.model_id, n))
+                raise self._halting(StageLimited("the response reported model %r, not the requested %r, at call %d"
+                                                 % (rep.model, self.model_id, n)))
             if rep.limited:
                 row.update(limited=True, error="limit")
                 self._append(row)
-                raise StageLimited("quota or billing refusal (HTTP %s) at call %d" % (rep.status, n))
+                raise self._halting(StageLimited("quota or billing refusal (HTTP %s) at call %d" % (rep.status, n)))
             if rep.throttled:
                 row.update(throttled=True, error="throttled", retry_after_s=rep.retry_after_s)
                 self._append(row)
@@ -409,7 +438,7 @@ class CappedPort:
             if self._fail_streak >= MAX_CLI_FAILURE_STREAK:
                 row.update(error="api_error")
                 self._append(row)
-                raise StageLimited("%d consecutive API failures, last at call %d" % (self._fail_streak, n))
+                raise self._halting(StageLimited("%d consecutive API failures, last at call %d" % (self._fail_streak, n)))
             out = self._judge(name, inputs, rep.text, row)
             if failed:
                 row.update(error="timeout" if rep.error == "timeout" else "api_error", api_error=rep.error or "no_answer")

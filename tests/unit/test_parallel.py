@@ -458,7 +458,7 @@ class LostInFlight(unittest.TestCase):
                 port.scoped("qa").call(Task.ROUTE, route_inputs(1))      # charged; the process ends inside the call
 
             class Stuck:
-                def wait(self):
+                def wait(self, check=None):
                     raise Ended()
             inner._pacer = Stuck()
             with self.assertRaises(Ended):
@@ -493,7 +493,7 @@ class LostInFlight(unittest.TestCase):
             b_waiting, a_charged = threading.Event(), threading.Event()
 
             class Gate:                     # B writes its pending row before A charges, and charges after A took the last unit
-                def wait(self):
+                def wait(self, check=None):
                     if threading.current_thread().name == "B":
                         b_waiting.set()
                         a_charged.wait(5)

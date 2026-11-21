@@ -44,11 +44,19 @@ from living_context.model.port import CallContext, CallResult, PortRefused, Task
 from . import claude_cli
 from .claude_cli import AllowanceRefused, StageLimited, StagePaused
 
-__all__ = ["Journal", "JournalCorrupt", "read_resumable", "Tally", "ResilientPort", "ScopedPort", "ScopeRequired", "StageStopped", "StagePaused", "StageLimited", "BudgetExceeded"]
+__all__ = ["Journal", "JournalCorrupt", "NotAdmitted", "read_resumable", "Tally", "ResilientPort", "ScopedPort", "ScopeRequired", "StageStopped", "StagePaused", "StageLimited", "BudgetExceeded"]
 
 
 class StageStopped(Exception):
     """The stop file exists: the stage stops cleanly and is resumable."""
+
+
+class NotAdmitted(Exception):
+    """Raised inside the inner port when the shared halt gate refuses a call before its charge (review F1); `ResilientPort` journals
+    the call as uncharged and raises the halt itself (`exc`), so it is never mistaken for the inner port's own refusal or throttle."""
+    def __init__(self, exc: BaseException):
+        super().__init__(str(exc))
+        self.exc = exc
 
 
 class JournalCorrupt(Exception):
@@ -249,6 +257,8 @@ class ResilientPort:
         self._tls = threading.local()                           # the journal key of the call this thread is making
         if hasattr(inner, "on_charge"):                         # the inner port reports each charge, in the charging thread
             inner.on_charge = self._charged
+        if hasattr(inner, "admit"):                             # the inner port asks the gate again after its pacer, before its charge
+            inner.admit, inner.on_halt = self._admit, self.halt
         self._lost_keys = self._lost_in_flight(journal)
 
     def _charged(self, n: int) -> None:
@@ -283,25 +293,38 @@ class ResilientPort:
                 self._halt = exc
             self._gate.notify_all()
 
-    def _raise_halt(self) -> None:
+    def _halted(self) -> Optional[BaseException]:
+        """Under the gate: the halt in force (a fresh exception of its type), the stop file making one, or None."""
         h = self._halt
         if h is not None:
-            raise type(h)(str(h))
+            return type(h)(str(h))
+        if self.stop_requested():
+            self._halt = StageStopped("stop file present")
+            self._gate.notify_all()
+            return StageStopped("stop file present")
+        return None
 
-    def _wait_gate(self) -> None:
-        """Before every charge: no halt, no stop file, nobody backing off."""
+    def _wait_gate(self, inner: bool = False) -> None:
+        """Before every charge: no halt, no stop file, nobody backing off. Inside the inner port (`inner`) a refusal is NotAdmitted."""
         with self._gate:
             while True:
-                self._raise_halt()
-                if self.stop_requested():
-                    err = StageStopped("stop file present")
-                    if self._halt is None:
-                        self._halt = err
-                    self._gate.notify_all()
-                    raise err
+                err = self._halted()
+                if err is not None:
+                    raise NotAdmitted(err) if inner else err
                 if self._backing_off == 0:
                     return
                 self._gate.wait(0.5)
+
+    def _admit(self, block: bool) -> None:
+        """The inner port's admission (review F1): after its pacer wait (`block`, waiting out a back-off too), during that wait and
+        immediately before its charge (never blocking: it holds the charge lock then)."""
+        if block:
+            self._wait_gate(inner=True)
+            return
+        with self._gate:
+            err = self._halted()
+        if err is not None:
+            raise NotAdmitted(err)
 
     def call(self, task: Task, inputs: Mapping[str, Any], *, ctx: Optional[CallContext] = None, scope: Optional[str] = None) -> CallResult:
         """One logical call. A failed BUILD call is asked again, as a new charged call with its own journal key, up to
@@ -354,6 +377,10 @@ class ResilientPort:
                 self._tls.key = key
                 try:
                     res = self._inner.call(task, inputs, ctx=ctx)
+                except NotAdmitted as e:
+                    # halted or stopped while it waited in the pacer: never charged, never sent; a resume asks it again
+                    self.journal.append({"t": "uncharged", "key": key, "task": name, "error": "halted", "ts": self._clock()})
+                    raise e.exc from None
                 except PortRefused as e:
                     # a refused prompt is refused before the charge: close the key, so a resume asks it (and refuses it) again
                     self.journal.append({"t": "uncharged", "key": key, "task": name, "error": "PortRefused", "ts": self._clock()})

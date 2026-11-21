@@ -15,14 +15,15 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from evalkit import claude_cli as cc, model_kind as mk, muse_api as ma, run_h1, run_s2, run_s6h1 as rs
-from evalkit.s2_ports import Journal, ResilientPort
-from living_context.model.budget import Budget
+from evalkit.s2_ports import Journal, ResilientPort, StageStopped
+from living_context.model.budget import Budget, BudgetExceeded
 from living_context.model.port import Task
 from tests.security.test_run_s2_es import Runner
 from tests.unit import test_run_h1_guards as hg, test_run_s3_parallel as s3p, test_run_s6h1 as t6
@@ -295,7 +296,129 @@ class Port(unittest.TestCase):
             errs = in_threads([lambda w=w: port.scoped("q%d" % w).call(Task.ROUTE, route_inputs(w)) for w in range(4)])
             self.assertEqual(errs, [None] * 4)
             self.assertEqual(b.count(), 4)
-        self.assertEqual(sorted(slept), [1.0, 2.0, 3.0])           # 60 per minute: starts 1 s apart, shared across the 4 workers
+        # 60 per minute: starts 1 s apart, shared across the 4 workers (waits of 1, 2 and 3 s), each slept in slices the halt gate
+        # checks between (review F1)
+        self.assertEqual((pacer.waited, round(sum(slept), 6)), (6.0, 6.0))
+        self.assertTrue(slept and max(slept) <= cc.Pacer.SLICE_S)
+
+
+class FirstHeld(Upstream):
+    """The first request is held at the upstream until the test releases it: that worker is in flight, charged, while others queue."""
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.first_in, self.first_go, self._seen = threading.Event(), threading.Event(), False
+
+    def reply(self, path, headers, body):
+        with self.lock:
+            first, self._seen = not self._seen, True
+        if first:
+            self.first_in.set()
+            self.first_go.wait(10)
+        return super().reply(path, headers, body)
+
+
+def started(fn, name=None):
+    box = {}
+
+    def run():
+        try:
+            fn()
+        except BaseException as e:          # inspected by the test
+            box["err"] = e
+    t = threading.Thread(target=run, daemon=True, name=name)
+    t.start()
+    return t, box
+
+
+class PacedHalt(unittest.TestCase):
+    """Review F1: a worker waiting in the pacer when another worker's call stops the stage (a billing refusal, a reported model
+    mismatch, the cap) or the stop file appears is never charged and sends nothing: the pacer wait is part of the shared halt gate,
+    and admission is checked again immediately before the charge."""
+    def scene(self, tmp, cond, pacer):
+        up = FirstHeld(**({cond: (1,)} if cond in ("quota", "mismatch") else {}))
+        b, port, _ = port_over(self, tmp, up, concurrency=3, cap=1 if cond == "cap" else 1000)
+        port._inner._pacer = pacer                             # the first request starts at once, the next one waits
+        a, abox = started(lambda: port.scoped("qa").call(Task.ROUTE, route_inputs(1)))
+        self.assertTrue(up.first_in.wait(10))                  # A is charged and in flight
+        bt, bbox = started(lambda: port.scoped("qb").call(Task.ROUTE, route_inputs(2)))
+        return up, b, port, a, abox, bt, bbox
+
+    def trigger(self, tmp, cond, up, a):
+        if cond == "stop":
+            (Path(tmp) / "STOP").write_text("")
+        up.first_go.set()                                      # A's answer: the refusal or mismatch that stops the stage, or an answer
+        a.join(10)
+
+    def nothing_more(self, tmp, cond, up, b, bbox, port):
+        self.assertEqual((b.count(), up.n), (1, 1), cond)                       # no second charge and no second request
+        self.assertEqual((port.limited, port.throttled), (int(cond in ("quota", "mismatch")), 0), cond)   # B's halt is not its own
+        self.assertEqual(len(rows(tmp)), 1, cond)
+        self.assertIsInstance(bbox.get("err"), (cc.StageLimited, BudgetExceeded, StageStopped), cond)
+        qb = [json.loads(l) for l in (Path(tmp) / "journal.jsonl").read_text().splitlines() if json.loads(l)["key"].startswith("qb|")]
+        self.assertNotIn("charged", [r["t"] for r in qb], cond)                 # a resume asks it again; it was never charged
+
+    def test_a_worker_released_from_the_pacer_after_a_stop_is_not_charged_and_sends_nothing(self):
+        for cond in ("quota", "mismatch", "stop", "cap"):      # "cap" is a guard: the durable counter refused it before this fix too
+            with self.subTest(cond=cond), tempfile.TemporaryDirectory() as tmp:
+                held, release = threading.Event(), threading.Event()
+
+                def hold(s):
+                    held.set()
+                    release.wait(10)
+                # 240 a minute on a still clock: B's wait is one slice, held here, so it is the check AFTER the wait that refuses it
+                up, b, port, a, abox, bt, bbox = self.scene(tmp, cond, cc.Pacer(240, clock=lambda: 0.0, sleep=hold))
+                if cond != "cap":
+                    self.assertTrue(held.wait(10), cond)       # B is waiting in the pacer
+                self.trigger(tmp, cond, up, a)
+                release.set()                                  # B leaves the pacer after the stop
+                bt.join(10)
+                self.assertFalse(bt.is_alive(), cond)
+                self.nothing_more(tmp, cond, up, b, bbox, port)
+
+    def test_a_stop_ends_a_pacer_wait_at_once(self):
+        for cond in ("quota", "stop"):
+            with self.subTest(cond=cond), tempfile.TemporaryDirectory() as tmp:
+                up, b, port, a, abox, bt, bbox = self.scene(tmp, cond, cc.Pacer(1))   # 1 a minute: a real wait of about 60 s for B
+                self.trigger(tmp, cond, up, a)
+                bt.join(5)
+                self.assertFalse(bt.is_alive(), cond)          # it does not sleep out the minute
+                self.nothing_more(tmp, cond, up, b, bbox, port)
+
+    def test_a_call_that_stops_the_stage_halts_the_others_before_its_charge_lock_is_released(self):
+        # B reaches the charge lock while A, holding it, records its mismatch: when A releases it, B must already see the halt
+        for cond in ("quota", "mismatch"):
+            with self.subTest(cond=cond), tempfile.TemporaryDirectory() as tmp:
+                up = Upstream(**{cond: (1,)})
+                b, port, _ = port_over(self, tmp, up, concurrency=2)
+                inner, b_at_lock, box = port._inner, threading.Event(), {}
+
+                class AtLock:
+                    def __init__(self, real):
+                        self.real = real
+
+                    def __enter__(self):
+                        if threading.current_thread().name == "B":
+                            b_at_lock.set()
+                        return self.real.__enter__()
+
+                    def __exit__(self, *x):
+                        return self.real.__exit__(*x)
+                inner._lock = AtLock(inner._lock)
+                append = inner._append
+
+                def a_records(row):              # A holds the charge lock here; B is sent to it and given time to block on it
+                    if threading.current_thread().name == "A" and "bt" not in box:
+                        box["bt"], box["bbox"] = started(lambda: port.scoped("qb").call(Task.ROUTE, route_inputs(2)), "B")
+                        self.assertTrue(b_at_lock.wait(10))
+                        time.sleep(0.3)
+                    append(row)
+                inner._append = a_records
+                a, abox = started(lambda: port.scoped("qa").call(Task.ROUTE, route_inputs(1)), "A")
+                a.join(10)
+                box["bt"].join(10)
+                self.assertIsInstance(abox.get("err"), cc.StageLimited, cond)
+                self.assertIsInstance(box["bbox"].get("err"), cc.StageLimited, cond)
+                self.assertEqual((b.count(), up.n), (1, 1), cond)
 
 
 @mock.patch.object(rs, "EXPECTED_LEAVES", 1)
