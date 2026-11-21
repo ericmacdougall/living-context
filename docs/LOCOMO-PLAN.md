@@ -147,4 +147,9 @@ pool this small.
 
 ## Amendments
 
-(none)
+### Amendment 1 (2026-11-21, before any arm ran, no result seen)
+
+The leaf counts in section 9 were computed without the session-date prefix that section 3 specifies. With the prefix, the segmenter
+gives 34, 25, 47, 42, 52, 60, 49, 50, 36, 43 leaves per conversation (file order), 438 in all (the table said 437). The unit
+test `RealFile.test_registered_counts` found the difference. Nothing else in the plan changes: the rule (prefix on, caps on) is the
+registered one and the counts follow from it.
