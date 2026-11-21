@@ -48,14 +48,25 @@ REFUSALS = {"a malformed 200": (200, {}), "a foreign 200": (200, ack("gr:tok-som
 
 class FakeAuthz:
     """The authz index of one tenant: a PUT lands (well-formed acknowledgement) unless `refuse` is set, when it answers `refuse` and
-    writes nothing. A scan (PIT, one search page, PIT close) returns every stored grant."""
+    writes nothing, or `hold` is set, when it answers a 503 and the write lands later (`land_late`: a write that timed out at the
+    client and still reached the index). A scan (PIT, one search page, PIT close) returns every stored grant."""
 
     def __init__(self):
         self.docs, self.refuse, self.seq, self.refused, self.search_down = {}, None, 0, 0, False
+        self.hold, self.late = False, []
+
+    def land_late(self):
+        for did, body in self.late:
+            self.seq += 1
+            self.docs[did] = body
+        self.late = []
 
     def request(self, method, path, body=None, **kw):
         if method == "PUT" and "/_doc/" in path:
             did = path.split("/_doc/")[1].split("?")[0]
+            if self.hold:
+                self.late.append((did, body))
+                return 503, {}
             if self.refuse is not None:
                 self.refused += 1
                 return self.refuse
@@ -94,8 +105,13 @@ class Node:
     def __init__(self, test, w, **admin_kw):
         self.fence = SendFence()
         self.epochs = EpochTable(lambda t: self.fence)
-        self.rt = start_tenant(T, gate=Gate(w.authz), epochs=self.epochs, keystore=w.ks, **w.dirs)
+        # the two start orders: the journal replayed before the copy is read back (`start_journal=True`), or the composition root's
+        # (`app.start_app`: the copy is read back, then the caller starts the journal)
+        self.rt = start_tenant(T, gate=Gate(w.authz), epochs=self.epochs, keystore=w.ks, start_journal=w.order == "journal first",
+                               **w.dirs)
         test.addCleanup(lambda: self.rt.revocation._j and self.rt.revocation._j.close())
+        if w.order == "copy first":
+            self.rt.revocation.start()
         self.admin = Admin(self.rt.grants, self.epochs, {T: LAT}, lambda t: self.rt.revocation, tok, **admin_kw)
         self.sessions = Sessions({T: Idp()}, self.epochs, tok, lambda t, p: self.rt.grants.get(t, p))
 
@@ -103,12 +119,15 @@ class Node:
         return self.rt.grants.get(T, tok(T, who))
 
 
+ORDERS = ("journal first", "copy first")
+
+
 class World:
-    def __init__(self, test, **admin_kw):
+    def __init__(self, test, order="journal first", **admin_kw):
         tmp = tempfile.TemporaryDirectory()
         test.addCleanup(tmp.cleanup)
         d = Path(tmp.name)
-        self.test, self.admin_kw = test, admin_kw
+        self.test, self.admin_kw, self.order = test, admin_kw, order
         self.dirs = dict(epoch_dir=d / "epochs", tombstone_paths=(d / "tomb" / "t.log", d / "tomb-replica" / "t.log"),
                          holds_path=d / "holds" / "h.json")
         epoch_journal.provision(self.dirs["epoch_dir"], 16384)
@@ -179,9 +198,9 @@ class AReductionHoldsAcrossARestart(unittest.TestCase):
     def test_a_reduction_whose_authz_write_is_refused_holds_after_compaction_and_a_restart(self):
         for name, reduce in REDUCTIONS.items():
             for answer, refusal in REFUSALS.items():
-                for how in ("clean", "crash"):
-                    with self.subTest(reduction=name, answer=answer, restart=how):
-                        w = World(self)
+                for how, order in ((h, o) for h in ("clean", "crash") for o in ORDERS):
+                    with self.subTest(reduction=name, answer=answer, restart=how, order=order):
+                        w = World(self, order)
                         w.authz.refuse = refusal
                         self.assertTrue(reduce(w.node).get("ok"))
                         self.assertGreaterEqual(w.authz.refused, 1, "the reduction wrote nothing to refuse")
@@ -197,9 +216,9 @@ class AReductionHoldsAcrossARestart(unittest.TestCase):
                         self.assertEqual(len(w.journal_reductions()), 1, "compaction dropped an unconfirmed reduction")
 
     def test_the_record_is_written_before_the_answer_a_crash_before_any_compaction_keeps_it(self):
-        for name, reduce in REDUCTIONS.items():
-            with self.subTest(reduction=name):
-                w = World(self)
+        for name, reduce, order in ((n, r, o) for n, r in REDUCTIONS.items() for o in ORDERS):
+            with self.subTest(reduction=name, order=order):
+                w = World(self, order)
                 w.authz.refuse = (503, {})
                 self.assertTrue(reduce(w.node).get("ok"))
                 w.authz.refuse = None
@@ -209,9 +228,9 @@ class AReductionHoldsAcrossARestart(unittest.TestCase):
     def test_a_failed_start_up_read_confirms_nothing(self):
         # a start-up whose read of the authz copy failed holds no grants (fail closed) and proves nothing about the copy: the record
         # must outlive it, its compaction and its stop, and narrow the grant at the next start that reads the copy
-        for name, reduce in REDUCTIONS.items():
-            with self.subTest(reduction=name):
-                w = World(self)
+        for name, reduce, order in ((n, r, o) for n, r in REDUCTIONS.items() for o in ORDERS):
+            with self.subTest(reduction=name, order=order):
+                w = World(self, order)
                 w.authz.refuse = (503, {})
                 self.assertTrue(reduce(w.node).get("ok"))
                 w.authz.refuse, w.authz.search_down = None, True
@@ -220,6 +239,36 @@ class AReductionHoldsAcrossARestart(unittest.TestCase):
                 w.authz.search_down = False
                 w.restart("clean")
                 self.reduced(w, f"{name}, after a start-up whose read failed")
+
+    def test_a_late_write_of_a_stopped_process_never_confirms_a_later_reduction(self):
+        # process 1: the class removal's write is refused; two additions follow whose writes time out and land after process 1 has
+        # stopped. Process 2 narrows the grant (the journalled removal) and takes a further class away, refused too. When the late
+        # writes land, the copy holds the wider grant of process 1 under a revision of process 1, which must not confirm process 2's
+        # reduction.
+        for order in ORDERS:
+            with self.subTest(order=order):
+                w = World(self, order)
+                w.authz.refuse = (503, {})
+                self.assertTrue(remove_restricted(w.node).get("ok"))
+                w.authz.refuse, w.authz.hold = None, True
+                n = w.node
+                for write in ([], ["base"]):
+                    self.assertTrue(n.admin.grant(n.get("a1"), T, LAT, "r1", {"grant_roles": ["reader"], "read": ["base", "restricted"],
+                                                                              "write": write}).get("ok"))
+                self.assertEqual(len(w.authz.late), 2)
+                w.authz.hold = False
+                w.restart("crash", compact=False)
+                self.assertEqual(w.node.get("r1").read_set, frozenset({"base"}))
+                w.authz.refuse = (503, {})
+                n = w.node
+                self.assertTrue(n.admin.remove_class(n.get("a1"), T, LAT, "r1", "base").get("ok"))
+                w.authz.refuse = None
+                w.authz.land_late()
+                self.assertEqual(w.authz.docs["gr:tok-r1"]["read"], ["base", "restricted"])   # the copy now holds the late, wider grant
+                w.restart("clean")
+                g = w.node.get("r1")
+                self.assertEqual((g.read_set, g.write_set), (frozenset(), frozenset()), "a late write of a stopped process undid a "
+                                                                                          "later reduction")
 
     def test_control_a_confirmed_write_drops_the_record_and_the_reduction_still_holds(self):
         for name, reduce in REDUCTIONS.items():
@@ -299,6 +348,20 @@ class TheTenantClosed(unittest.TestCase):
                 self.assertNotEqual(svc.state, OPEN)
                 self.assertNotIn("restricted", w.node.get("r1").read_set)   # memory holds the reduction (fail safe)
 
+    def test_a_reduction_whose_epoch_bump_fails_is_undone_and_raises(self):
+        swap = lambda n: n.admin.grant(n.get("a1"), T, LAT, "r1", {"grant_roles": ["reader"], "read": ["base"], "write": ["base"]})
+        for name, reduce in dict(REDUCTIONS, swap=swap).items():
+            with self.subTest(reduction=name):
+                w = World(self)
+                before = w.node.get("r1")
+
+                def bump(principal):
+                    raise Refused("planted: the tenant closed between the reduction and its epoch bump")
+                w.node.rt.revocation.bump = bump
+                with self.assertRaises(Refused):
+                    reduce(w.node)
+                self.assertEqual(w.node.get("r1"), before, "the change was not undone")
+
     def test_a_closed_tenant_refuses_a_reduction_and_changes_nothing(self):
         w = World(self)
         w.node.rt.revocation.clean_stop()
@@ -349,19 +412,40 @@ class GrantStoreRules(unittest.TestCase):
 
     def test_replay_narrows_a_stale_copy_and_never_a_newer_one(self):
         rec = {"t": "grant_reduce", "principal": "tok-x", "roles": ["reader"], "read": ["base"], "write": [], "own_class": "", "rev": 4}
-        for copy_rev, narrowed in ((3, True), (4, False), (5, False)):
-            with self.subTest(copy_rev=copy_rev):
-                st = GrantStore()
-                st.attach(T, self.journal())
-                st.apply_record(T, rec)            # the journal replays first (start_journal=True) ...
-                st.restore(self.P, copy_rev)       # ... then the copy is read back
-                st.loaded(T)
-                g = st.get(T, "tok-x")
-                self.assertEqual(g == self.P, not narrowed)
-                if narrowed:
-                    self.assertEqual((g.roles, g.read_set, g.write_set, g.own_class), (frozenset({Role.READER}), frozenset({"base"}),
-                                                                                       frozenset(), None))
-                self.assertEqual(len(st.snapshot_records(T)), 1 if narrowed else 0)
+        reduced = Principal(T, "tok-x", frozenset({Role.READER}), frozenset({"base"}), frozenset(), None)
+        # an equal revision confirms only with exactly the reduced grant: a write that a stopped process sent under that revision may
+        # hold a wider one
+        for copy, copy_rev, narrowed in ((self.P, 3, True), (self.P, 4, True), (reduced, 4, False), (self.P, 5, False)):
+            for replay_first in (True, False):
+                with self.subTest(copy_rev=copy_rev, copy_is_the_reduced_grant=copy == reduced, replay_first=replay_first):
+                    st = GrantStore()
+                    st.attach(T, self.journal())
+                    if replay_first:
+                        st.apply_record(T, rec)    # the journal replays first (start_journal=True) ...
+                    st.restore(copy, copy_rev)     # ... the copy is read back
+                    st.loaded(T)
+                    if not replay_first:
+                        st.apply_record(T, rec)    # the composition root's order: the journal starts after the read
+                    g = st.get(T, "tok-x")
+                    self.assertEqual(g, reduced if narrowed else copy)
+                    self.assertEqual(len(st.snapshot_records(T)), 1 if narrowed else 0)
+                    st.loaded(T)                   # settling again changes nothing (memory is narrowed; the copy is not)
+                    self.assertEqual(len(st.snapshot_records(T)), 1 if narrowed else 0)
+
+    def test_a_revision_is_never_reused_across_a_restart(self):
+        now = [5.0]
+        st = GrantStore(persist=lambda p, rev: None, clock=lambda: now[0])
+        st.put(self.P)
+        first = st._rev[(T, "tok-x")]
+        self.assertEqual(first, 5_000_000)
+        now[0] = 1.0                               # a clock behind the last revision: the revision still moves forward
+        st.put(Principal(T, "tok-x", self.P.roles | {Role.WRITER}, self.P.read_set, self.P.write_set, self.P.own_class))
+        self.assertEqual(st._rev[(T, "tok-x")], first + 1)
+        now[0] = 9.0                               # a later process: past the time, not only past what it read back
+        later = GrantStore(persist=lambda p, rev: None, clock=lambda: now[0])
+        later.restore(self.P, first)
+        later.put(Principal(T, "tok-x", self.P.roles | {Role.WRITER}, self.P.read_set, self.P.write_set, self.P.own_class))
+        self.assertEqual(later._rev[(T, "tok-x")], 9_000_000)
 
     def test_only_a_complete_read_confirms_the_reduction_of_a_principal_the_copy_does_not_hold(self):
         rec = {"t": "grant_reduce", "principal": "tok-x", "roles": ["reader"], "read": ["base"], "write": [], "own_class": "", "rev": 2}
@@ -377,8 +461,9 @@ class GrantStoreRules(unittest.TestCase):
         st = GrantStore(persist=lambda p, rev: sent.append(rev))
         st.put(self.P)
         with self.assertRaises(RuntimeError):
-            st._persist_at(self.P, 0)   # revision 0 is older than the grant in memory (1)
-        self.assertEqual(sent, [1])
+            st._persist_at(self.P, 0)   # revision 0 is older than the grant in memory
+        self.assertEqual(len(sent), 1)
+        self.assertGreater(sent[0], 0)
         self.assertEqual(st.persist_failures, 1)
 
 

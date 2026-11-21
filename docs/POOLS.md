@@ -1126,7 +1126,8 @@ Conflicts (quote, then the resolving edit):
 - DESIGN 4.4 removal of a class grant bumps the epoch; pool access removal is the
   journalled record of 2.5 instead. The same restart gap exists for class-grant
   removal (a removed class grant re-read from best-effort authz on a re-mint);
-  the edit applies the journal record to class-grant removal too.
+  the edit applies the journal record to class-grant removal too (built in review
+  round 7: `admin.GrantStore.reduce` journals every grant reduction before the answer).
 - DESIGN 4.4 `J_SIZE = 4 MiB`: 16 MiB, with `J_SOFT` and the principal-closed
   record (2.5 arithmetic).
 - DESIGN 4.4 break-glass recovery rebuilds from the journal and authz and
