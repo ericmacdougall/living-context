@@ -20,13 +20,14 @@ class Inner:
     """Charges the durable counter BEFORE acting, like the real port; `script` maps call number to an action."""
     def __init__(self, budget, script=None, default=None):
         self.b, self.script, self.default, self.calls = budget, script or {}, default, 0
+        self.on_charge = lambda n: None             # set by ResilientPort, called right after the charge (as CappedPort does)
 
     def call(self, task, inputs, *, ctx=None):
         self.calls += 1
         act = self.script.get(self.calls, self.default)
         if act == "kill_before_charge":
             raise Kill()
-        self.b.charge()
+        self.on_charge(self.b.charge())
         if act == "kill_after_charge":
             raise Kill()
         if act == "throttle":

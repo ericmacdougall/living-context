@@ -296,6 +296,7 @@ class CappedPort:
         self.models_reported: set = set()             # the API kind: every model id a response reported
         self.providers_reported: set = set()          # the API kind: every upstream provider a response reported
         self.row_extra: Callable[[], dict] = dict        # set by ResilientPort: the effective concurrency at the time of the call
+        self.on_charge: Callable[[int], None] = lambda n: None   # set by ResilientPort: journals the charge of the call in this thread
         self._log.parent.mkdir(parents=True, exist_ok=True)
 
     def _check_prompt(self, prompt: str) -> None:
@@ -323,6 +324,7 @@ class CappedPort:
             self.port_calls += 1
             n = self._budget.charge()         # BEFORE the process; raises BudgetExceeded at the cap, nothing is spawned
             self.spawned += 1
+        self.on_charge(n)                     # journaled before the process: a kill from here on leaves a charged call with no outcome
         ro = self._run(prompt)                # several processes may run at once (the caller bounds how many: `ResilientPort`)
         if isinstance(ro, ApiReply):
             return self._api(name, inputs, prompt, n, ro)

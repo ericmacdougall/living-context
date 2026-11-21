@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from living_context.model.budget import Budget, BudgetExceeded
-from living_context.model.port import CallContext, CallResult, Task
+from living_context.model.port import CallContext, CallResult, PortRefused, Task
 
 from . import claude_cli
 from .claude_cli import AllowanceRefused, StageLimited, StagePaused
@@ -56,6 +56,7 @@ class Journal:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.results: Dict[str, dict] = {}
+        self.tail: Dict[str, dict] = {}         # the last row of every key
         self.rows = 0
         self.last: Optional[dict] = None
         self._lock = threading.Lock()
@@ -69,6 +70,8 @@ class Journal:
                     break
                 self.rows += 1
                 self.last = row
+                if "key" in row:
+                    self.tail[row["key"]] = row
                 if row.get("t") == "result":
                     self.results[row["key"]] = row
 
@@ -80,6 +83,8 @@ class Journal:
                 os.fsync(f.fileno())
             self.rows += 1
             self.last = row
+            if "key" in row:
+                self.tail[row["key"]] = row
             if row.get("t") == "result":
                 self.results[row["key"]] = row
 
@@ -175,7 +180,15 @@ class ResilientPort:
         # workers x retries). Throttles stay per call: a burst of 429s in flight together halves the limit and goes on.
         self._refused = 0
         self.delays: List[float] = []
-        self._lost_keys = self._lost_in_flight(journal, budget.count())
+        self._tls = threading.local()                           # the journal key of the call this thread is making
+        if hasattr(inner, "on_charge"):                         # the inner port reports each charge, in the charging thread
+            inner.on_charge = self._charged
+        self._lost_keys = self._lost_in_flight(journal)
+
+    def _charged(self, n: int) -> None:
+        key = getattr(self._tls, "key", None)
+        if key is not None:
+            self.journal.append({"t": "charged", "key": key, "n": n, "ts": self._clock()})
 
     def _bump(self) -> int:
         with self._lock:
@@ -183,22 +196,13 @@ class ResilientPort:
             return self._refused
 
     @staticmethod
-    def _lost_in_flight(journal: Journal, count: int) -> set:
-        """Keys whose last journal row is `pending`: charged or about to be when the run was killed. They are answered as lost (never
-        asked again) when the counter moved past the earliest of them; with one worker this is exactly the single tail row rule."""
-        last: Dict[str, dict] = {}
-        if journal.path.exists():
-            for line in journal.path.read_text().splitlines():
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    break
-                if "key" in row:
-                    last[row["key"]] = row
-        pend = {k: r for k, r in last.items() if r.get("t") == "pending"}
-        if not pend or count <= min(r.get("count_before", 0) for r in pend.values()):
-            return set()
-        return set(pend)
+    def _lost_in_flight(journal: Journal) -> set:
+        """Keys whose last journal row is `charged`: the call was charged and the run ended before its outcome was written. They are
+        answered as lost (never asked again: the charge is spent). Nothing else is lost: a key whose last row is `pending` was never
+        charged (it waited for a slot or the pacer, or was refused before the charge, which also writes `uncharged`) and is asked
+        again. A kill between the charge and its journal row (an fsync apart) asks that one call again, charged and counted twice;
+        a journal written before charges were journaled has no lost keys, and its pending calls are asked again the same way."""
+        return {k for k, r in journal.tail.items() if r.get("t") == "charged"}
 
     def scoped(self, scope: str) -> ScopedPort:
         return ScopedPort(self, str(scope))
@@ -281,8 +285,13 @@ class ResilientPort:
                 self._wait_gate()                 # a halt or back-off may have started while this worker waited for a slot
                 self.journal.append({"t": "pending", "key": key, "task": name, "count_before": self._budget.count(),
                                      "concurrency": self.slots.limit, "ts": self._clock()})
+                self._tls.key = key
                 try:
                     res = self._inner.call(task, inputs, ctx=ctx)
+                except PortRefused as e:
+                    # a refused prompt is refused before the charge: close the key, so a resume asks it (and refuses it) again
+                    self.journal.append({"t": "uncharged", "key": key, "task": name, "error": "PortRefused", "ts": self._clock()})
+                    raise
                 except AllowanceRefused as e:
                     with self._lock:
                         self.limited += 1
@@ -313,10 +322,13 @@ class ResilientPort:
                     paused, retry_after = True, getattr(e, "retry_after_s", None)
                 except BudgetExceeded as e:
                     # nothing was charged beyond the cap and nothing is retried; no other worker charges after it
+                    self.journal.append({"t": "uncharged", "key": key, "task": name, "error": "BudgetExceeded", "ts": self._clock()})
                     self.halt(e)
                     raise
                 else:
                     paused = False
+                finally:
+                    self._tls.key = None
             finally:
                 self.slots.release()
             if paused:

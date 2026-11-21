@@ -29,9 +29,10 @@ class Kill(BaseException):
 class Inner:
     def __init__(self, budget, kill_after_charge=None):
         self.b, self.backend, self.n, self.kill_after = budget, StubBackend(), 0, kill_after_charge
+        self.on_charge = lambda n: None             # set by ResilientPort, called right after the charge (as CappedPort does)
 
     def call(self, task, inputs, *, ctx=None):
-        self.b.charge()
+        self.on_charge(self.b.charge())
         self.n += 1
         if self.kill_after is not None and self.b.count() == self.kill_after:
             raise Kill()

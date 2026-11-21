@@ -15,7 +15,7 @@ from evalkit.s2_ports import Journal, ResilientPort, ScopeRequired, StagePaused,
 from living_context.config import Constants
 from living_context.ids import IdGenerator
 from living_context.model.budget import Budget, BudgetExceeded
-from living_context.model.port import CallResult, Task
+from living_context.model.port import CallResult, PortRefused, Task
 from living_context.model.cache import DictStore
 from living_context.model.port import ModelPort
 from living_context.model.stub import StubBackend
@@ -306,9 +306,11 @@ class FakeInner:
     """A charged inner port whose answer carries its charge number (a stochastic model answers differently each time)."""
     def __init__(self, budget, delay=0.0):
         self.b, self.delay, self.calls = budget, delay, 0
+        self.on_charge = lambda n: None             # set by ResilientPort, called right after the charge (as CappedPort does)
 
     def call(self, task, inputs, *, ctx=None):
         n = self.b.charge()
+        self.on_charge(n)
         self.calls += 1
         time.sleep(self.delay)
         return CallResult(True, {"n": n})
@@ -409,7 +411,8 @@ class Port(unittest.TestCase):
             b = Budget(tmp / "counter", 100)
             for _ in range(5):
                 b.charge()
-            rows = [{"t": "pending", "key": "q%d|k:0" % i, "task": "route", "count_before": 2 + i, "ts": 0} for i in range(3)]
+            rows = [r for i in range(3) for r in ({"t": "pending", "key": "q%d|k:0" % i, "task": "route", "count_before": 2 + i, "ts": 0},
+                                                  {"t": "charged", "key": "q%d|k:0" % i, "n": 3 + i, "ts": 0})]
             (tmp / "j.jsonl").write_text("".join(json.dumps(x) + "\n" for x in rows))
             p = ResilientPort(FakeInner(b), b, Journal(tmp / "j.jsonl"), tmp / "STOP", concurrency=3,
                               render=lambda name, i: "k")
@@ -434,6 +437,104 @@ class Port(unittest.TestCase):
                 outs = [p.scoped("q%d" % i).call(Task.ROUTE, {}) for i in range(2)]
             self.assertTrue(all(o.ok for o in outs))
             self.assertEqual(b.count(), 4)
+
+
+class Ended(BaseException):
+    """The process ends here (killed): nothing after this point runs."""
+
+
+class LostInFlight(unittest.TestCase):
+    """A call is lost on resume (answered lost_in_flight, never asked again) only when its charge was journaled and no outcome
+    followed. Anything refused or interrupted before its charge is asked again, however far the counter moved meanwhile."""
+
+    def test_a_charged_call_in_flight_is_lost_and_a_call_still_waiting_at_the_pacer_is_asked_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+
+            def ends(prompt):
+                raise Ended()
+            b, inner, port = capped(tmp, ends, concurrency=2)
+            with self.assertRaises(Ended):
+                port.scoped("qa").call(Task.ROUTE, route_inputs(1))      # charged; the process ends inside the call
+
+            class Stuck:
+                def wait(self):
+                    raise Ended()
+            inner._pacer = Stuck()
+            with self.assertRaises(Ended):
+                port.scoped("qb").call(Task.ROUTE, route_inputs(2))      # pending; the process ends at the pacer, before its charge
+            self.assertEqual(b.count(), 1)
+            b2, _, p2 = capped(tmp, SafeRunner(), concurrency=2)
+            a = p2.scoped("qa").call(Task.ROUTE, route_inputs(1))
+            c = p2.scoped("qb").call(Task.ROUTE, route_inputs(2))
+            self.assertEqual((a.ok, a.error, c.ok, b2.count(), p2.lost), (False, "lost_in_flight", True, 2, 1))
+
+    def test_a_refused_prompt_is_asked_again_on_resume_after_the_counter_moved_on(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            b = Budget(tmp / "counter", 100)
+            bad = dict(route_inputs(2), query="question 2 FORBIDDEN-MARKER")
+
+            def port():
+                inner = cc.CappedPort(SafeRunner(), b, tmp / "calls.jsonl", model_id="m", forbidden=("FORBIDDEN-MARKER",))
+                return ResilientPort(inner, b, Journal(tmp / "journal.jsonl"), tmp / "STOP", concurrency=2)
+            p1 = port()
+            with self.assertRaises(PortRefused):
+                p1.scoped("qb").call(Task.ROUTE, bad)
+            self.assertTrue(p1.scoped("qa").call(Task.ROUTE, route_inputs(1)).ok)    # the counter moves past the refused call
+            p2 = port()
+            with self.assertRaises(PortRefused):                    # asked (and refused) again, not answered lost_in_flight
+                p2.scoped("qb").call(Task.ROUTE, bad)
+            self.assertEqual((p2.lost, b.count()), (0, 1))
+
+    def test_a_call_refused_at_the_cap_while_another_took_the_last_charge_is_asked_again_on_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            b_waiting, a_charged = threading.Event(), threading.Event()
+
+            class Gate:                     # B writes its pending row before A charges, and charges after A took the last unit
+                def wait(self):
+                    if threading.current_thread().name == "B":
+                        b_waiting.set()
+                        a_charged.wait(5)
+                    else:
+                        b_waiting.wait(5)
+            ok = SafeRunner()
+
+            def runner(prompt):
+                a_charged.set()
+                return ok(prompt)
+            b, inner, port = capped(tmp, runner, cap=1, concurrency=2)
+            inner._pacer = Gate()
+            errs = {}
+
+            def ask(name, i):
+                try:
+                    port.scoped("q" + name).call(Task.ROUTE, route_inputs(i))
+                except BaseException as e:      # collected and inspected below
+                    errs[name] = e
+            ts = [threading.Thread(target=ask, args=(n, i), name=n) for n, i in (("A", 1), ("B", 2))]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+            self.assertIsInstance(errs.get("B"), BudgetExceeded)
+            self.assertEqual(b.count(), 1)
+            b2, _, p2 = capped(tmp, SafeRunner(), cap=2, concurrency=2)
+            out = p2.scoped("qB").call(Task.ROUTE, route_inputs(2))
+            self.assertEqual((out.ok, p2.lost, b2.count()), (True, 0, 2))
+
+    def test_after_an_allowance_refusal_or_a_throttle_halt_the_refused_call_is_asked_again(self):
+        for runner, kw in ((LimitAt(at=(2,)), {}), (SafeRunner(throttle=(2,)), {"max_retries": 0})):
+            with tempfile.TemporaryDirectory() as tmp:
+                b, _, p1 = capped(tmp, runner, concurrency=2, **kw)
+                self.assertTrue(p1.scoped("qa").call(Task.ROUTE, route_inputs(1)).ok)
+                with self.assertRaises((cc.StageLimited, StagePaused)):
+                    p1.scoped("qb").call(Task.ROUTE, route_inputs(2))
+                self.assertTrue(p1.journal.tail)
+                b2, _, p2 = capped(tmp, SafeRunner(), concurrency=2)
+                out = p2.scoped("qb").call(Task.ROUTE, route_inputs(2))
+                self.assertEqual((out.ok, p2.lost, b2.count()), (True, 0, 3), type(runner).__name__)
 
 
 # ---- the build ----------------------------------------------------------------------------------------------------------------------
