@@ -195,7 +195,8 @@ class IsolationOnElasticsearch(unittest.TestCase):
         self.assertEqual(before, after)
 
     def test_t3_broken_gateway_that_forwards_a_sub_response_is_caught(self):
-        bad = Forwarding(self.es, self.sessions, {t: LAT for t in TENANTS}, writers=lambda t: self.writers[t])
+        bad = Forwarding(self.es, self.sessions, {t: LAT for t in TENANTS}, writers=lambda t: self.writers[t],
+                         admits=lambda t: True)   # as `cls.gw`: no epoch journal here, admission is explicit (F1 has no fail-open default)
         for ix in ("lc-tenb-base-leaf", "lc-tenb-base-alias"):
             r = bad.handle(self.tok["tena"], {"op": "lookup", "index": ix})
             self.assertIn("lc-tenb", json.dumps(r), ix)  # the leak the clean checks must see
