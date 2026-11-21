@@ -239,7 +239,9 @@ does:
 - Compaction keeps a pool-grant record until a write of that grant made after
   the removal has landed. A read of the authz index never confirms a removal: a
   start-up writes each unconfirmed grant again and confirms it only when that
-  write lands. Compaction keeps a detach record while the pool is detached, and a
+  write lands. A removal on a pool that has been erased is dropped instead, so
+  no record of the erased pool is written back. Compaction keeps a detach record
+  while the pool is detached, and a
   token-revoke record until its `exp` passes, at most `TOKEN_TTL` after the
   revoke. Bound: a principal holds at most `TOK_LIVE_MAX` tokens whose `exp` has
   not passed, revoked or not (2.6), so it has at most `TOK_LIVE_MAX` revoke

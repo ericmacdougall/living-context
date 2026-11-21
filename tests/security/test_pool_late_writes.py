@@ -15,8 +15,10 @@ on the real cluster. Everything else is the real code: the pool service, the epo
 import tempfile
 import threading
 import unittest
+from types import SimpleNamespace
 
 from living_context.gateway.sessions import TokenError
+from living_context.policy import Principal, Role
 from tests.security.test_pool_tokens import T, World, q
 
 
@@ -182,6 +184,43 @@ class MarkedConfirmation(unittest.TestCase):
             self.assertEqual(w.dir.live_ops(T, "pt-user-alice", a), frozenset(), "the removed grant came back")
             with self.assertRaises(TokenError):
                 w.mint("alice", {a: q("query")}, conv="after")
+            w.rev.clean_stop()
+
+
+class ErasedPool(unittest.TestCase):
+    """A removal still unconfirmed when its pool is deleted is not written again at the next start: the erasure removed every record
+    of the pool, and a start-up write would put a record naming the pool and the principal back into the copy. Start-up never restores
+    a grant of a pool that is gone (`pool_boot.load`), so the removal needs no record any more."""
+
+    def test_a_pending_removal_of_an_erased_pool_writes_no_record_at_the_next_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            holder = {}
+
+            def eraser(cls, pool):   # the erasure's effect on the authz copy: every record of the pool is deleted
+                fa = holder["w"].authz
+                gone = [d for d in fa.docs if d == f"pp:{pool}" or (d.startswith("pg:") and d.endswith(":" + pool))]
+                for d in gone:
+                    del fa.docs[d]
+                    fa.seqs.pop(d, None)
+                return SimpleNamespace(docs_deleted=len(gone), indices_dropped=[])
+            w = holder["w"] = World(tmp, svc_kw={"eraser": eraser}).start()
+            a = w.pool("alpha")
+            gid = f"pg:pt-user-alice:{a}"
+            w.authz.down = True
+            self.assertTrue(w.admin("pool_ungrant", who="user-alice", pool=a)["durable"])   # its write fails: unconfirmed
+            w.authz.down = False
+            self.assertEqual(len(w.svc._unconfirmed), 1)
+            admins = [Principal(T, f"pt-user-{n}", frozenset({Role.TENANT_ADMIN}), frozenset({"base"}), frozenset({"base"}))
+                      for n in ("admin", "admin2")]
+            self.assertEqual(w.svc.delete(admins[0], a), {"ok": False, "error": "pending"})
+            self.assertTrue(w.svc.delete(admins[1], a)["deleted"])
+            self.assertFalse([d for d in w.authz.docs if d.endswith(a)])
+            for _ in range(2):
+                w.rev.compact()
+                w.restart()
+                self.assertIsNone(w.dir.get(T, a))
+                self.assertNotIn(gid, w.authz.docs, "the start-up wrote a record of an erased pool")
+                self.assertEqual(w.svc._unconfirmed, {})
             w.rev.clean_stop()
 
 

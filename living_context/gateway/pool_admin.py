@@ -133,12 +133,22 @@ class PoolService:
         holds it (`_persist_grant`), and is confirmed only when that write lands. A read never confirms a removal (review round 8): a
         grant write of an earlier process may still be in flight, and only a landed write is past it (a compare-and-set it cannot pass
         any more); a grant absent from the copy, or held without the removed operations, proves nothing. Nothing is written or confirmed
-        after an INCOMPLETE read (a partial or refused record), which is no account of what memory was rebuilt from."""
+        after an INCOMPLETE read (a partial or refused record), which is no account of what memory was rebuilt from.
+        A removal on a pool that is gone (no pool record in this complete read, the journal applied: the pool was erased) is not written:
+        the erasure removed every record of the pool, and a write would put one naming the pool and the principal back. Its journal
+        record is dropped: start-up never restores a grant of an unknown pool (`pool_boot.load`), and an erased pool's record does not
+        come back (every later write of it is a compare-and-set that the erasure's delete refuses; its first write landed before the
+        pool had a grant)."""
         if not complete:
             return
         with self._ulock:
             rows = sorted({(k[0], k[1]) for k in self._unconfirmed})
         for principal, pool in rows:
+            if self.dir.get(self.tenant, pool) is None:
+                with self._ulock:
+                    for k in [k for k in self._unconfirmed if k[0] == principal and k[1] == pool]:
+                        del self._unconfirmed[k]
+                continue
             self._rewrite(principal, pool)
 
     def _rewrite(self, principal: str, pool: str) -> None:
