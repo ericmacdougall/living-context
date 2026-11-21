@@ -71,6 +71,22 @@ class RevocationService:
         # is called for every record that is not an epoch record, in order; `extra_snapshot` gives the records compaction keeps.
         self.extra_replay: Optional[Callable[[dict], None]] = None
         self.extra_snapshot: Optional[Callable[[], list]] = None
+        # other owners of record kinds (the class grants' reductions, `admin.GrantStore`): a record whose kind starts with one of the
+        # prefixes is replayed to that owner, and compaction keeps what its snapshot returns
+        self._kinds: list[tuple[tuple[str, ...], Callable[[dict], None], Callable[[], list]]] = []
+
+    def register_records(self, prefixes: tuple[str, ...], replay: Callable[[dict], None], snapshot: Callable[[], list]) -> None:
+        """Register the owner of the record kinds starting with `prefixes`, BEFORE `start` (the replay runs there)."""
+        if any(p.startswith(("pool_", "token_", "revoke", "bump", "start", "shutdown", "recovery")) for p in prefixes):
+            raise ValueError("a record kind the journal or the pool records already own")
+        self._kinds.append((tuple(prefixes), replay, snapshot))
+
+    def _extras(self) -> list:
+        """The non-epoch records compaction keeps: the pool records and every registered owner's."""
+        out = list(self.extra_snapshot() if self.extra_snapshot else [])
+        for _, _, snapshot in self._kinds:
+            out += snapshot()
+        return out
 
     @property
     def journal_path(self) -> Path:
@@ -83,10 +99,15 @@ class RevocationService:
     # ---- start and stop ---------------------------------------------------------------------------------------
     def _replay(self, j: Journal) -> None:
         for r in j.records:
-            if r.get("t") in ("revoke", "bump"):
-                self._ep.restore(self.tenant, r["principal"], int(r["epoch"]), r["t"] == "revoke")
-            elif self.extra_replay is not None and str(r.get("t", "")).startswith(("pool_", "token_")):
+            t = str(r.get("t", ""))
+            if t in ("revoke", "bump"):
+                self._ep.restore(self.tenant, r["principal"], int(r["epoch"]), t == "revoke")
+            elif self.extra_replay is not None and t.startswith(("pool_", "token_")):
                 self.extra_replay(r)
+            else:
+                for prefixes, replay, _ in self._kinds:
+                    if t.startswith(prefixes):
+                        replay(r)
 
     def _fault(self, why: str) -> None:
         self.state, self.lane_open, self.fault = FAULT, False, why   # no shutdown record is ever written for it
@@ -196,7 +217,8 @@ class RevocationService:
         return self._flip(principal, False)
 
     def journalled(self, apply: Callable[[], Any], record: Callable[[Any], dict], *, persist: Optional[Callable[[Any], None]] = None):
-        """A pool-grant removal, a detach or a single-token revoke (POOLS 2.5), in the order of a revoke: (1) `apply` runs under the
+        """A pool-grant removal, a detach, a single-token revoke (POOLS 2.5) or a class-grant reduction (`admin.GrantStore.reduce`), in
+        the order of a revoke: (1) `apply` runs under the
         EXCLUSIVE side of the tenant's send fence, in memory only, which is the denial; (2) after the fence is released the record
         `record(result)` is appended and fsynced, and (3) `persist(result)` is the best-effort write to the authz copy. Returns
         (result, Receipt-like dict with `denied_at` and `durable_at`)."""
@@ -257,7 +279,7 @@ class RevocationService:
         sj.append({"t": "start", "at": self._clock(), "compacted": True})
         for principal, epoch, revoked in self._ep.snapshot(self.tenant):
             sj.append({"t": "revoke" if revoked else "bump", "principal": principal, "epoch": epoch})
-        for extra in (self.extra_snapshot() if self.extra_snapshot else []):
+        for extra in self._extras():
             sj.append(extra)
         self._j = sj
         self.events.append("compacted")
@@ -281,7 +303,7 @@ class RevocationService:
                     sj.append({"t": "start", "at": self._clock(), "compacted": True}, sync=sync)
                 for principal, epoch, revoked in self._ep.snapshot(self.tenant):
                     sj.append({"t": "revoke" if revoked else "bump", "principal": principal, "epoch": epoch}, sync=sync)
-                for extra in (self.extra_snapshot() if self.extra_snapshot else []):
+                for extra in self._extras():
                     sj.append(extra, sync=sync)
                 if self._b["copy_shutdown"] and any(r.get("t") == "shutdown" for r in self._j.records):
                     # BROKEN variant: the previous run's shutdown state is carried into the compacted file, so a crash after it

@@ -5,8 +5,11 @@ What a restart must bring back, and from where:
     only then admits);
   * the erased-identifier and bare-name sets of the guard (E3): the tombstone journal (`Guard.load_journal`); without this a
     re-ingest of an erased identifier would be accepted again after a restart;
-  * grants: the best-effort copy in `lc-<t>-authz` (`GrantStore.persist` writes it, `load_grants` reads it back). Memory first: a
-    failed write never blocks a call, and a principal whose grant is not found cannot mint a session (fail closed);
+  * grants: the copy in `lc-<t>-authz` (`GrantStore.persist` writes it with the grant's revision, `load_grant_revs` reads it back),
+    with the reductions the copy may not hold replayed over it from the epoch journal (`GrantStore.attach`, before the journal
+    starts; `GrantStore.reduce`). Memory first: a failed write of an addition never blocks a call (the grant is lost at the next
+    start, fail safe), a reduction holds whatever the write answered, and a principal whose grant is not found cannot mint a
+    session (fail closed);
   * legal holds and their queue: the hold registry's own durable file.
 `offboard_tenant` is the tenant-wide revocation (offboarding, key compromise): the gateway forgets every client of the tenant at
 once (`EsGate.drop_tenant`) and, given the key owner's client, the keys are invalidated at the cluster too.
@@ -33,38 +36,47 @@ from .sessions import EpochTable
 
 
 
-def grant_doc(tenant: str, p: Principal) -> dict:
-    """The authz record of a grant: lineage names the principal's token, so erasing the person deletes it (14.1)."""
+def grant_doc(tenant: str, p: Principal, rev: int = 0) -> dict:
+    """The authz record of a grant at revision `rev` (`GrantStore`): lineage names the principal's token, so erasing the person
+    deletes it (14.1)."""
     return {"tenant": tenant, "cls": "tenantwide", "kind": "grant", "lin_leaves": [], "lin_leaf_ids": [], "lin_nodes": [],
             "lin_subjects": [p.token], "lin_queries": [], "derivation": "grant", "erasure_rewrite": 0, "schema_v": 1,
             "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "principal": p.token,
             "roles": sorted(r.value for r in p.roles), "read": sorted(p.read_set), "write": sorted(p.write_set),
-            "own_class": p.own_class or ""}
+            "own_class": p.own_class or "", "rev": rev}
 
 
-def grant_persister(gate: EsGate, tenant: str) -> Callable[[Principal], None]:
+def grant_persister(gate: EsGate, tenant: str) -> Callable[..., None]:
     """The authz copy of a grant. Written only on a well-formed acknowledgement about exactly this record (`reads.put_doc_landed`
     through the authz alias); any other answer raises, so the caller counts the write as failed (review round 6)."""
-    def persist(p: Principal) -> None:
+    def persist(p: Principal, rev: int = 0) -> None:
         try:
-            put_doc_landed(gate.client(tenant, "authz"), f"lc-{tenant}-authz", f"gr:{p.token}", grant_doc(tenant, p), "refresh=true",
-                           alias=True)
+            put_doc_landed(gate.client(tenant, "authz"), f"lc-{tenant}-authz", f"gr:{p.token}", grant_doc(tenant, p, rev),
+                           "refresh=true", alias=True)
         except IncompleteRead as e:
             raise RuntimeError("authz write refused") from e
     return persist
 
 
 def load_grants(gate: EsGate, tenant: str, *, page: int = 1000) -> list[Principal]:
-    """Every grant record of the tenant's authz index, in one snapshot paged until exhausted (`reads.scan`). A failed or partial page is an error
-    (`reads.complete_hits`; the caller starts with no grants, which fails closed: nobody can mint a session until a grant is made
-    again)."""
+    """Every grant of the tenant's authz index (`load_grant_revs`, without the revisions)."""
+    return [p for p, _ in load_grant_revs(gate, tenant, page=page)]
+
+
+def load_grant_revs(gate: EsGate, tenant: str, *, page: int = 1000) -> list[tuple[Principal, int]]:
+    """Every grant record of the tenant's authz index with its revision (0 for a record written before revisions), in one snapshot
+    paged until exhausted (`reads.scan`). A failed or partial page is an error (`reads.complete_hits`; the caller starts with no
+    grants, which fails closed: nobody can mint a session until a grant is made again)."""
     out = []
     for h in scan(gate.client(tenant, "authz"), f"lc-{tenant}-authz", {"query": {"term": {"kind": "grant"}}}, page=page):
         s = h["_source"]
         try:
-            out.append(Principal(tenant, s["principal"], frozenset(Role(x) for x in s["roles"]), frozenset(s.get("read", [])),
-                                 frozenset(s.get("write", [])), s.get("own_class") or None))
-        except (KeyError, ValueError):
+            rev = s.get("rev", 0)
+            if type(rev) is not int or rev < 0:
+                raise ValueError("revision")
+            out.append((Principal(tenant, s["principal"], frozenset(Role(x) for x in s["roles"]), frozenset(s.get("read", [])),
+                                  frozenset(s.get("write", [])), s.get("own_class") or None), rev))
+        except (KeyError, ValueError, TypeError):
             continue   # a record that does not parse is no grant
     return out
 
@@ -90,18 +102,20 @@ def start_tenant(tenant: str, *, gate: EsGate, epochs: EpochTable, epoch_dir: Pa
     `start_journal=False`: the caller starts the journal itself, exactly once, after it has registered the pool records' replay and
     read the pool state back (the composition root, `app.start_app`, via `pool_root.start_pools`)."""
     rev = RevocationService(tenant, epochs, epoch_dir, d_fsync_s=d_fsync_s)
+    grants = GrantStore(persist=grant_persister(gate, tenant))
+    grants.attach(tenant, rev)   # before the journal starts: its replay narrows the grants read back to the unconfirmed reductions
     if start_journal:
         rev.start()
     tomb = TombstoneJournal(*tombstone_paths)
     guard = Guard(TokenSource(keystore))
-    grants = GrantStore(persist=grant_persister(gate, tenant))
     rt = TenantRuntime(tenant, rev, tomb, guard, HoldRegistry(holds_path), grants)
     if not broken_skip_load:
         rt.guard_records = guard.load_journal(tomb.records())
         try:
-            for p in load_grants(gate, tenant):
-                grants.restore(p)
+            for p, r in load_grant_revs(gate, tenant):
+                grants.restore(p, r)
                 rt.loaded_grants += 1
+            grants.loaded(tenant)   # the read was complete (a failed or partial one raised before any restore)
         except Exception as e:   # nothing readable: no grants, nobody can mint a session until they are made again (fail closed)
             rt.grant_load_error = f"{type(e).__name__}: {e}"
     return rt

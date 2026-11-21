@@ -23,7 +23,7 @@ from typing import Any, Callable, Mapping, Optional
 
 from ..policy import ClassLattice, Op, Principal, Role, decide
 from ..policy.decide import validate_principal
-from .revocation import RevocationService
+from .revocation import Refused, RevocationService
 
 OK_ANSWER = {"ok": True}
 REFUSED = {"ok": False, "error": "refused"}
@@ -44,33 +44,179 @@ def lane_allowed(op: Any, p: Principal) -> bool:
 PENDING_S = 900.0   # ASSUMPTION: a first administrator's call waits this long for the second
 
 
-class GrantStore:
-    """The gateway's own grants: (tenant, principal token) to roles and sets. Memory first; `persist` is the best-effort write to
-    `lc-<t>-authz` and never blocks or fails a call."""
+REDUCE = "grant_reduce"   # the epoch-journal record of a class-grant reduction
 
-    def __init__(self, persist: Optional[Callable[[Principal], None]] = None):
+
+def narrower(a: Principal, b: Principal) -> bool:
+    """Whether `a` holds nothing `b` does not (roles, read and write classes, own class)."""
+    return a.roles <= b.roles and a.read_set <= b.read_set and a.write_set <= b.write_set and a.own_class in (None, b.own_class)
+
+
+def meet(a: Principal, b: Principal) -> Principal:
+    """What both grants hold. Never wider than either; down-closed read sets stay down-closed."""
+    return Principal(a.tenant, a.token, a.roles & b.roles, a.read_set & b.read_set, a.write_set & b.write_set,
+                     a.own_class if a.own_class == b.own_class else None)
+
+
+def _of_record(tenant: str, r: Mapping) -> Principal:
+    return Principal(tenant, r["principal"], frozenset(Role(x) for x in r["roles"]), frozenset(r["read"]), frozenset(r["write"]),
+                     r.get("own_class") or None)
+
+
+class GrantStore:
+    """The gateway's own grants: (tenant, principal token) to roles and sets, memory first, with a copy in `lc-<t>-authz` (`persist`)
+    that the next start reads back. Each change takes the next revision of the principal's grant, and the copy carries it.
+
+    * An addition (`put`) persists best effort: a write that does not land only loses access at the next start (fail safe), and it
+      never fails the call. `put` refuses a change that takes anything away.
+    * A REDUCTION (`reduce`: a class removal, a grant that takes roles or classes away) must hold across a restart even when its authz
+      write is refused or fails (review round 7, the admin-lane form of F18). Before the call answers, it is journalled in the tenant's
+      epoch journal (a `grant_reduce` record with the reduced grant and its revision, `RevocationService.journalled`). At start-up the
+      record is replayed over the grant read back from the copy, which is narrowed to it (`meet`, never widened), and compaction keeps
+      it until a validated authz write of that revision or a later one lands, or a COMPLETE start-up read shows the copy at or past
+      that revision (or holding no grant). This is the pool lane's design (pool_admin.py: unconfirmed removals) for the class grants.
+    The store must be `attach`ed to the tenant's journal before the journal starts, so the replay reaches it."""
+
+    def __init__(self, persist: Optional[Callable[..., None]] = None):
         self._g: dict[tuple[str, str], Principal] = {}
+        self._rev: dict[tuple[str, str], int] = {}        # the revision of the grant in memory
+        self._copy_rev: dict[tuple[str, str], int] = {}   # the revision the authz copy is known to hold (read back, or a landed write)
+        self._unconfirmed: dict[tuple[str, str], dict] = {}   # the latest reduction whose authz write has not been confirmed
+        self._complete: set[str] = set()                  # tenants whose start-up read of the copy was complete
+        self._journals: dict[str, Any] = {}
         self._lock = threading.Lock()
+        self._write_locks: dict[tuple[str, str], threading.Lock] = {}
         self._persist = persist
         self.persist_failures = 0
 
     def get(self, tenant: str, token: str) -> Optional[Principal]:
+        """The grant, or None. A grant that holds no role (a replayed reduction narrowed it to nothing) is no grant: such a principal
+        cannot mint a session (fail closed), and a new grant to it is an addition."""
         with self._lock:
-            return self._g.get((tenant, token))
+            g = self._g.get((tenant, token))
+            return g if g is not None and g.roles else None
 
-    def restore(self, p: Principal) -> None:
-        """A grant read back at start-up: memory only, no persist."""
+    # ---- start-up -------------------------------------------------------------------------------------------------------------
+    def attach(self, tenant: str, journal: Any) -> None:
+        """Make the store the owner of the tenant's `grant_reduce` records (replay and compaction). Before `journal.start()`."""
+        self._journals[tenant] = journal
+        journal.register_records((REDUCE,), lambda r: self.apply_record(tenant, r), lambda: self.snapshot_records(tenant))
+
+    def restore(self, p: Principal, rev: int = 0) -> None:
+        """A grant read back at start-up (revision `rev` of the copy): memory only, no persist; narrowed to an unconfirmed reduction."""
+        k = (p.tenant, p.token)
         with self._lock:
-            self._g[(p.tenant, p.token)] = p
+            self._g[k] = p
+            self._copy_rev[k] = max(self._copy_rev.get(k, 0), rev)
+            self._rev[k] = max(self._rev.get(k, 0), rev)
+            self._settle(k)
 
+    def loaded(self, tenant: str) -> None:
+        """The start-up read of the tenant's copy was COMPLETE (every grant it holds was restored): a reduction of a principal the copy
+        holds no grant for is confirmed. Never after a failed or partial read, which proves nothing."""
+        with self._lock:
+            self._complete.add(tenant)
+            for k in [k for k in self._unconfirmed if k[0] == tenant]:
+                self._settle(k)
+
+    def apply_record(self, tenant: str, r: Mapping) -> None:
+        """Journal replay of a reduction: the latest one per principal is kept (it was made from a memory that held every earlier one)."""
+        if r.get("t") != REDUCE:
+            return
+        k, rev = (tenant, r["principal"]), int(r["rev"])
+        with self._lock:
+            cur = self._unconfirmed.get(k)
+            if cur is None or int(cur["rev"]) < rev:
+                self._unconfirmed[k] = dict(r)
+            self._rev[k] = max(self._rev.get(k, 0), rev)
+            self._settle(k)
+
+    def snapshot_records(self, tenant: str) -> list:
+        with self._lock:
+            return [dict(r) for k, r in self._unconfirmed.items() if k[0] == tenant]
+
+    def _settle(self, k: tuple[str, str]) -> None:
+        """Under the lock: drop a reduction the copy is known to hold (or, after a complete read, of a principal the copy holds no grant
+        for), else narrow the grant in memory to it."""
+        r = self._unconfirmed.get(k)
+        if r is None:
+            return
+        if self._copy_rev.get(k, 0) >= int(r["rev"]) or (k not in self._g and k[0] in self._complete):
+            del self._unconfirmed[k]
+            return
+        if k in self._g:
+            self._g[k] = meet(self._g[k], _of_record(k[0], r))
+
+    # ---- changes --------------------------------------------------------------------------------------------------------------
     def put(self, p: Principal) -> None:
+        """A new grant, or one that only adds: memory, then the best-effort authz write (never fails the call)."""
+        k = (p.tenant, p.token)
         with self._lock:
-            self._g[(p.tenant, p.token)] = p
+            old = self._g.get(k)
+            if old is not None and old.roles and not narrower(old, p):
+                raise ValueError("a grant that takes anything away is a reduction (GrantStore.reduce)")
+            self._g[k] = p
+            rev = self._rev[k] = self._rev.get(k, 0) + 1
         if self._persist:
             try:
-                self._persist(p)
+                self._persist_at(p, rev)
             except Exception:
-                self.persist_failures += 1
+                pass   # an addition is best effort (counted in persist_failures): a lost write loses access at the next start (fail safe)
+
+    def reduce(self, p: Principal) -> dict:
+        """A grant that takes something away: in memory under the tenant's send fence, then the journal record (appended and fsynced
+        before this returns), then the authz write. Returns the journal's receipt (`durable_at`, `persisted`). Raises
+        `revocation.Refused` when the tenant's journal is closed (nothing changed) or when the record did not become durable (the
+        append faulted and closed the tenant: the reduction holds in memory, but the caller is never told ok for it), and refuses
+        when the store is not attached to the journal."""
+        journal = self._journals.get(p.tenant)
+        if journal is None:
+            raise RuntimeError("the grant store is not attached to the tenant's journal: a reduction would not survive a restart")
+        k = (p.tenant, p.token)
+
+        def apply():
+            with self._lock:
+                self._g[k] = p
+                rev = self._rev[k] = self._rev.get(k, 0) + 1
+                r = {"t": REDUCE, "principal": p.token, "roles": sorted(x.value for x in p.roles), "read": sorted(p.read_set),
+                     "write": sorted(p.write_set), "own_class": p.own_class or "", "rev": rev}
+                self._unconfirmed[k] = r
+                return r
+
+        write = (lambda r: self._persist_at(p, int(r["rev"]))) if self._persist else None   # no copy configured: the journal alone
+        _, rc = journal.journalled(apply, lambda r: dict(r), persist=write)
+        if rc["durable_at"] is None:
+            raise Refused("the reduction's journal record is not durable")
+        return rc
+
+    def _persist_at(self, p: Principal, rev: int) -> None:
+        """The authz write of revision `rev`. Writes of one principal go one at a time, and a write that a later revision has
+        superseded is not sent (so an earlier, wider state never lands after a later one). A write that lands confirms every
+        reduction of the principal up to `rev`; one that does not (refused, malformed, failed: the persister raises) is counted and
+        raises, and the reduction stays unconfirmed."""
+        k = (p.tenant, p.token)
+        with self._lock:
+            wl = self._write_locks.setdefault(k, threading.Lock())
+        with wl:
+            with self._lock:
+                superseded = self._rev.get(k, 0) > rev
+            if superseded:
+                self._count_failure()
+                raise RuntimeError("a later revision superseded this write")
+            try:
+                self._persist(p, rev)
+            except Exception:
+                self._count_failure()
+                raise
+            with self._lock:
+                self._copy_rev[k] = max(self._copy_rev.get(k, 0), rev)
+                r = self._unconfirmed.get(k)
+                if r is not None and int(r["rev"]) <= rev:
+                    del self._unconfirmed[k]
+
+    def _count_failure(self) -> None:
+        with self._lock:
+            self.persist_failures += 1
 
 
 class Admin:
@@ -136,7 +282,7 @@ class Admin:
         if not (svc.state == "open" if self._b["any_admin"] else svc.may_grant(p.token)):   # a recovering tenant admits grant calls only from the administrators the operator named
             return UNAVAILABLE
         old = self._st.get(tenant, tgt.token)
-        reduces = old is not None and not (old.roles <= tgt.roles and old.read_set <= tgt.read_set and old.write_set <= tgt.write_set)
+        reduces = old is not None and not narrower(old, tgt)
         if reduces and old.roles & {Role.TENANT_ADMIN, Role.REVOKER}:
             # a grant that takes roles or classes from an administrator or a revoker is a revocation of part of its authority:
             # two distinct administrators, like the revoke itself
@@ -144,15 +290,18 @@ class Admin:
             verdict = self._authorise(p, tenant, lattice, old, act)
             if verdict is not None:
                 return verdict
-        self._st.put(tgt)
-        if reduces:
-            # a grant that takes anything away is a reduction: the sessions minted under the larger grant end at their next check
-            if not self._b["nobump"]:     # BROKEN variant: they keep the removed roles and classes
-                try:
-                    self._rev(tenant).bump(tgt.token)
-                except Exception:
-                    self._st.put(old)
-                    raise
+        if not reduces:
+            self._st.put(tgt)    # an addition: best effort
+            return OK_ANSWER
+        # a grant that takes anything away is a reduction: journalled before the answer, so it holds across a restart whatever the
+        # authz write answered (GrantStore.reduce), and the sessions minted under the larger grant end at their next check
+        self._st.reduce(tgt)
+        if not self._b["nobump"]:     # BROKEN variant: they keep the removed roles and classes
+            try:
+                self._rev(tenant).bump(tgt.token)
+            except Exception:
+                self._st.put(old)
+                raise
         return OK_ANSWER
 
     # ---- revoke and class removal -------------------------------------------------------------------------------
@@ -199,7 +348,8 @@ class Admin:
             return verdict
         read = frozenset(c for c in tgt.read_set if not lattice.dominates(c, cls))   # keeps the read set down-closed
         write = frozenset(c for c in tgt.write_set if c != cls)
-        self._st.put(Principal(tenant, tgt.token, tgt.roles, read, write, tgt.own_class))
+        # a reduction: journalled before the answer, so it holds across a restart whatever the authz write answered (GrantStore.reduce)
+        self._st.reduce(Principal(tenant, tgt.token, tgt.roles, read, write, tgt.own_class))
         epoch = self._ep.epoch(tenant, tgt.token)
         if not self._b["nobump"]:    # BROKEN variant: the grants shrink, the old sessions keep the class until they end
             try:

@@ -136,7 +136,9 @@ Each entry names the passages, the reading the build follows and the test that k
 - Class-grant removal removes the class and every class that dominates it from the read set (a read set must stay down-closed), takes the
   class from the write set, journals an epoch bump and ends the principal's sessions at their next check.
 - Grants are held in the gateway's memory and persisted best-effort to the authz index (4.4); a restart without that persistence
-  loses grants made since, which fails closed (a principal without a grant cannot mint a session).
+  loses grants made since, which fails closed (a principal without a grant cannot mint a session). A reduction is not best effort
+  (pools review round 7): it is journalled in the epoch journal before the call answers and replayed over the grants read back at
+  start-up until a validated authz write confirms it, so a refused write cannot bring a removed class or role back.
 - 4.4 says the tenant key owner rotates and invalidates the tenant's keys. An owner can only list and invalidate the keys it created, so
   provisioning takes the owner's client (`provision_tenant(key_owner=...)`) and creates the tenant's keys through it. Keys created by the
   bootstrap credential instead expire at their 7-day expiry and can be invalidated only with that credential.
