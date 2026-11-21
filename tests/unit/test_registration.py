@@ -228,7 +228,7 @@ class Registration(unittest.TestCase):
         pattern = next(n.value for n in ast.walk(find) if isinstance(n, ast.Assign)
                        and any(isinstance(t, ast.Name) and t.id == "pattern" for t in n.targets))
         self.assertIn(ast.unparse(pattern).replace("'", '"'), ('f"lc-{check_id(tenant, "tenant")}-*"',))   # quoting differs by Python version
-        self.assertIn("f'/{pattern}/_search?ignore_unavailable=true'", ast.unparse(find))
+        self.assertIn("reads.scan(es, pattern, body, page=PAGE, ignore_unavailable=True)", ast.unparse(find))   # the whole tenant glob, one snapshot
         self.assert_no_kind_filter(find)
         verifier = parse("verifier/check.py")
         self.assertEqual(ast.unparse(symbol(verifier, "_all").body[0].value), "f'lc-{self.tenant}-*'")
@@ -263,7 +263,8 @@ class Registration(unittest.TestCase):
         self.assertIn("f'lc-{self.tenant}-*'", ast.unparse(pool_docs))
         self.assertTrue({"pool", "lin_pools"} <= strings(pool_docs))
         self.assert_no_kind_filter(pool_docs)
-        self.assertIn("f'/lc-{tenant}-*/_search?ignore_unavailable=true'", ast.unparse(symbol(verifier, "pool_residue")))
+        self.assertIn('f"/lc-{tenant}-*/_search?ignore_unavailable=true&allow_partial_search_results=false"',
+                      ast.unparse(symbol(verifier, "pool_residue")).replace("'", '"'))   # quoting differs by Python version
 
         handler = parse("gateway/handler.py")
         admin = parse("gateway/admin.py")
@@ -365,22 +366,22 @@ class Registration(unittest.TestCase):
         self.assertIn(("src", "key id field leaf_id", "erasure/pool_scope.py"), key_gaps({"src": {"key_ref"}}, {"src": "leaf_id"}))
 
     def test_every_authz_start_up_and_erasure_search_is_a_complete_read(self):
-        """C1 (pools delta review): every search of the authz, start-up and pool-erasure paths asks for no partial results and passes
-        its answer through the one validator (`reads.complete_hits`); no other search path exists in those modules."""
+        """C1 (pools delta review), F12: the authz, start-up and pool-erasure paths read through `reads.scan` (a PIT, the `_shard_doc`
+        cursor, `complete_hits` on every page) and build no search path of their own. The package-wide enumeration of every request
+        call site is tests/unit/test_read_paths.py; this test pins the three start-up and pool-erasure modules to the scan."""
         for rel in ("gateway/pool_boot.py", "gateway/boot.py", "erasure/pool_scope.py"):
             tree = parse(rel)
             for n in ast.walk(tree):
                 if isinstance(n, ast.Constant) and isinstance(n.value, str):
-                    self.assertNotIn("_search", n.value, rel + ": a search path built outside reads.search_path")
-            searching = [f for f in ast.walk(tree) if isinstance(f, ast.FunctionDef)
-                         and any(isinstance(c, ast.Call) and call_name(c) == "search_path" for c in ast.walk(f))]
-            self.assertTrue(searching, rel)
-            for f in searching:
-                self.assertIn("complete_hits", {call_name(c) for c in ast.walk(f) if isinstance(c, ast.Call)}, rel + ":" + f.name)
-        reads = ast.unparse(symbol(parse("gateway/reads.py"), "complete_hits"))
+                    self.assertNotIn("_search", n.value, rel + ": a search path built outside reads")
+            self.assertTrue(any(isinstance(c, ast.Call) and call_name(c) == "scan" for c in ast.walk(tree)), rel)
+        reads = parse("gateway/reads.py")
         for check in ("timed_out", "terminated_early", "failed", "successful", "total"):
-            self.assertIn(check, reads)
-        self.assertIn("allow_partial_search_results=false", ast.unparse(symbol(parse("gateway/reads.py"), "search_path")))
+            self.assertIn(check, ast.unparse(symbol(reads, "complete_hits")))
+        self.assertIn("allow_partial_search_results=false", ast.unparse(symbol(reads, "search_path")))
+        scan = symbol(reads, "scan")
+        self.assertIn("_shard_doc", strings(scan))
+        self.assertIn("complete_hits", {call_name(c) for c in ast.walk(scan) if isinstance(c, ast.Call)})
 
     def test_every_pool_write_of_the_writer_is_gated(self):
         """C4 (pools delta review): every Writer entry point that writes a pool document takes the write gate and checks the pool is

@@ -2,7 +2,7 @@
 best-effort copy in `lc-<t>-authz`, and THEN the epoch journal is applied on top, so a grant or state that a later journal record
 removed stays removed. Call `load` before `RevocationService.start` (which replays the journal into `PoolService.apply_record`).
 
-The read is complete or the start-up fails: the authz copy is paged with `search_after` until it is exhausted, and any failed page raises
+The read is complete or the start-up fails: the authz copy is read in one snapshot (a PIT, `_shard_doc`, `search_after`) until it is exhausted, and any failed page raises
 (a partial read is never used to confirm that a removal landed). Token documents are stored as one JSON string (a fixed mapping, not an
 object keyed by pool id) and an expired one is deleted when it is read.
 """
@@ -13,7 +13,7 @@ from typing import Any, Callable, Optional
 
 from ..policy import pools as pl
 from .pool_admin import PoolService
-from .reads import complete_hits, search_path
+from .reads import scan
 from .sessions import Sessions
 
 PAGE = 1000   # documents per page of the start-up read; the read is paged until exhausted (no cap)
@@ -31,19 +31,10 @@ def token_persister(authz: Callable[[], Any], tenant: str) -> Callable[[str, dic
 
 
 def _read_all(authz: Callable[[], Any], tenant: str, page: int) -> list:
-    """Every pool, grant and token record of the authz copy, in pages sorted by `_doc` with `search_after`. A failed or partial page
-    raises (`reads.complete_hits`)."""
-    out, after = [], None
-    while True:
-        body = {"size": page, "sort": [{"_doc": "asc"}], "query": {"terms": {"kind": ["pool", "pgrant", "token"]}}}
-        if after is not None:
-            body["search_after"] = after
-        st, r = authz().request("POST", search_path(f"lc-{tenant}-authz"), body)
-        hits = complete_hits(st, r)   # a failed OR partial page (HTTP 200 with timed_out or a failed shard) raises: the start-up fails
-        if not hits:
-            return out
-        out += [{**h["_source"], "_id": h["_id"]} for h in hits]
-        after = hits[-1]["sort"]
+    """Every pool, grant and token record of the authz copy: one consistent snapshot read in pages with a unique cursor (`reads.scan`:
+    a PIT and `_shard_doc`). A failed or partial page raises (`reads.complete_hits`): the start-up fails."""
+    hits = scan(authz(), f"lc-{tenant}-authz", {"query": {"terms": {"kind": ["pool", "pgrant", "token"]}}}, page=page)
+    return [{**h["_source"], "_id": h["_id"]} for h in hits]
 
 
 def load(authz: Callable[[], Any], tenant: str, directory: pl.PoolDirectory, sessions: Sessions, svc: PoolService, *, page: int = PAGE,

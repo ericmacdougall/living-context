@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Iterable, NamedTuple
 
+from ..gateway import reads
 from ..gateway.es import EsClient
 from ..gateway.indices import check_id
 
@@ -53,24 +54,17 @@ def find(es: EsClient, tenant: str, *, subjects: Iterable[str] = (), leaf_ids: I
         should += [{"terms": {f: queries}} for f in ("lin_queries", "evidence", "shaped_by")]
     if not should:
         return []
-    es.request("POST", f"/{pattern}/_refresh")
-    out, after = [], None
-    while True:
-        body = {"size": PAGE, "_source": ["kind", "lin_leaf_ids", "lin_nodes", "search_id", "lin_subjects", "item_subjects", "actor"], "query": {"bool": {"should": should, "minimum_should_match": 1}},
-                "sort": [{"_doc": "asc"}]}
-        if after is not None:
-            body["search_after"] = after
-        st, r = es.request("POST", f"/{pattern}/_search?ignore_unavailable=true", body)
-        if st != 200:
-            raise ScanError(f"lineage scan failed ({st})")
-        hits = r["hits"]["hits"]
-        if not hits:
-            return out
-        out += [Hit(h["_index"], h["_id"], h["_source"].get("kind", ""), tuple(h["_source"].get("lin_leaf_ids", [])),
-                    tuple(h["_source"].get("lin_nodes", [])),
-                    h["_source"].get("search_id", ""), tuple(h["_source"].get("lin_subjects", [])),
-                    tuple(h["_source"].get("item_subjects", [])), h["_source"].get("actor", "")) for h in hits]
-        after = hits[-1]["sort"]
+    body = {"_source": ["kind", "lin_leaf_ids", "lin_nodes", "search_id", "lin_subjects", "item_subjects", "actor"],
+            "query": {"bool": {"should": should, "minimum_should_match": 1}}}
+    try:   # one consistent snapshot with a unique cursor; a failed refresh, PIT or page, or a partial page, raises (F12, F13)
+        reads.refresh(es, pattern)
+        hits = reads.scan(es, pattern, body, page=PAGE, ignore_unavailable=True)
+    except reads.IncompleteRead as e:
+        raise ScanError("lineage scan failed") from e
+    return [Hit(h["_index"], h["_id"], h["_source"].get("kind", ""), tuple(h["_source"].get("lin_leaf_ids", [])),
+                tuple(h["_source"].get("lin_nodes", [])),
+                h["_source"].get("search_id", ""), tuple(h["_source"].get("lin_subjects", [])),
+                tuple(h["_source"].get("item_subjects", [])), h["_source"].get("actor", "")) for h in hits]
 
 
 def delete(es: EsClient, found: Iterable[tuple]) -> int:

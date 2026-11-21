@@ -32,10 +32,11 @@ from typing import Callable, Iterable, Optional
 
 from ..config import Constants
 from ..embed import stub as embed_stub
-from ..gateway import validator
+from ..gateway import reads, validator
 from ..gateway.gate import NoGate
 from ..gateway.es import EsClient
 from ..gateway.indices import TENANT_CLS, class_index, pool_index, tenant_index
+from ..gateway.reads import IncompleteRead, complete_hits
 from ..graph import entities
 from ..ids import new_leaf_id
 from ..keystore.store import Keystore, KeystoreError
@@ -462,9 +463,11 @@ class Writer:
         st, r = self._es.request("POST", f"/{idx}/_search", {"size": 1000, "_source": ["qid", "created_at", "state"],
                                                               "query": {"bool": {"filter": [{"term": {"kind": "quarantine"}}],
                                                                                  "must_not": [{"exists": {"field": "pool"}}]}}})   # not the holds of a pool
-        if st != 200:
-            raise WriterError("quarantine scan failed")
-        return sorted((h["_source"] for h in r["hits"]["hits"]), key=lambda d: d["created_at"])
+        try:
+            hits = complete_hits(st, r)   # a partial answer would hide a held item from its reviewer
+        except IncompleteRead as e:
+            raise WriterError("quarantine scan failed") from e
+        return sorted((h["_source"] for h in hits), key=lambda d: d["created_at"])
 
     def quarantine_review(self, cls: str, qid: str, decision: str) -> WriteResult:
         """`admit` writes the held text as an ordinary leaf (the reviewer decided it is not the erased subject);
@@ -731,6 +734,19 @@ class Writer:
         except WriterError:
             return
 
+    def _refresh_checked(self, index: str) -> None:
+        try:
+            reads.refresh(self._es, index)
+        except IncompleteRead as e:
+            raise WriterError("refresh failed") from e
+
+    @staticmethod
+    def _page(st, r) -> list:
+        try:
+            return complete_hits(st, r)   # a partial page (HTTP 200 with a failed shard) is not the end of the scan
+        except IncompleteRead as e:
+            raise WriterError("scan failed") from e
+
     def repair(self, classes: Iterable[str]) -> dict:
         """Finish or undo partial writes. Source documents without a projection are re-projected from the
         source (decrypted with the leaf's key); a source whose key is gone was erased and is left alone;
@@ -738,7 +754,7 @@ class Writer:
         leaf are recreated."""
         classes = list(classes)
         src_idx = tenant_index(self.tenant, "src")
-        self._es.request("POST", f"/{src_idx}/_refresh")
+        self._refresh_checked(src_idx)
         out = {"reprojected": 0, "erased_skipped": 0, "projections_deleted": 0, "heads_created": 0, "queued": 0}
         after = None
         while True:
@@ -746,9 +762,7 @@ class Writer:
             if after is not None:
                 body["search_after"] = [after]
             st, r = self._es.request("POST", f"/{src_idx}/_search", body)
-            if st != 200:
-                raise WriterError("scan failed")
-            hits = r["hits"]["hits"]
+            hits = self._page(st, r)
             if not hits:
                 break
             for h in hits:
@@ -778,25 +792,29 @@ class Writer:
             after = hits[-1]["sort"][0]
         for cls in classes:  # projections whose source document is missing
             leaf = class_index(self.tenant, cls, "leaf")
-            self._es.request("POST", f"/{leaf}/_refresh")
+            self._refresh_checked(leaf)
             after = None
             while True:
                 body = {"size": 200, "sort": [{"src_seq": "asc"}], "_source": False, "query": {"match_all": {}}}
                 if after is not None:
                     body["search_after"] = [after]
                 st, r = self._es.request("POST", f"/{leaf}/_search", body)
-                if st != 200:
-                    raise WriterError("scan failed")
-                hits = r["hits"]["hits"]
+                hits = self._page(st, r)
                 if not hits:
                     break
                 ids = [h["_id"] for h in hits]
                 st, m = self._es.request("POST", "/_mget", {"docs": [{"_index": src_idx, "_id": i} for i in ids]})
-                if st != 200:
+                docs = m.get("docs") if st == 200 and isinstance(m, dict) else None
+                if not isinstance(docs, list) or len(docs) != len(ids):
                     raise WriterError("scan failed")
-                for d in m["docs"]:
-                    if d.get("found") is not True:
-                        self._es.request("DELETE", f"/{leaf}/_doc/{d['_id']}")
+                for d in docs:
+                    # only a VERIFIED absence deletes: a per-document error (an unavailable shard) is not "the source is missing"
+                    if not isinstance(d, dict) or "error" in d or d.get("found") not in (True, False):
+                        raise WriterError("source lookup incomplete")
+                    if d["found"] is False:
+                        st, _ = self._es.request("DELETE", f"/{leaf}/_doc/{d['_id']}")
+                        if st not in (200, 404):
+                            raise WriterError("projection delete failed")
                         out["projections_deleted"] += 1
                 after = hits[-1]["sort"][0]
         for cls in classes:

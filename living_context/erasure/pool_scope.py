@@ -29,7 +29,7 @@ from ..gateway.es import EsClient
 from ..gateway.gate import WriteGate
 from ..gateway.indices import check_id, check_pool_id, pool_index
 from ..gateway.journal import TombstoneJournal
-from ..gateway.reads import IncompleteRead, complete_hits, search_path
+from ..gateway.reads import IncompleteRead, aliases, refresh, scan
 from ..keystore.store import Keystore
 from . import purge
 
@@ -61,66 +61,73 @@ class PoolEraser:
         self._er, self._drop, self.tenant, self._ks, self._j, self._gate = es_erase, drop_index, check_id(tenant, "tenant"), keystore, journal, gate
         self._pd, self._pi, self._pause = purge_deadline_s, purge_interval_s, pause or (lambda s: None)
         self._b = dict(class_level=broken_skip_class_level, keys=broken_skip_keys, keep=broken_keep_indices)
+        self._manifest_indices: set = set()   # the physical indices the pool's manifest names, filled by the closure scan
 
     def _docs(self, pool: str) -> list[tuple[str, str, str, str]]:
         """(index, id, kind, key id) of every document of the tenant naming the pool, wherever it lives, except the pool's own leaf
-        indices. The key id is the field `KEY_KINDS` names for a key-holding kind ("" otherwise). A failed or partial page raises."""
-        er, out, after = self._er(), [], None
+        indices. The key id is the field `KEY_KINDS` names for a key-holding kind ("" otherwise). One consistent snapshot with a unique
+        cursor (`reads.scan`: PIT and `_shard_doc`, review F12); a failed refresh, PIT or page, or a partial page, raises."""
+        er, out = self._er(), []
         pattern = f"lc-{self.tenant}-*"
-        er.request("POST", f"/{pattern}/_refresh")
-        fields = sorted({"kind", *KEY_KINDS.values()})
-        while True:
-            body = {"size": PAGE, "_source": fields, "sort": [{"_doc": "asc"}], "query": {"bool": {"should": [
-                {"term": {"pool": pool}}, {"term": {"lin_pools": pool}}], "minimum_should_match": 1}}}
-            if after is not None:
-                body["search_after"] = after
-            st, r = er.request("POST", search_path(pattern, "ignore_unavailable=true"), body)
-            try:
-                hits = complete_hits(st, r)
-            except IncompleteRead as e:
-                raise PoolEraseError("closure scan failed") from e
-            if not hits:
-                return out
-            for h in hits:
-                if f"-{pool}-" in h["_index"]:
-                    continue
-                src = h.get("_source") or {}
-                k = src.get("kind", "")
-                out.append((h["_index"], h["_id"], k, str(src.get(KEY_KINDS[k], "")) if k in KEY_KINDS else ""))
-            after = hits[-1]["sort"]
+        fields = sorted({"kind", "indices", *KEY_KINDS.values()})
+        try:
+            refresh(er, pattern)
+            hits = scan(er, pattern, {"_source": fields, "query": {"bool": {"should": [
+                {"term": {"pool": pool}}, {"term": {"lin_pools": pool}}], "minimum_should_match": 1}}}, page=PAGE, ignore_unavailable=True)
+        except IncompleteRead as e:
+            raise PoolEraseError("closure scan failed") from e
+        for h in hits:
+            if f"-{pool}-" in h["_index"]:
+                continue
+            src = h.get("_source") or {}
+            k = src.get("kind", "")
+            out.append((h["_index"], h["_id"], k, str(src.get(KEY_KINDS[k], "")) if k in KEY_KINDS else ""))
+            if k == "manifest" and src.get("pool", pool) == pool:
+                self._manifest_indices.update(x for x in src.get("indices", []) if isinstance(x, str))
+        return out
 
     def _leaf_ids(self, cls: str, pool: str) -> set:
-        er, ids, after = self._er(), set(), None
-        idx = pool_index(self.tenant, cls, pool, "leaf")
-        while True:
-            body = {"size": PAGE, "_source": ["lin_leaf_ids"], "sort": [{"_doc": "asc"}], "query": {"match_all": {}}}
-            if after is not None:
-                body["search_after"] = after
-            st, r = er.request("POST", search_path(idx, "ignore_unavailable=true"), body)
-            if st == 404:
-                return ids
-            try:
-                hits = complete_hits(st, r)
-            except IncompleteRead as e:
-                raise PoolEraseError("leaf scan failed") from e
-            if not hits:
-                return ids
-            for h in hits:
-                ids.update(h["_source"].get("lin_leaf_ids", []))
-            after = hits[-1]["sort"]
+        """The leaf ids of every document of the pool's own leaf index (every physical index behind the alias). An absent index is
+        verified absence (a resumed delete after the drop); anything else that is not a complete read raises."""
+        try:
+            hits = scan(self._er(), pool_index(self.tenant, cls, pool, "leaf"), {"_source": ["lin_leaf_ids"], "query": {"match_all": {}}},
+                        page=PAGE, missing_ok=True)
+        except IncompleteRead as e:
+            raise PoolEraseError("leaf scan failed") from e
+        return {i for h in hits for i in (h.get("_source") or {}).get("lin_leaf_ids", [])}
 
     def _key_inventory(self, cls: str, pool: str) -> tuple[list, set]:
         """The closure's documents and the COMPLETE set of data-key ids of the pool: every leaf of the pool's own index, and the key id of
         every key-holding document (`KEY_KINDS`) in the closure: the source documents of the pool (a write that never reached its
         projection included) and its held saves. Read before anything is deleted; the keys are destroyed before the documents that name
         them, so a crash at any step leaves either the keys destroyed or the documents that name them in place (a resume finds them)."""
+        self._manifest_indices = set()
         docs = [] if self._b["class_level"] else self._docs(pool)
         keys = set(self._leaf_ids(cls, pool)) | {key for _, _, kind, key in docs if kind in KEY_KINDS and key}
         return docs, keys
 
     def _physical(self, cls: str, pool: str) -> list[str]:
-        st, r = self._er().request("GET", f"/{pool_index(self.tenant, cls, pool, 'leaf')}/_alias")
-        return sorted(r) if st == 200 and isinstance(r, dict) else []
+        """Every physical index of the pool: the indices behind its leaf alias and the ones its manifest names. A failed or malformed
+        alias lookup raises (review F11); only a verified absence (404 `index_not_found_exception`) reads as none behind the alias."""
+        alias = pool_index(self.tenant, cls, pool, "leaf")
+        try:
+            behind = aliases(self._er(), alias)
+        except IncompleteRead as e:
+            raise PoolEraseError("index discovery failed") from e
+        named = {x for x in self._manifest_indices if x != alias and x.startswith(alias + "-")}
+        return sorted(set(behind) | named)
+
+    def _gone(self, cls: str, pool: str, physical: list) -> None:
+        """Raise unless the leaf alias and every physical index of the pool are verifiably absent. Runs before the pool's own records
+        are deleted, so a drop that failed leaves the pool in state `deleting` with its manifest, and a retry finds the indices."""
+        er = self._er()
+        for name in [pool_index(self.tenant, cls, pool, "leaf"), *physical]:
+            try:
+                left = aliases(er, name)
+            except IncompleteRead as e:
+                raise PoolEraseError("index removal could not be confirmed") from e
+            if left:
+                raise PoolEraseError("an index of the pool is still there")
 
     @staticmethod
     def _del(er, index: str, did: str, rc) -> None:
@@ -153,6 +160,7 @@ class PoolEraser:
                 for phys in physical:
                     self._drop(phys)
                     rc.indices_dropped.append(phys)
+                self._gone(cls, pool, physical)   # the drop callable's result is not trusted: absence is read back
             self._pause("indices")
             for index, did in last:
                 self._del(er, index, did, rc)

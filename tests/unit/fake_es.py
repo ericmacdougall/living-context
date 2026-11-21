@@ -53,9 +53,10 @@ class FakeEs:
             return 200, {"docs": [({"_id": i, "found": True, "_source": docs[i], "_seq_no": 1, "_primary_term": 1} if i in docs
                                    else {"_id": i, "found": False}) for i in body["ids"]]}
         hits = [(i, s) for i, s in docs.items() if self._match(s, body["query"])]
+        shards = {"total": 1, "successful": 1, "skipped": 0, "failed": 0}   # a complete answer, as Elasticsearch gives
         if m.group(2) == "_count":
-            return 200, {"count": len(hits)}
-        out = {"hits": {"hits": [{"_id": i, "_source": s} for i, s in hits[: body.get("size", 10)]]}}
+            return 200, {"count": len(hits), "_shards": shards}
+        out = {"timed_out": False, "_shards": shards, "hits": {"hits": [{"_id": i, "_source": s} for i, s in hits[: body.get("size", 10)]]}}
         if "aggs" in body:
             out["aggregations"] = {}
             for name, a in body["aggs"].items():
@@ -76,17 +77,109 @@ class FakeAuthz:
     def request(self, method, path, body=None, **kw):
         if self.down:
             return 503, {}
+        p = path.split("?")[0]
+        if p.endswith("/_pit"):   # a point in time: the snapshot is the record ids in insertion order (one shard)
+            self.pits = getattr(self, "pits", {})
+            pid = f"pit{len(self.pits)}"
+            self.pits[pid] = list(self.docs)
+            return 200, {"id": pid, "_shards": {"total": 1, "successful": 1, "skipped": 0, "failed": 0}}
+        if p == "/_pit" and method == "DELETE":
+            return 200, {"succeeded": getattr(self, "pits", {}).pop(body["id"], None) is not None, "num_freed": 1}
         did = path.split("/_doc/")[1].split("?")[0] if "/_doc/" in path else None
         if method == "PUT":
             self.docs[did] = body
             return 200, {}
         if method == "DELETE":
             return (200, {}) if self.docs.pop(did, None) is not None else (404, {})
-        kinds = body["query"]["terms"]["kind"]
-        keys = [i for i, d in self.docs.items() if d.get("kind") in kinds]          # insertion order stands for `_doc`
+        q = body["query"]
+        kinds = q["terms"]["kind"] if "terms" in q else [q["term"]["kind"]]
+        ids = self.pits[body["pit"]["id"]] if "pit" in body else list(self.docs)
+        keys = [i for i in ids if i in self.docs and self.docs[i].get("kind") in kinds]   # insertion order stands for `_shard_doc`
         start = (int(body["search_after"][0]) + 1) if body.get("search_after") else 0
         size = int(body.get("size", 10))
         self.searches = getattr(self, "searches", 0) + 1
         page = list(enumerate(keys))[start:start + size]
         return 200, {"timed_out": False, "_shards": {"total": 1, "successful": 1, "skipped": 0, "failed": 0},   # a complete answer, as ES gives
                      "hits": {"hits": [{"_id": i, "_source": self.docs[i], "sort": [n]} for n, i in page]}}
+
+
+class ShardedFake(FakeEs):
+    """Several one-shard indices behind one pattern, with the two cursors Elasticsearch offers a multi-index scan:
+
+    * `sort: _doc` gives each hit its shard-LOCAL document number, so the first document of every index has sort value [0]; a
+      `search_after: [k]` continues after k in every shard, so a page boundary that falls between equal values skips the rest (F12);
+    * a point in time (`POST /<pattern>/_pit`, then `POST /_search` with `pit` and `sort: _shard_doc`) gives every hit a value unique
+      across the snapshot (shard number and document number), so `search_after` neither skips nor repeats.
+
+    `partial` makes the next N search answers HTTP 200 with a failed shard; `alias_status` answers `GET /<name>/_alias`. Not a
+    model of Elasticsearch beyond these cursors: the real behaviour is in the `_es` tests."""
+
+    def __init__(self):
+        super().__init__()
+        self.aliases, self.pits, self.partial, self.alias_status, self.closed_pits = {}, {}, 0, None, []
+
+    def _indices(self, pattern):
+        import fnmatch
+        return sorted(n for n in self.docs for part in pattern.split(",")
+                      if fnmatch.fnmatchcase(n, part) or part in self.aliases.get(n, ()))
+
+    def _shards(self, n):
+        if self.partial:
+            self.partial -= 1
+            return {"total": max(n, 1), "successful": max(n, 1) - 1, "skipped": 0, "failed": 1}
+        return {"total": n, "successful": n, "skipped": 0, "failed": 0}
+
+    def request(self, method, path, body=None, **kw):
+        self.requests.append((method, path, body))
+        p, _, qs = path.partition("?")
+        if method == "DELETE" and p == "/_pit":
+            self.closed_pits.append(body["id"])
+            return 200, {"succeeded": self.pits.pop(body["id"], None) is not None, "num_freed": 1}
+        m = re.match(r"^/([^/]+)/(_refresh|_pit|_search|_alias|_doc/(.+))$", p)
+        if p == "/_search":
+            pit = self.pits[body["pit"]["id"]]
+            return self._page(pit, body, unique=True)
+        assert m, path
+        target, op = m.group(1), m.group(2)
+        if op == "_alias":
+            if self.alias_status is not None:
+                return self.alias_status, {"error": {"type": "unavailable_shards_exception"}}
+            hit = {n: {"aliases": {target: {}}} for n, al in self.aliases.items() if target in al}
+            if target in self.docs:
+                hit[target] = {"aliases": {}}
+            return (200, hit) if hit else (404, {"error": {"type": "index_not_found_exception"}, "status": 404})
+        if op.startswith("_doc/"):
+            phys = self._indices(target)
+            did = m.group(3)
+            for n in phys:
+                if did in self.docs[n] and method == "DELETE":
+                    del self.docs[n][did]
+                    return 200, {"result": "deleted"}
+            return 404, {"result": "not_found"}
+        phys = self._indices(target)
+        if op == "_refresh":
+            return 200, {"_shards": self._shards(len(phys))}
+        if op == "_pit":
+            if not phys and "ignore_unavailable=true" not in qs and "*" not in target:
+                return 404, {"error": {"type": "index_not_found_exception"}, "status": 404}
+            pid = f"pit{len(self.pits) + len(self.closed_pits)}"
+            self.pits[pid] = [(n, list(self.docs[n].items())) for n in phys]   # the snapshot
+            return 200, {"id": pid, "_shards": self._shards(len(phys))}
+        return self._page([(n, list(self.docs[n].items())) for n in phys], body, unique=False)
+
+    def _page(self, snapshot, body, *, unique):
+        hits = []
+        for shard, (name, docs) in enumerate(snapshot):
+            for local, (did, src) in enumerate(docs):
+                if self._match(src, body["query"]) if "match_all" not in body["query"] else True:
+                    key = [shard * 2 ** 31 + local] if unique else [local]
+                    hits.append((key, shard, name, did, src))
+        hits.sort(key=lambda h: (h[0], h[1]))
+        if body.get("search_after") is not None:
+            hits = [h for h in hits if h[0] > list(body["search_after"])]
+        size = body.get("size", 10)
+        fields = body.get("_source")
+        page = [{"_index": name, "_id": did, "sort": key,
+                 "_source": {k: v for k, v in src.items() if fields is None or fields is True or k in fields}}
+                for key, _, name, did, src in hits[:size]]
+        return 200, {"timed_out": False, "_shards": self._shards(len(snapshot)), "hits": {"hits": page}}

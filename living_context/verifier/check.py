@@ -85,6 +85,33 @@ def grep_data_roots(roots: Iterable[Path], needles: Iterable[str]) -> dict:
     return found
 
 
+def _complete(st, r, what: str) -> dict:
+    """The verifier's OWN check that a search answer is complete (DESIGN 14.7: it shares no read path with the gateway): HTTP 200, not
+    timed out or terminated early, every shard successful and none failed, a hits section. Anything else is a step that cannot run,
+    never an absence (review F13)."""
+    if st != 200 or not isinstance(r, dict) or r.get("timed_out") is not False or r.get("terminated_early"):
+        raise VerifierError(f"{what}: not a complete read ({st})")
+    sh = r.get("_shards")
+    if not isinstance(sh, dict) or sh.get("failed") != 0 or not isinstance(sh.get("total"), int) or sh.get("successful") != sh.get("total"):
+        raise VerifierError(f"{what}: not every shard answered")
+    if not isinstance(r.get("hits"), dict) or not isinstance(r["hits"].get("hits"), list):
+        raise VerifierError(f"{what}: no hits section")
+    return r
+
+
+def _exact_total(r: dict, what: str) -> int:
+    total = r["hits"].get("total")
+    if not isinstance(total, dict) or total.get("relation") != "eq" or not isinstance(total.get("value"), int):
+        raise VerifierError(f"{what}: the total is not exact")
+    return total["value"]
+
+
+def _refreshed(st, r, what: str) -> None:
+    sh = r.get("_shards") if isinstance(r, dict) else None
+    if st != 200 or not isinstance(sh, dict) or sh.get("failed") != 0:
+        raise VerifierError(f"{what}: refresh failed ({st})")
+
+
 class Verifier:
     def __init__(self, es: EsClient, tenant: str, *, log_paths: Iterable[Path] = (), segment_dir: Optional[Path] = None,
                  data_roots: Iterable[Path] = ()):
@@ -93,10 +120,9 @@ class Verifier:
         self._roots = [Path(p) for p in data_roots]
 
     def _search(self, index: str, body: dict) -> list:
-        st, r = self._es.request("POST", f"/{index}/_search?ignore_unavailable=true&allow_no_indices=true", body)
-        if st != 200:
-            raise VerifierError(f"direct read failed ({st})")
-        return r["hits"]["hits"]
+        st, r = self._es.request("POST", f"/{index}/_search?ignore_unavailable=true&allow_no_indices=true&allow_partial_search_results=false",
+                                 body)
+        return _complete(st, r, "direct read")["hits"]["hits"]
 
     @property
     def _all(self) -> str:
@@ -184,9 +210,8 @@ class Verifier:
     # ---- the checks ---------------------------------------------------------------------------------------------------
     def probe(self, canaries: Canaries) -> Report:
         """Run every probe once and count what is found."""
-        st, _ = self._es.request("POST", f"/{self._all}/_refresh")
-        if st != 200:   # reading unrefreshed data could report a leftover as gone: a step that cannot run is an error
-            raise VerifierError(f"refresh before the probes failed ({st})")
+        st, r = self._es.request("POST", f"/{self._all}/_refresh")
+        _refreshed(st, r, "refresh before the probes")   # reading unrefreshed data could report a leftover as gone: an error, not a skip
         rep = Report()
 
         def step(name: str, probes: int, found: int):
@@ -248,24 +273,29 @@ def pool_residue(es: EsClient, tenant: str, pool: Optional[str] = None, leaf_ids
     executor): the indices of the tenant whose name carries the pool id, the documents of every index that name the pool in `pool` or
     `lin_pools` or a leaf of it in `lin_leaf_ids`, and a phrase search for each canary text. Everything must be zero after the delete;
     run it first against a pool that exists (the positive control) so a skipped index cannot read as clean."""
-    es.request("POST", f"/lc-{tenant}-*/_refresh?ignore_unavailable=true")
+    st, r = es.request("POST", f"/lc-{tenant}-*/_refresh?ignore_unavailable=true")
+    _refreshed(st, r, "pool residue")
     st, rows = es.request("GET", f"/_resolve/index/lc-{tenant}-*")
-    names = [r["name"] for k in ("indices",) for r in (rows.get(k, []) if st == 200 and isinstance(rows, dict) else [])]
+    if st != 200 or not isinstance(rows, dict) or not isinstance(rows.get("indices"), list):
+        raise VerifierError(f"pool residue: the index listing failed ({st})")   # a failed listing is never "no index of the pool"
+    names = [r["name"] for r in rows["indices"] if isinstance(r, dict) and isinstance(r.get("name"), str)]
     out = {"indices": sum(1 for n in names if pool and f"-{pool}-" in n), "docs": 0, "by_index": {}, "text": 0}
     should = [{"term": {"pool": pool}}, {"term": {"lin_pools": pool}}] if pool else []
     if leaf_ids:
         should.append({"terms": {"lin_leaf_ids": sorted(leaf_ids)}})
     if not should:
         raise VerifierError("nothing to check")
-    st, r = es.request("POST", f"/lc-{tenant}-*/_search?ignore_unavailable=true", {
+    path = f"/lc-{tenant}-*/_search?ignore_unavailable=true&allow_partial_search_results=false"
+    st, r = es.request("POST", path, {
         "size": 0, "track_total_hits": True, "query": {"bool": {"should": should, "minimum_should_match": 1}},
         "aggs": {"by": {"terms": {"field": "_index", "size": 200}}}})
-    if st != 200:
-        raise VerifierError("residue search failed")
-    out["docs"] = r["hits"]["total"]["value"]
-    out["by_index"] = {b["key"]: b["doc_count"] for b in r["aggregations"]["by"]["buckets"]}
+    r = _complete(st, r, "pool residue search")
+    out["docs"] = _exact_total(r, "pool residue search")
+    buckets = (r.get("aggregations") or {}).get("by", {}).get("buckets")
+    if not isinstance(buckets, list):
+        raise VerifierError("pool residue search: no per-index counts")
+    out["by_index"] = {b["key"]: b["doc_count"] for b in buckets}
     for t in texts:
-        st, r = es.request("POST", f"/lc-{tenant}-*/_search?ignore_unavailable=true", {
-            "size": 0, "track_total_hits": True, "query": {"match_phrase": {"text": t}}})
-        out["text"] += r["hits"]["total"]["value"] if st == 200 else 0
+        st, r = es.request("POST", path, {"size": 0, "track_total_hits": True, "query": {"match_phrase": {"text": t}}})
+        out["text"] += _exact_total(_complete(st, r, "pool residue text search"), "pool residue text search")
     return out

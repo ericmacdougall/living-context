@@ -24,6 +24,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 from .es import EsClient
 from .indices import class_index, check_pool_id
+from .reads import IncompleteRead, complete_count, complete_hits
 
 _ID_CHARS = re.compile(r"^[A-Za-z0-9:_.-]{3,200}$")
 READABLE_KINDS = ("ctl", "log", "sq")
@@ -154,6 +155,11 @@ class ClassReader:
         st, r = self._client_for(cls).request(method, path.replace("{index}", index), body)
         if st not in (200, 404) or not isinstance(r, (dict, list)):
             raise ReaderRefused("failed")
+        if st == 200 and (search or path.endswith("/_count")):
+            try:   # HTTP 200 with a failed shard or a time-out is not an answer: a hold missing from it would read as no hold (F13)
+                complete_hits(st, r) if search else complete_count(st, r)
+            except IncompleteRead as e:
+                raise ReaderRefused("incomplete") from e
         return st, r
 
     def _check_ids(self, ids: Sequence[str], pool: str) -> None:

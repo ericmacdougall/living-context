@@ -27,7 +27,7 @@ from .admin import GrantStore
 from .handler import EsGate
 from .journal import TombstoneJournal
 from .keyowner import invalidate_all
-from .reads import complete_hits, search_path
+from .reads import scan
 from .revocation import OPEN, RevocationService
 from .sessions import EpochTable
 
@@ -52,27 +52,18 @@ def grant_persister(gate: EsGate, tenant: str) -> Callable[[Principal], None]:
 
 
 def load_grants(gate: EsGate, tenant: str, *, page: int = 1000) -> list[Principal]:
-    """Every grant record of the tenant's authz index, paged with `search_after` until exhausted. A failed or partial page is an error
+    """Every grant record of the tenant's authz index, in one snapshot paged until exhausted (`reads.scan`). A failed or partial page is an error
     (`reads.complete_hits`; the caller starts with no grants, which fails closed: nobody can mint a session until a grant is made
     again)."""
-    c = gate.client(tenant, "authz")
-    out, after = [], None
-    while True:
-        body = {"size": page, "sort": [{"_doc": "asc"}], "query": {"term": {"kind": "grant"}}}
-        if after is not None:
-            body["search_after"] = after
-        st, r = c.request("POST", search_path(f"lc-{tenant}-authz"), body)
-        hits = complete_hits(st, r)
-        if not hits:
-            return out
-        for h in hits:
-            s = h["_source"]
-            try:
-                out.append(Principal(tenant, s["principal"], frozenset(Role(x) for x in s["roles"]), frozenset(s.get("read", [])),
-                                     frozenset(s.get("write", [])), s.get("own_class") or None))
-            except (KeyError, ValueError):
-                continue   # a record that does not parse is no grant
-        after = hits[-1]["sort"]
+    out = []
+    for h in scan(gate.client(tenant, "authz"), f"lc-{tenant}-authz", {"query": {"term": {"kind": "grant"}}}, page=page):
+        s = h["_source"]
+        try:
+            out.append(Principal(tenant, s["principal"], frozenset(Role(x) for x in s["roles"]), frozenset(s.get("read", [])),
+                                 frozenset(s.get("write", [])), s.get("own_class") or None))
+        except (KeyError, ValueError):
+            continue   # a record that does not parse is no grant
+    return out
 
 
 @dataclass
