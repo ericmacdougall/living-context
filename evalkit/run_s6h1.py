@@ -41,7 +41,7 @@ E5_WORKER_MB = 1_024                # one up-front embedding process (MEASURED: 
 RC = {"COMPLETE": 0, "STOPPED": 3, "CAP_REACHED": 4, "BUILD_FAILED": 5, "PAUSED_THROTTLE": 75, "LIMIT_REACHED": 76, "ERROR": 1,
       "REFUSED": 2, "PREBUILT": 0}
 STAMP_KEYS = ("commit", "cap", "approval_ref", "release_ref", "freeze_sha256", "a0_fields", "model")
-PREBUILD_KEYS = ("commit", "code_sha256", "cap", "approval_ref", "amendment_ref", "a0_fields", "model", "model_kind", "threads")
+PREBUILD_KEYS = ("commit", "code_sha256", "cap", "approval_ref", "amendment_ref", "a0_fields", "threads")   # and mk.IDENTITY
 
 
 def _registry_rows(path) -> List[dict]:
@@ -123,8 +123,7 @@ def prebuild_record(run_dir) -> Optional[dict]:
 
 def _prebuild_now(a, root: Path) -> dict:
     return {"commit": a.commit, "code_sha256": fz.code_digest(root), "cap": a.approved_cap, "approval_ref": a.approval_ref,
-            "amendment_ref": getattr(a, "amendment_ref", ""), "a0_fields": a.a0_fields, "model": a.model,
-            "model_kind": getattr(a, "model_kind", "claude"), "threads": a.threads}
+            "amendment_ref": getattr(a, "amendment_ref", ""), "a0_fields": a.a0_fields, "threads": a.threads, **mk.record(a)}
 
 
 def _prebuild_prereqs(a, rd: Path, root: Path) -> List[str]:
@@ -145,6 +144,8 @@ def _prebuild_prereqs(a, rd: Path, root: Path) -> List[str]:
         for k in PREBUILD_KEYS:
             if old.get(k) != now[k]:
                 why.append("the early build must continue with the same %s as %s" % (k, PREBUILD_FILE))
+        for k in mk.differs(old, a):
+            why.append("the early build must continue with the same %s as %s" % (k, PREBUILD_FILE))
     elif any(r.get("stage") == PREBUILD_STAGE for r in rows):
         why.append("the stamp registry has an early build row for this run directory but no %s" % PREBUILD_FILE)
     elif (rd / "BUILT.json").exists() or (rd / "counter").exists():     # an ingested tenant refused before any call is attached
@@ -175,8 +176,9 @@ def _stamped_prereqs(a, rd: Path, manifest_path: Path, root: Path) -> List[str]:
         for k in STAMP_KEYS:
             if old.get(k) != now[k]:
                 why.append("--resume must continue the same run: %s differs from the stamp" % k)
-        if old.get("model_kind", "claude") != getattr(a, "model_kind", "claude"):
-            why.append("--resume must continue the same run: model_kind differs from the stamp")
+        for k in mk.differs(old, a):
+            if k != "model":                # compared with STAMP_KEYS above
+                why.append("--resume must continue the same run: %s differs from the stamp" % k)
     if a.resume and not stamp.exists():
         why.append("--resume needs the stamp of an earlier start in the run directory")
     if str(getattr(a, "stamp_registry", "") or "").strip():
@@ -192,9 +194,11 @@ def _stamped_prereqs(a, rd: Path, manifest_path: Path, root: Path) -> List[str]:
     pre = prebuild_record(rd)
     if pre is not None:                 # the early build (14.5) must be the code, fields and model under test
         now = _prebuild_now(a, root)
-        for k in ("commit", "code_sha256", "a0_fields", "model", "model_kind", "threads", "cap", "approval_ref"):
+        for k in ("commit", "code_sha256", "a0_fields", "threads", "cap", "approval_ref"):
             if pre.get(k) != now[k]:
                 why.append("the early build's %s (%s) is not this run's: the prebuilt tree is not the one under test" % (k, PREBUILD_FILE))
+        for k in mk.differs(pre, a):
+            why.append("the early build's %s (%s) is not this run's: the prebuilt tree is not the one under test" % (k, PREBUILD_FILE))
     elif (rd / "BUILT.json").exists() and not stamp.exists():
         why.append("the run directory holds a built tree with neither a stamp nor %s" % PREBUILD_FILE)
     return why
@@ -292,6 +296,10 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
     proven_max_leaves = int(mem_proof(a.mem_proof, root)["leaves"])
     stamp = run_dir / "STAMP.json"
     pre = prebuild_record(run_dir)
+    try:                                  # the model port (and its key source) is built before any work, stamp or charge
+        prepared = mk.prepare(a, run_dir, runner=runner)
+    except mk.PortUnavailable as e:
+        return write_state(run_dir, "REFUSED", error=str(e))
     # nothing is stamped until every no-call gate has passed (data counts, pool count, memory, budget): a refusal leaves the run
     # directory and the host's stamp registry unspent, so a corrected start is still the stage's one stamped run
     if prebuild:                          # the pool contents only: the questions, answers and gold stay sealed (EXPERIMENT 14.5)
@@ -377,7 +385,7 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
         et.close()
         return write_state(run_dir, "REFUSED", leaves=n_leaves, error=why[0])
     if prebuild and pre is None:
-        pre = dict(mk.record(a), **_prebuild_now(a, root), stage=PREBUILD_STAGE, pool_contents=len(pool), pool_sha256=pool_sha,
+        pre = dict(mk.stamp_record(a, prepared), **_prebuild_now(a, root), stage=PREBUILD_STAGE, pool_contents=len(pool), pool_sha256=pool_sha,
                    leaves=n_leaves,
                    embed_workers=embed_workers, ingest_writers=ingest_writers, mem_proof_sha256=fz._sha(Path(a.mem_proof)),
                    started=time.time())
@@ -390,13 +398,13 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
                                      "release_ref": a.release_ref, "freeze_sha256": fsha, "a0_fields": a.a0_fields, "model": a.model,
                                      "beta": vals["beta"], "mem_proof_sha256": fz._sha(Path(a.mem_proof)), "leaves": n_leaves,
                                      "concurrency": n_par, "concurrency_reason": getattr(a, "concurrency_reason", "") or "",
-                                     "prebuild": pre, **mk.record(a), "started": time.time()}, sort_keys=True))
+                                     "prebuild": pre, **mk.stamp_record(a, prepared), "started": time.time()}, sort_keys=True))
         with open(a.stamp_registry, "a") as f:
             f.write(json.dumps({"stage": STAGE, "run_dir": os.path.realpath(a.run_dir), "commit": a.commit, "freeze_sha256": fsha,
                                 "at": time.time()}, sort_keys=True) + "\n")
 
     budget = Budget(run_dir / "counter", a.approved_cap)
-    inner = mk.capped_port(a, run_dir, budget, runner=runner)
+    inner = mk.capped_port(a, run_dir, budget, prepared=prepared)
     journal = Journal(run_dir / "journal.jsonl")
     adaptive = n_par > 1 and not getattr(a, "fixed_concurrency", False)
     port = ResilientPort(inner, budget, journal, run_dir / "STOP", max_retries=a.max_retries, base_delay_s=a.base_delay,
@@ -450,7 +458,8 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
         extra.update(questions_done=len(ledger.rows), questions=len(fs.questions))
     extra.update(counter=budget.count(), cap=a.approved_cap, leaves=n_leaves, replayed=port.replayed, fresh=port.fresh,
                  lost_in_flight=port.lost, throttled=port.throttled, limited=port.limited, concurrency_now=port.slots.limit,
-                 models_reported=sorted(inner.models_reported), concurrency_changes=port.slots.changes)
+                 models_reported=sorted(inner.models_reported), providers_reported=sorted(inner.providers_reported),
+                 concurrency_changes=port.slots.changes)
     if state == "COMPLETE":
         dec = st.decide(ledger, fs, clusters, shuffled_qids=shuffled_qids, shuffled_min=vals["thresholds"]["shuffled_min_point"])
         pool_label = "whole pool (%d contents, %d leaves)" % (len(pool), n_leaves)

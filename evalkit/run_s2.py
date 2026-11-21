@@ -47,10 +47,15 @@ def run(a, pick_questions, *, embedder=None, runner=None, loader=None, tenant_fa
     run_dir = Path(a.run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     stamp = run_dir / "STAMP.json"
+    try:                                  # the model port (and its key source) is built before any stamp, work or charge
+        prepared = mk.prepare(a, run_dir, runner=runner)
+    except mk.PortUnavailable as e:
+        print("REFUSED: %s" % e, flush=True)
+        return 2
     if not stamp.exists():
         stamp.write_text(json.dumps({"stage": a.stage, "commit": a.commit, "cap": a.approved_cap, "approval_ref": a.approval_ref,
                                      "n_questions": a.n_questions, "a0_fields": a.a0_fields, "shuffled_n": int(getattr(a, "shuffled_n", 0) or 0), "embedder": e5.MODEL_ID,
-                                     **mk.record(a), "started": time.time()}, sort_keys=True))
+                                     **mk.stamp_record(a, prepared), "started": time.time()}, sort_keys=True))
     else:
         old = json.loads(stamp.read_text())
         if old.get("commit") != a.commit:        # `check_prereqs` allows this only for a run that never charged a call, or under a
@@ -104,7 +109,7 @@ def run(a, pick_questions, *, embedder=None, runner=None, loader=None, tenant_fa
                                                                               et.leaf_count_in_es()), flush=True)
 
     budget = Budget(run_dir / "counter", a.approved_cap)
-    inner = mk.capped_port(a, run_dir, budget, runner=runner)
+    inner = mk.capped_port(a, run_dir, budget, prepared=prepared)
     journal = Journal(run_dir / "journal.jsonl")
     n_par = int(getattr(a, "concurrency", 1) or 1)
     adaptive = n_par > 1 and not getattr(a, "fixed_concurrency", False)
@@ -168,6 +173,7 @@ def run(a, pick_questions, *, embedder=None, runner=None, loader=None, tenant_fa
     extra.update(counter=budget.count(), cap=a.approved_cap, questions_done=len(ledger.rows), questions=len(dev), replayed=port.replayed,
                  fresh=port.fresh, lost_in_flight=port.lost, throttled=port.throttled,
                  limited=port.limited, concurrency_now=port.slots.limit, models_reported=sorted(inner.models_reported),
+                 providers_reported=sorted(inner.providers_reported),
                  concurrency_changes=port.slots.changes)
     if state == "COMPLETE":
         qids = [q.qid for q in dev if q.gold_session_ids and not q.is_abstention]

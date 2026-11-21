@@ -206,23 +206,29 @@ class RunOut:
 
 @dataclass
 class ApiReply:
-    """One HTTP model call (the `muse` model kind, `evalkit.model_kind`): the reply text, token counts, latency, and the outcome
-    flags the port maps: `throttled` (HTTP 429), `retryable` (503 or 504: retried as a throttle, bounded), `limited` (a quota or
-    billing refusal, HTTP 402: the stage stops at once, never retried), `model_mismatch` (the response reported another model than
-    the requested one: the stage stops at once, never retried), or another `error`. `model` is the model the response reported."""
+    """One HTTP model call (the `muse` model kind; `model_kind.MuseRunner` reads it from `muse_api.MusePort`'s envelope): the answer
+    text (None unless the call answered and finished), the token counts the response reported (completion includes reasoning),
+    latency, and the outcome: `throttled` (429, 503, OpenRouter's in-flight 402: the stage pauses and backs off, Retry-After as the
+    floor), `limited` (a billing, credit or budget refusal, 402 or OpenRouter's 403: the stage stops at once, never retried),
+    `model_mismatch` (the response reported another model: the stage stops at once, never retried), or another `error` (a failed
+    call, counted in the failure streak; an answer cut by `finish_reason` length is one). `model` and `upstream_provider` are what
+    the response reported."""
     text: Optional[str]
-    input_tokens: int = 0
-    output_tokens: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
     reasoning_tokens: int = 0
+    cached_tokens: int = 0
     latency_s: float = 0.0
     throttled: bool = False
-    retryable: bool = False
     limited: bool = False
     model_mismatch: bool = False
     error: str = ""
     status: Optional[int] = None
     retry_after_s: Optional[float] = None
     model: str = ""
+    upstream_provider: str = ""
+    finish_reason: str = ""
+    cost_usd: Optional[float] = None
 
 
 class Pacer:
@@ -288,6 +294,7 @@ class CappedPort:
         self.spawned = 0
         self.rows: List[dict] = []
         self.models_reported: set = set()             # the API kind: every model id a response reported
+        self.providers_reported: set = set()          # the API kind: every upstream provider a response reported
         self.row_extra: Callable[[], dict] = dict        # set by ResilientPort: the effective concurrency at the time of the call
         self._log.parent.mkdir(parents=True, exist_ok=True)
 
@@ -364,17 +371,21 @@ class CappedPort:
         return out
 
     def _api(self, name: str, inputs: Mapping[str, Any], prompt: str, n: int, rep: "ApiReply") -> CallResult:
-        """The HTTP model kind: the same charge, row, refusal and scoring rules as the CLI, from an `ApiReply`. A 429 or a 503/504
-        pauses (back-off, Retry-After honoured) and is not a failure of the streak; a quota refusal stops the stage at once."""
+        """The HTTP model kind: the same charge, row, refusal and scoring rules as the CLI, from an `ApiReply`. A throttle pauses
+        (back-off, Retry-After honoured) and is not a failure of the streak; a billing refusal or a model mismatch stops the stage at
+        once; any other error, an unfinished answer included, is a failed call of the streak and never an answer."""
         with self._lock:
             row = {**self.row_extra(), "n": n, "task": name, "prompt_chars": len(prompt),
                    "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:16], "latency_s": round(float(rep.latency_s or 0), 3),
                    "argv": self._argv, "prompt_version": PROMPT_VERSION, "http_status": rep.status,
-                   "input_tokens": int(rep.input_tokens or 0), "output_tokens": int(rep.output_tokens or 0),
-                   "reasoning_tokens": int(rep.reasoning_tokens or 0), "model_reported": rep.model or "",
-                   "stdout_chars": len(rep.text or "")}
+                   "prompt_tokens": int(rep.prompt_tokens or 0), "completion_tokens": int(rep.completion_tokens or 0),
+                   "reasoning_tokens": int(rep.reasoning_tokens or 0), "cached_tokens": int(rep.cached_tokens or 0),
+                   "model_reported": rep.model or "", "upstream_provider": rep.upstream_provider or "",
+                   "finish_reason": rep.finish_reason or "", "cost_usd": rep.cost_usd, "stdout_chars": len(rep.text or "")}
             if rep.model:
                 self.models_reported.add(rep.model)
+            if rep.upstream_provider:
+                self.providers_reported.add(rep.upstream_provider)
             if rep.model_mismatch:
                 row.update(limited=True, error="model_mismatch")
                 self._append(row)
@@ -383,10 +394,10 @@ class CappedPort:
                 row.update(limited=True, error="limit")
                 self._append(row)
                 raise StageLimited("quota or billing refusal (HTTP %s) at call %d" % (rep.status, n))
-            if rep.throttled or rep.retryable:
-                row.update(throttled=True, error="throttled" if rep.throttled else "unavailable", retry_after_s=rep.retry_after_s)
+            if rep.throttled:
+                row.update(throttled=True, error="throttled", retry_after_s=rep.retry_after_s)
                 self._append(row)
-                raise StagePaused("%s at call %d" % (row["error"], n), retry_after_s=rep.retry_after_s)
+                raise StagePaused("throttled (HTTP %s) at call %d" % (rep.status, n), retry_after_s=rep.retry_after_s)
             failed = bool(rep.error) or rep.text is None
             self._fail_streak = self._fail_streak + 1 if failed else 0
             if self._fail_streak >= MAX_CLI_FAILURE_STREAK:
@@ -395,7 +406,7 @@ class CappedPort:
                 raise StageLimited("%d consecutive API failures, last at call %d" % (self._fail_streak, n))
             out = self._judge(name, inputs, rep.text, row)
             if failed:
-                row["error"] = "api_error"
+                row.update(error="api_error", api_error=rep.error or "no_answer")
             self._append(row)
             if failed or not row["schema_ok"]:
                 return CallResult(False, error=row.get("error") or ("parse" if out is None else "schema"))

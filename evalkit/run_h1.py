@@ -44,6 +44,8 @@ def check_prereqs(a, *, embed=embed_stub.embed) -> List[str]:
     why: List[str] = []
     if a.stage not in STAGES:
         why.append("unknown stage")
+    if a.stage == "DEV-STUB" and getattr(a, "model_kind", "") == "muse":
+        why.append("--model-kind muse runs only in S2 or S3")
     if a.splits != ["pilot"]:
         why.append("only the pilot split may be run here; the held-out and fresh questions are never loaded")
     if a.stage in ("S2", "S3"):
@@ -92,9 +94,9 @@ def check_prereqs(a, *, embed=embed_stub.embed) -> List[str]:
                 #               done may continue under an amendment; the stamp records the earlier commit (and the amendment)
             if old.get(k, 0 if k == "shuffled_n" else None) != now:
                 why.append("--resume must continue the same run: %s differs from the stamp (a new cap needs a new approval and a new run)" % k)
-        if old.get("model_kind", "claude") != getattr(a, "model_kind", "claude") or \
-                old.get("model", getattr(a, "model", "")) != getattr(a, "model", ""):
-            why.append("--resume must continue the same run: the model kind or model differs from the stamp (a new model is a new run)")
+        from . import model_kind as mk
+        for k in mk.differs(old, a):
+            why.append("--resume must continue the same run: %s differs from the stamp (a new model or setting is a new run)" % k)
     if a.stage in ("S2", "S3"):
         n_par = getattr(a, "concurrency", 1)
         why += par.check_concurrency(n_par, getattr(a, "concurrency_reason", ""))
