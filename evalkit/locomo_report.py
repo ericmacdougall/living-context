@@ -311,7 +311,7 @@ def render(res: dict, run: Run) -> str:
          "Pool sizes (leaves per conversation, file order): %s. These pools are small: see the chance reference in every table." % ", ".join(str(c["pools"][k]) for k in sorted(c["pools"])), ""]
     if res["a0_all"].get("n"):
         a = res["a0_all"]
-        L += ["## A0 on all eligible questions (no model call)", "", "n = %d questions." % a["n"], "", "| Metric | A0 [95%% CI, primary cluster] | conversation-cluster CI |", "|---|---|---|"]
+        L += ["## A0 on all eligible questions (no model call)", "", "n = %d questions." % a["n"], "", "| Metric | A0 [95% CI, primary cluster] | conversation-cluster CI |", "|---|---|---|"]
         for m in ALL_METRICS:
             L.append("| %s | %s | %s |" % (LABEL[m], cell(a["metrics"][m]), cell(a["metrics"][m], True)))
         L += ["| chance reference, gold-leaf recall@5 / @10 | %s / %s | |" % (f3(a["chance"]["leaf_r5"]), f3(a["chance"]["leaf_r10"])), "",
