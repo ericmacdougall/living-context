@@ -201,14 +201,15 @@ def timing(rows: Sequence[dict], key: str) -> Optional[dict]:
 def cost(run: Run) -> dict:
     by: Dict[str, dict] = {}
     for r in run.calls:
-        b = by.setdefault(r.get("task", "?"), {"calls": 0, "valid": 0, "lat": [], "in": 0, "out": 0, "throttled": 0})
+        b = by.setdefault(r.get("task", "?"), {"calls": 0, "valid": 0, "schema": 0, "lat": [], "in": 0, "out": 0, "throttled": 0})
         b["calls"] += 1
+        b["schema"] += bool(r.get("schema_ok"))
         b["valid"] += bool(r.get("strict_ok"))
         b["throttled"] += bool(r.get("throttled"))
         b["lat"].append(float(r.get("latency_s", 0.0)))
         b["in"] += sum(int(r.get(k, 0) or 0) for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
         b["out"] += int(r.get("output_tokens", 0) or 0)
-    tasks = {k: {"calls": b["calls"], "valid": b["valid"], "throttled": b["throttled"], "input_tokens": b["in"], "output_tokens": b["out"],
+    tasks = {k: {"calls": b["calls"], "valid": b["valid"], "schema_ok": b["schema"], "throttled": b["throttled"], "input_tokens": b["in"], "output_tokens": b["out"],
                  "latency_median_s": statistics.median(b["lat"]), "latency_p90_s": pct(b["lat"], 0.9)} for k, b in by.items()}
     allrows = [r for rows in run.done.values() for r in rows.values()]
     shuf = [r["shuffled"] for r in allrows if "shuffled" in r]
@@ -230,12 +231,13 @@ def md_cost(c: dict) -> List[str]:
     L = ["### Cost and latency", "", "Model calls charged (build plus recall, retries included): **%d**." % c["calls_total"]]
     if c["cost_usd"] is not None:
         L.append("Reported cost on the subscription CLI (`cost_usd` summed over rows that report one): $%.2f." % c["cost_usd"])
-    L += ["", "| Task | calls | valid (strict) | throttled | input tokens | output tokens | latency median s | latency p90 s |", "|---|---|---|---|---|---|---|---|"]
+    L += ["", "| Task | calls | schema valid | strict valid | throttled | input tokens | output tokens | latency median s | latency p90 s |", "|---|---|---|---|---|---|---|---|---|"]
     for k, v in sorted(c["by_task"].items()):
-        L.append("| %s | %d | %d | %d | %d | %d | %.2f | %.2f |" % (k, v["calls"], v["valid"], v["throttled"], v["input_tokens"], v["output_tokens"],
+        L.append("| %s | %d | %d | %d | %d | %d | %d | %.2f | %.2f |" % (k, v["calls"], v["schema_ok"], v["valid"], v["throttled"], v["input_tokens"], v["output_tokens"],
                                                                     v["latency_median_s"], v["latency_p90_s"]))
     b, r = c["build"], c["recall"]
-    L += ["", "Tree build: %d conversations, %d build calls, %.0f s in total." % (b["conversations_built"], b["build_calls"], b["seconds"]), "",
+    L += ["", "Schema valid means the reply parsed and matched the task's schema. Strict valid also applies the prompt's own rules (for route calls, each "
+          "reason at most 12 words); the selections of a call that is schema valid but not strict valid are kept, as in S2.", "", "Tree build: %d conversations, %d build calls, %.0f s in total." % (b["conversations_built"], b["build_calls"], b["seconds"]), "",
           "Per tree recall (wall seconds around the recall, which includes waiting for a concurrency slot; calls inside a recall are serial): %s." % t(r["tree_wall_s"], " s"),
           "Calls per tree recall: %s." % t(r["tree_calls"]), "Holder (route) calls per recall: %s." % t(r["holder_calls"]),
           "Seconds the recall spent inside its calls: %s." % t(r["tree_call_wall_s"], " s"),
@@ -336,6 +338,12 @@ def render(res: dict, run: Run) -> str:
               "Lists returned empty: %d; failed recalls: %d; mean leaves returned: %.2f." % (s["shuffled_empty_lists"], s["shuffled_failed"], s["shuffled_mean_leaves"]), ""]
         L += md_block("A0, A1, A1-tree-only and SHUFFLED on those questions", s, ("A0", "A1", "A1-tree-only", "SHUFFLED"), names, metrics=("leaf_r5", "leaf_r10", "sess_r5", "mrr10"))
     L += md_cost(res["cost"])
+    L += ["## Limits (fixed in the plan, section 10)", "",
+          "- Pools are 25 to 60 leaves: a top-10 list covers a large share of a pool, A0 is already high, and the tree has one level of 2 to 4 nodes. "
+          "These numbers do not transfer to the 4,000 to 78,000 leaf pools of the LongMemEval work.",
+          "- Retrieval only: no answer generation and no end-to-end QA accuracy.",
+          "- Model: Sonnet through the Claude CLI at the version installed on the host; not the model of S3 or S6-H1.",
+          "- The session date is attached to the first leaf of a session only. Every figure is EXPLORATORY.", ""]
     return "\n".join(L) + "\n"
 
 
