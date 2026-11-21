@@ -229,6 +229,27 @@ class Prebuild(unittest.TestCase):
         self.assertIn("differs from the one the early build ingested", json.loads((self.run / "STATE.json").read_text())["error"])
         self.assertEqual(len(self.calls()), n)
 
+    def test_an_early_build_that_crashed_in_its_concurrent_ingest_reruns_in_the_same_run_directory(self):
+        # the host's crash at the first concurrent leaf writes: nothing stamped, registered or charged, and a rerun starts afresh
+        from tests.unit.test_run_s6h1 import MemTenant
+        real, crashed = MemTenant.ingest_concurrent, []
+
+        def crash_once(self_, pool, **kw):
+            if not crashed:
+                crashed.append(1)
+                raise TypeError("'NoneType' object is not subscriptable")
+            return real(self_, pool, **kw)
+        with mock.patch.object(MemTenant, "ingest_concurrent", crash_once):
+            with self.assertRaises(TypeError):
+                self.prebuild(ingest_writers=4)
+            for f in ("PREBUILD.json", "STAMP.json", "counter", "calls.jsonl", "tenant_state.json"):
+                self.assertFalse((self.run / f).exists(), f)
+            reg = self.base / "stamps.jsonl"
+            self.assertFalse(reg.exists() and reg.read_text().strip())
+            self.assertEqual(self.prebuild(ingest_writers=4), 0)
+        self.assertEqual(json.loads((self.run / "STATE.json").read_text())["state"], "PREBUILT")
+        self.assertTrue((self.run / "PREBUILD.json").exists())
+
     def test_a_prebuilt_tenant_is_never_reset(self):
         self.assertEqual(self.prebuild(), 0)
         (self.run / ds.RELEASE_FILE).write_text(self.release)

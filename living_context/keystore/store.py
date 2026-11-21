@@ -27,6 +27,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from .canon import canonicalise
 
 TOKEN_BYTES = 16
+TENANT_KEYS = ("subject", "principal", "idem", "content")
 _TENANT = re.compile(r"^[a-z0-9]{4,16}$")
 
 
@@ -78,9 +79,11 @@ class Keystore:
             CREATE TABLE IF NOT EXISTS identities(
                 token TEXT NOT NULL, exact TEXT NOT NULL, PRIMARY KEY(token, exact));
             """)
-        for name in ("subject", "principal", "idem", "content"):
+        for name in TENANT_KEYS:
             self._db.execute("INSERT OR IGNORE INTO tenant_keys(name, key) VALUES (?, ?)",
                              (name, os.urandom(32)))
+        for name in TENANT_KEYS:           # provisioned before the keystore is handed to any writer; refused by name otherwise
+            self._hmac_key(name)
 
     # --- the two knobs the broken variants of the tests override -----------------
     def _configure(self, db: sqlite3.Connection) -> None:
@@ -96,7 +99,19 @@ class Keystore:
 
     # --- tokens -----------------------------------------------------------------
     def _hmac_key(self, name: str) -> bytes:
-        return self._db.execute("SELECT key FROM tenant_keys WHERE name=?", (name,)).fetchone()[0]
+        # under the keystore's lock like every other use of its one connection: writer threads share it, and an unserialised
+        # read on a shared SQLite connection can come back empty or fail (the S6-H1 early build's crash at its first concurrent
+        # leaf writes)
+        with self._lock:
+            row = self._db.execute("SELECT key FROM tenant_keys WHERE name=?", (name,)).fetchone()
+        if row is None or not row[0]:
+            raise KeystoreError("the tenant key %r is missing from the keystore %s; refused (the keys are provisioned when the "
+                                "keystore is created)" % (name, self.path.name))
+        return row[0]
+
+    def mac(self, purpose: str, msg: bytes) -> bytes:
+        """HMAC-SHA256 of `msg` under the tenant key `purpose` (for callers that derive their own tokens, never the key)."""
+        return hmac.new(self._hmac_key(purpose), msg, hashlib.sha256).digest()
 
     def subject_token(self, identifier: str, *, confusables: bool = True) -> str:
         msg = canonicalise(identifier, confusables=confusables).encode()
@@ -212,7 +227,7 @@ def _locked(fn):
     return wrapper
 
 
-for _name in ("subject_token", "digest", "has_key", "principal_token", "register_identifier", "encrypt",
+for _name in ("subject_token", "digest", "mac", "has_key", "principal_token", "register_identifier", "encrypt",
               "decrypt", "destroy", "count_keys"):
     setattr(Keystore, _name, _locked(getattr(Keystore, _name)))
 

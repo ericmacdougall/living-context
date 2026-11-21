@@ -42,8 +42,8 @@ class TokenSource:
         return self._ks.subject_token(text)
 
     def bare(self, name: str) -> str:
-        key = self._ks._hmac_key("subject")
-        return hmac.new(key, b"bare:" + canonicalise(name).encode(), hashlib.sha256).digest()[:16].hex()
+        # through the keystore's public, locked `mac` (writer threads share the keystore); the same token as before
+        return self._ks.mac("subject", b"bare:" + canonicalise(name).encode())[:16].hex()
 
 
 class Guard:

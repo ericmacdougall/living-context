@@ -95,6 +95,19 @@ def pool(n=12, mates=6):
     return out
 
 
+def named_pool(n=24, mates=8):
+    """The pool with people in it, as the benchmark's conversations have: every turn names two people (capitalised pairs, the
+    subject guard's bare-name path) and an e-mail address (its identifier path). The synthetic fixture alone has neither."""
+    from evalkit import dataset as ds
+    names = ("Alice Smith", "Bob Jones", "Carol White", "David Brown", "Erin Green", "Frank Black")
+    out = []
+    for k, (_h, turns) in enumerate(pool(n, mates)):
+        t2 = tuple((r, "%s told %s (mail%d@example.org): %s" % (names[k % 6], names[(k + i + 1) % 6], k, c))
+                   for i, (r, c) in enumerate(turns))
+        out.append((ds.turns_hash(t2), t2))
+    return out
+
+
 def stub_many(texts):
     return {t: stub.embed(t) for t in texts}
 
@@ -110,8 +123,9 @@ def shape(et, es):
             if did == "seq":
                 docs[("seq",)] = src["value"]
                 continue
+            # subject tokens are keyed by each tenant's own random subject key: their number is compared, not their value
             docs[(suffix, src.get("kind"), src.get("src_seq", src.get("current_lv")), did.startswith("lh:"))] = \
-                {k: v for k, v in src.items() if k not in drop}
+                {k: (len(v) if k == "lin_subjects" else v) for k, v in src.items() if k not in drop}
     return leaves, et.session_tokens, et.max_seq, docs
 
 
@@ -132,6 +146,50 @@ class SameAsSerial(unittest.TestCase):
             self.assertEqual(et.ingest_concurrent(p, writers=w, embed_many=stub_many), n1)
             self.assertEqual(shape(et, es), shape(et1, es1), w)
             self.assertEqual([l.src_seq for l in et.leaves], list(range(1, n1 + 1)))
+
+    def test_a_pool_that_names_people_ingests_with_many_writers_on_a_fresh_real_keystore(self):
+        # the early build's crash at its first concurrent writes: the subject guard read the keystore's HMAC key outside the
+        # keystore's lock, so writer threads shared one SQLite connection unserialised (a None row, or an API misuse error)
+        p = named_pool()
+        n1, et1, es1 = self.serial(p)
+        self.assertTrue(any(d.get("lin_subjects") for d in shape(et1, es1)[3].values()))   # the subject guard's paths really run
+        for w in (8, 16):
+            es = MemEs(seed=w)
+            et = tenant(es, tempfile.mkdtemp())             # a fresh tenant directory: keystore and keys created here
+            self.assertEqual(et.ingest_concurrent(p, writers=w, embed_many=stub_many), n1, w)
+            self.assertEqual(shape(et, es), shape(et1, es1), w)
+
+    def test_the_subject_guard_is_safe_from_many_threads_on_one_real_keystore(self):
+        ks = Keystore(Path(tempfile.mkdtemp()) / "ks" / ("%s.db" % T), T)
+        g, tokens = Guard(TokenSource(ks)), TokenSource(ks)
+        text = "Alice Smith met Bob Jones and wrote to bob%d@example.org"
+        want = {i: g.tokens_in(text % i) for i in range(50)}
+        errs, wrong = [], []
+
+        def work(k):
+            try:
+                for j in range(1500):
+                    i = (j + k) % 50
+                    g.check(text % i)
+                    if g.tokens_in(text % i) != want[i]:
+                        wrong.append(i)
+            except Exception as e:                     # inspected below
+                errs.append(repr(e))
+        ts = [threading.Thread(target=work, args=(k,)) for k in range(8)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual((errs[:3], wrong[:3]), ([], []))
+        self.assertEqual(tokens.bare("Alice Smith"), TokenSource(ks).bare("Alice Smith"))
+
+    def test_a_tenant_key_missing_from_the_keystore_is_refused_by_name(self):
+        from living_context.keystore.store import KeystoreError
+        ks = Keystore(Path(tempfile.mkdtemp()) / "ks" / ("%s.db" % T), T)
+        ks._db.execute("DELETE FROM tenant_keys WHERE name='subject'")
+        with self.assertRaises(KeystoreError) as e:
+            TokenSource(ks).bare("Alice Smith")
+        self.assertIn("subject", str(e.exception))
 
     def test_a_repeated_content_is_skipped_and_a_second_ingest_continues_the_sequence(self):
         p = pool(6, 4)
