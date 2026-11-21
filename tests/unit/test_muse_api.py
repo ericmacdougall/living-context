@@ -317,6 +317,18 @@ class Responses(Base):
             self.assertEqual(req["body"]["messages"][1], {"role": "user", "content": "judge this"})
             self.assertEqual(req["body"][ma.PROVIDERS[pv].max_tokens_field], 500)
 
+    def test_retry_after_keeps_long_and_dated_waits(self):
+        import email.utils
+        ra = ma.MusePort._retry_after
+        self.assertEqual(ra({"Retry-After": "7"}), 7)
+        self.assertEqual(ra({"Retry-After": "172800"}), 172800)
+        self.assertEqual(ra({"Retry-After": "9" * 40}), ma.RETRY_AFTER_MAX_S)          # held at a representable maximum
+        dated = ra({"Retry-After": email.utils.formatdate(time.time() + 7200, usegmt=True)})
+        self.assertTrue(7100 <= dated <= 7200, dated)
+        self.assertEqual(ra({"Retry-After": email.utils.formatdate(time.time() - 600, usegmt=True)}), 0)   # a date passed: no wait
+        for bad in ("-5", "1.5", "soon", "", None):
+            self.assertIsNone(ra({"Retry-After": bad} if bad is not None else {}), bad)
+
     def test_429_sets_throttled_with_retry_after(self):
         for pv in self.each():
             ro, env, _ = self.run_one(pv, lambda *a: (429, {"Retry-After": "7"}, err_body(429, etype="rate_limit_error",

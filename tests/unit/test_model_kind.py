@@ -650,6 +650,24 @@ class S3OnMuse(unittest.TestCase):
         self.assertIn("above the ceiling", state["error"])
         self.assertEqual(state["retry_after_s"], 7200.0)
 
+    def test_a_long_or_dated_retry_after_from_the_real_port_pauses_the_stage_after_one_charged_request(self):
+        # delta review F2: the port kept only integer values up to 86,400 s, so 172,800 or an HTTP date reached the ceiling as None
+        import email.utils
+        for header, low in (("172800", 172800.0), (email.utils.formatdate(time.time() + 7200, usegmt=True), 7000.0)):
+            with self.subTest(header=header):
+                d = Path(tempfile.mkdtemp())
+                up = Upstream(retry_after=header, throttle=(1,))
+                live = Live(up)
+                self.addCleanup(live.close)
+                with seeded_node_ids():
+                    rc = run_s2.run(s3p.args(d, **vars(margs(rpm=10 ** 6))), run_h1.pick_questions, embedder=t6.RealEmbed(),
+                                    runner=live.runner, loader=s3p.loader, tenant_factory=t6.factory(d))
+                self.assertEqual(rc, run_s2.RC["PAUSED_THROTTLE"])
+                state = json.loads((d / "STATE.json").read_text())
+                self.assertIn("resume after", state["error"])
+                self.assertTrue(low <= state["retry_after_s"] <= low + 400, state["retry_after_s"])
+                self.assertEqual((up.n, int((d / "counter").read_text())), (1, 1))      # one charged request, no retry
+
     def test_a_torn_last_call_row_is_set_aside_on_resume_and_the_summaries_still_read(self):
         d = Path(tempfile.mkdtemp())
         live = Live(Upstream())

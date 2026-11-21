@@ -35,6 +35,8 @@ key, never the file's contents.
 """
 from __future__ import annotations
 
+import datetime
+import email.utils
 import http.client
 import json
 import os
@@ -54,6 +56,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from .claude_cli import LIMIT, SYSTEM_PROMPT, THROTTLE, RunOut
+
+RETRY_AFTER_MAX_S = 10 ** 7          # about 116 days: a longer Retry-After is held here (any run's ceiling is far below)
 
 API_ARGV0 = "muse-chat-completions-api"
 LOOPBACK_HOST = "127.0.0.1"
@@ -434,12 +438,28 @@ class MusePort:
 
     @staticmethod
     def _retry_after(headers) -> Optional[int]:
+        """Retry-After as whole seconds (RFC 9110 10.2.3): delay-seconds (digits) or an HTTP date (seconds from now, 0 once past).
+        A long wait is kept, so the run can stop above its ceiling instead of retrying early (goodqa#16562 F2); a value past
+        RETRY_AFTER_MAX_S is held there (still far above any ceiling). Anything else is None."""
         try:
             v = headers.get("Retry-After") if headers is not None else None
-            n = int(str(v).strip()) if v is not None else None
-        except (ValueError, TypeError, AttributeError):
+        except AttributeError:
             return None
-        return n if n is not None and 0 <= n <= 86400 else None
+        if v is None:
+            return None
+        s = str(v).strip()
+        if s.isascii() and s.isdigit():
+            return min(int(s), RETRY_AFTER_MAX_S)
+        try:
+            when = email.utils.parsedate_to_datetime(s)
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+        if when is None:
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=datetime.timezone.utc)
+        left = (when - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+        return int(min(max(0.0, left), RETRY_AFTER_MAX_S))
 
     def _env(self, **kw) -> Dict[str, Any]:
         env = {"type": "result", "is_error": True, "result": "", "num_turns": 1, "throttled": False, "limited": False, "error": None,
