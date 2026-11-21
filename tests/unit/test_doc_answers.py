@@ -16,13 +16,13 @@ from living_context.erasure.executor import Executor
 from living_context.gateway import pool_boot
 from living_context.gateway.indices import physical_name
 from living_context.policy import pools as pl
-from tests.unit.fake_es import DocStore, FakeAuthz, ShardedFake, behind, doc_answer, unconfirmed_deletes
+from tests.unit.fake_es import DocStore, FakeAuthz, ShardedFake, behind, conflict, doc_answer, unconfirmed_deletes
 
 T = "tena"
 SRC = f"lc-{T}-src"
 NODE = physical_name(f"lc-{T}-base-node", b"\x01\x02\x03\x04")   # the concrete `_index` a lineage scan hit names
 UNAVAILABLE = (503, {"error": {"type": "unavailable_shards_exception"}, "status": 503})
-CONFLICT = (409, {"error": {"type": "version_conflict_engine_exception"}, "status": 409})
+CONFLICT = conflict(NODE)   # the typed conflict names the index (round 6: a bare 409 is not a lost compare-and-set)
 
 
 class SubjectErasureDelete(unittest.TestCase):
@@ -111,6 +111,14 @@ class NodeRewrite(unittest.TestCase):
         with self.assertRaises(scan.ScanError):
             rewrite(self.es)
         self.assertEqual(self.stored()["summary"], "erased summary")
+        for name, answer in {"409 with an empty body": (409, {}), "409 naming another index": conflict(f"lc-{T}-base-other")}.items():
+            with self.subTest(name):   # not the typed conflict of this index: refused at once, never retried as a lost race
+                self.setUp()
+                self.es.doc_answers[("PUT", NODE, "n1")] = [answer] * 10
+                with self.assertRaises(scan.ScanError):
+                    rewrite(self.es)
+                self.assertEqual(len(self.es.doc_answers[("PUT", NODE, "n1")]), 9)
+                self.assertEqual(self.stored()["summary"], "erased summary")
 
 
 class BootExpiredTokens(unittest.TestCase):

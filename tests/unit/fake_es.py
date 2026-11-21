@@ -54,6 +54,36 @@ def unconfirmed_deletes(index, did, *, strict=True):
     return out
 
 
+def conflict(index):
+    """The typed version conflict Elasticsearch 9 answers a lost compare-and-set or an `op_type=create` on an existing id: HTTP 409,
+    `version_conflict_engine_exception`, naming the physical index (pinned on the cluster by test_pools_rescue_es.py)."""
+    return 409, {"error": {"type": "version_conflict_engine_exception", "reason": "version conflict", "index": index},
+                 "status": 409}
+
+
+def unconfirmed_puts(index, did):
+    """Answers to `PUT /<index>/_doc/<did>` (through the alias `index`) that confirm no write (review round 6, F18 and F19). At 4e7ee85
+    the authz replacement and the taint write accepted any 200 or 201 on its status alone, so each of these reported a write that may
+    never have landed; a bare or foreign 409 is not the typed conflict a compare-and-set loop may retry on."""
+    phys, other = behind(index), index.rsplit("-", 1)[0] + "-other"
+    seq = {"_shards": SHARDS_ONE, "_seq_no": 4, "_primary_term": 1, "_version": 2}
+    return {
+        "200 with an empty body": (200, {}),
+        "201 with an empty body": (201, {}),
+        "200 with a list body": (200, []),
+        "200 updated for another _id": (200, {"_index": phys, "_id": did + "x", "result": "updated", **seq}),
+        "200 updated for another index": (200, {"_index": other, "_id": did, "result": "updated", **seq}),
+        "200 updated without _index": (200, {"_id": did, "result": "updated", **seq}),
+        "200 that says noop": (200, {"_index": phys, "_id": did, "result": "noop", **seq}),
+        "200 that says deleted": (200, {"_index": phys, "_id": did, "result": "deleted", **seq}),
+        "200 updated without sequence fields": (200, {"_index": phys, "_id": did, "result": "updated", "_shards": SHARDS_ONE}),
+        "201 created on no successful shard": (201, {"_index": phys, "_id": did, "result": "created", "_seq_no": 4, "_primary_term": 1,
+                                                    "_shards": {"total": 1, "successful": 0, "failed": 1}}),
+        "409 with an empty body": (409, {}),
+        "409 conflict naming another index": conflict(other),
+    }
+
+
 class FakeEs:
     def __init__(self):
         self.docs = {}      # index -> {id: source}
@@ -94,14 +124,14 @@ class FakeEs:
         assert m, path
         index = m.group(1)
         docs = self.docs.get(index, {})
-        if m.group(2).startswith("_doc/"):
+        if m.group(2).startswith("_doc/"):   # answered by the physical index behind the alias, as Elasticsearch does
             did = m.group(3)
             if did not in docs:
-                return 404, {"found": False}
-            return 200, {"found": True, "_id": did, "_source": docs[did], "_seq_no": 1, "_primary_term": 1}
+                return 404, {"_index": behind(index), "_id": did, "found": False}
+            return 200, {"_index": behind(index), "found": True, "_id": did, "_source": docs[did], "_seq_no": 1, "_primary_term": 1}
         if m.group(2) == "_mget":
-            return 200, {"docs": [({"_id": i, "found": True, "_source": docs[i], "_seq_no": 1, "_primary_term": 1} if i in docs
-                                   else {"_id": i, "found": False}) for i in body["ids"]]}
+            return 200, {"docs": [({"_index": behind(index), "_id": i, "found": True, "_source": docs[i], "_seq_no": 1, "_primary_term": 1}
+                                   if i in docs else {"_index": behind(index), "_id": i, "found": False}) for i in body["ids"]]}
         hits = [(i, s) for i, s in docs.items() if self._match(s, body["query"])]
         shards = {"total": 1, "successful": 1, "skipped": 0, "failed": 0}   # a complete answer, as Elasticsearch gives
         if m.group(2) == "_count":
@@ -282,7 +312,8 @@ class DocStore:
             out = []
             for d in body["docs"]:
                 cur = self.docs.get((d["_index"], d["_id"]))
-                out.append({"_index": d["_index"], "_id": d["_id"], "found": cur is not None, **({"_source": dict(cur[0])} if cur else {})})
+                out.append({"_index": behind(d["_index"]), "_id": d["_id"], "found": cur is not None,
+                            **({"_source": dict(cur[0]), "_seq_no": cur[1], "_primary_term": 1} if cur else {})})
             return 200, {"docs": out}
         if p.endswith("/_search") and "sort" not in body:   # a filter of `term` clauses (the class reader's searches)
             index = p[1:-len("/_search")]
@@ -315,9 +346,9 @@ class DocStore:
             return doc_answer("DELETE", phys, key[1], self.docs.pop(key, None) is not None)
         if method == "PUT":
             if params.get("op_type") == "create" and cur is not None:
-                return 409, {"error": {"type": "version_conflict_engine_exception"}}
+                return conflict(phys)
             if "if_seq_no" in params and (cur is None or int(params["if_seq_no"]) != cur[1]):
-                return 409, {"error": {"type": "version_conflict_engine_exception"}}
+                return conflict(phys)
             self.seq += 1
             self.docs[key] = (dict(body), self.seq)
             return doc_answer("PUT", phys, key[1], True, created=cur is None)

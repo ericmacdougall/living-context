@@ -27,7 +27,7 @@ from .class_reader import ClassReader, ReaderRefused
 from .pool_authz import VIEW, carry, view
 from .indices import POOL_KINDS, TENANT_CLS, physical_name, pool_index
 from .provision import PURGE_SETTINGS, SLOWLOG_OFF, mapping_for
-from .reads import IncompleteRead, delete_doc
+from .reads import IncompleteRead, delete_doc, put_doc_landed
 from .revocation import RevocationService, Refused as TenantClosed
 from .sessions import Record, Sessions
 
@@ -103,9 +103,14 @@ class PoolService:
 
     # ---- persistence (best effort; never blocks a call) -----------------------------------------------------------------------
     def _authz_put(self, doc_id: str, doc: dict) -> None:
-        st, _ = self._authz().request("PUT", f"/lc-{self.tenant}-authz/_doc/{doc_id}?refresh=true", doc)
-        if st not in (200, 201):
-            raise RuntimeError("authz write refused")
+        """Only a well-formed acknowledgement that exactly this record landed (`reads.doc_written` through the authz alias: `_index`,
+        `_id`, `result` created or updated, the sequence fields and a successful primary) counts as written. Any other answer, an empty or
+        foreign 200 and any 409 included, raises: a partial grant removal then stays unconfirmed and compaction keeps its journal record
+        (review round 6, F18)."""
+        try:
+            put_doc_landed(self._authz(), f"lc-{self.tenant}-authz", doc_id, doc, "refresh=true", alias=True)
+        except IncompleteRead as e:
+            raise RuntimeError("authz write refused") from e
 
     def _authz_delete(self, doc_id: str) -> None:
         """Only a confirmed delete or a verified absence of exactly this record (through the authz alias) lets the caller confirm a grant
@@ -176,8 +181,11 @@ class PoolService:
                 phys = physical_name(alias)
                 self._create_index(phys, {"settings": {"number_of_shards": 1, "number_of_replicas": 0, **SLOWLOG_OFF, **PURGE_SETTINGS},
                                           "mappings": mapping_for("leaf"), "aliases": {alias: {}}})
-                self._ctl(cls).request("PUT", f"/lc-{self.tenant}-{cls}-ctl/_doc/pm:{pool.id}?refresh=true", _base(
-                    self.tenant, cls, "manifest", [], pool=pool.id, indices=[alias, phys], pool_kind=pool.kind, state=pl.ACTIVE))
+                # the manifest names the pool's indices for erasure discovery (erasure/pool_scope.py): a pool whose manifest did not
+                # land is not created (an IncompleteRead is caught below)
+                put_doc_landed(self._ctl(cls), f"lc-{self.tenant}-{cls}-ctl", f"pm:{pool.id}", _base(
+                    self.tenant, cls, "manifest", [], pool=pool.id, indices=[alias, phys], pool_kind=pool.kind, state=pl.ACTIVE),
+                    "refresh=true", alias=True)
             self._persist_pool(pool)
         except Exception:
             self.dir.drop(self.tenant, pool.id)
