@@ -106,6 +106,7 @@ Categories are labelled by number (the LoCoMo repository does not name them). Ca
 | 4 | 55 | 0.927 [0.852, 0.982] | 0.927 [0.849, 0.983] | 0.927 [0.849, 0.983] | 0.945 [0.877, 1.000] | 0.909 [0.825, 0.981] | 0.909 [0.825, 0.981] | 0.000 [-0.091, 0.088] |
 
 Tree recalls that failed (scored 0, kept): 0 of 100. A0 at recall time equals the A0 of the all-questions stage on 100 of 100 questions.
+Routing: in 100 of 100 recalls the number of holder calls equals the number of level-1 nodes of the conversation's tree (3, 2, 3, 3, 4, 4, 4, 4, 3, 3), that is, the recall opened every node and the model was offered every leaf of the pool. Where this is all of them, A1 and A1-tree-only measure a model pass over the leaf descriptors of the whole pool compared with flat search, not a selective descent of the tree.
 
 ## Tree arms, batch B2
 
@@ -160,6 +161,7 @@ Categories are labelled by number (the LoCoMo repository does not name them). Ca
 | 4 | 164 | 0.909 [0.861, 0.952] | 0.951 [0.919, 0.981] | 0.909 [0.865, 0.948] | 0.884 [0.829, 0.933] | 0.957 [0.926, 0.983] | 0.909 [0.863, 0.948] | 0.043 [-0.006, 0.092] |
 
 Tree recalls that failed (scored 0, kept): 0 of 300. A0 at recall time equals the A0 of the all-questions stage on 300 of 300 questions.
+Routing: in 300 of 300 recalls the number of holder calls equals the number of level-1 nodes of the conversation's tree (3, 2, 3, 3, 4, 4, 4, 4, 3, 3), that is, the recall opened every node and the model was offered every leaf of the pool. Where this is all of them, A1 and A1-tree-only measure a model pass over the leaf descriptors of the whole pool compared with flat search, not a selective descent of the tree.
 
 ## Tree arms, batch B1+B2
 
@@ -214,6 +216,7 @@ Categories are labelled by number (the LoCoMo repository does not name them). Ca
 | 4 | 219 | 0.913 [0.871, 0.952] | 0.945 [0.916, 0.972] | 0.913 [0.878, 0.947] | 0.900 [0.858, 0.938] | 0.945 [0.915, 0.972] | 0.909 [0.870, 0.945] | 0.032 [-0.010, 0.078] |
 
 Tree recalls that failed (scored 0, kept): 0 of 400. A0 at recall time equals the A0 of the all-questions stage on 400 of 400 questions.
+Routing: in 400 of 400 recalls the number of holder calls equals the number of level-1 nodes of the conversation's tree (3, 2, 3, 3, 4, 4, 4, 4, 3, 3), that is, the recall opened every node and the model was offered every leaf of the pool. Where this is all of them, A1 and A1-tree-only measure a model pass over the leaf descriptors of the whole pool compared with flat search, not a selective descent of the tree.
 
 A1-tree-only returns on average 15.09 in B1, 16.04 in B2 leaves per question (scored as returned, not padded to 10); the pools hold 25 to 60 leaves.
 

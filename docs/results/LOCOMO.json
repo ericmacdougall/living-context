@@ -1073,6 +1073,10 @@
      }
     }
    },
+   "routing": {
+    "holder_calls_equal_node_count": 100,
+    "of": 100
+   },
    "tree_failed_recalls": 0
   },
   "B1+B2": {
@@ -1903,6 +1907,10 @@
      }
     }
    },
+   "routing": {
+    "holder_calls_equal_node_count": 400,
+    "of": 400
+   },
    "tree_failed_recalls": 0
   },
   "B2": {
@@ -2732,6 +2740,10 @@
       "n": 300
      }
     }
+   },
+   "routing": {
+    "holder_calls_equal_node_count": 300,
+    "of": 300
    },
    "tree_failed_recalls": 0
   }
