@@ -27,7 +27,7 @@ from .admin import GrantStore
 from .handler import EsGate
 from .journal import TombstoneJournal
 from .keyowner import invalidate_all
-from .reads import scan
+from .reads import IncompleteRead, put_doc_landed, scan
 from .revocation import OPEN, RevocationService
 from .sessions import EpochTable
 
@@ -43,11 +43,14 @@ def grant_doc(tenant: str, p: Principal) -> dict:
 
 
 def grant_persister(gate: EsGate, tenant: str) -> Callable[[Principal], None]:
+    """The authz copy of a grant. Written only on a well-formed acknowledgement about exactly this record (`reads.put_doc_landed`
+    through the authz alias); any other answer raises, so the caller counts the write as failed (review round 6)."""
     def persist(p: Principal) -> None:
-        st, _ = gate.client(tenant, "authz").request("PUT", f"/lc-{tenant}-authz/_doc/gr:{p.token}?refresh=true",
-                                                             grant_doc(tenant, p))
-        if st not in (200, 201):
-            raise RuntimeError(f"authz write refused ({st})")
+        try:
+            put_doc_landed(gate.client(tenant, "authz"), f"lc-{tenant}-authz", f"gr:{p.token}", grant_doc(tenant, p), "refresh=true",
+                           alias=True)
+        except IncompleteRead as e:
+            raise RuntimeError("authz write refused") from e
     return persist
 
 

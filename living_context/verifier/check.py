@@ -107,9 +107,20 @@ def _exact_total(r: dict, what: str) -> int:
 
 
 def _refreshed(st, r, what: str) -> None:
+    """A refresh that every primary ran: HTTP 200 and a `_shards` section with integer counts and no failed shard."""
     sh = r.get("_shards") if isinstance(r, dict) else None
-    if st != 200 or not isinstance(sh, dict) or sh.get("failed") != 0:
+    if st != 200 or not isinstance(sh, dict) or sh.get("failed") != 0 or not isinstance(sh.get("total"), int) \
+            or not isinstance(sh.get("successful"), int):
         raise VerifierError(f"{what}: refresh failed ({st})")
+
+
+def _listed(st, r, what: str) -> list:
+    """The index names of a `_resolve/index` answer: HTTP 200 and an `indices` list whose every item carries a string name. A failed
+    or malformed listing is never "no index of the pool" (review round 6: an item without a name was skipped)."""
+    rows = r.get("indices") if st == 200 and isinstance(r, dict) else None
+    if not isinstance(rows, list) or not all(isinstance(x, dict) and isinstance(x.get("name"), str) and x["name"] for x in rows):
+        raise VerifierError(f"{what}: the index listing failed ({st})")
+    return [x["name"] for x in rows]
 
 
 class Verifier:
@@ -120,9 +131,9 @@ class Verifier:
         self._roots = [Path(p) for p in data_roots]
 
     def _search(self, index: str, body: dict) -> list:
-        st, r = self._es.request("POST", f"/{index}/_search?ignore_unavailable=true&allow_no_indices=true&allow_partial_search_results=false",
-                                 body)
-        return _complete(st, r, "direct read")["hits"]["hits"]
+        return _complete(*self._es.request(
+            "POST", f"/{index}/_search?ignore_unavailable=true&allow_no_indices=true&allow_partial_search_results=false", body),
+            "direct read")["hits"]["hits"]
 
     @property
     def _all(self) -> str:
@@ -210,8 +221,8 @@ class Verifier:
     # ---- the checks ---------------------------------------------------------------------------------------------------
     def probe(self, canaries: Canaries) -> Report:
         """Run every probe once and count what is found."""
-        st, r = self._es.request("POST", f"/{self._all}/_refresh")
-        _refreshed(st, r, "refresh before the probes")   # reading unrefreshed data could report a leftover as gone: an error, not a skip
+        # reading unrefreshed data could report a leftover as gone: an error, not a skip
+        _refreshed(*self._es.request("POST", f"/{self._all}/_refresh"), "refresh before the probes")
         rep = Report()
 
         def step(name: str, probes: int, found: int):
@@ -273,12 +284,8 @@ def pool_residue(es: EsClient, tenant: str, pool: Optional[str] = None, leaf_ids
     executor): the indices of the tenant whose name carries the pool id, the documents of every index that name the pool in `pool` or
     `lin_pools` or a leaf of it in `lin_leaf_ids`, and a phrase search for each canary text. Everything must be zero after the delete;
     run it first against a pool that exists (the positive control) so a skipped index cannot read as clean."""
-    st, r = es.request("POST", f"/lc-{tenant}-*/_refresh?ignore_unavailable=true")
-    _refreshed(st, r, "pool residue")
-    st, rows = es.request("GET", f"/_resolve/index/lc-{tenant}-*")
-    if st != 200 or not isinstance(rows, dict) or not isinstance(rows.get("indices"), list):
-        raise VerifierError(f"pool residue: the index listing failed ({st})")   # a failed listing is never "no index of the pool"
-    names = [r["name"] for r in rows["indices"] if isinstance(r, dict) and isinstance(r.get("name"), str)]
+    _refreshed(*es.request("POST", f"/lc-{tenant}-*/_refresh?ignore_unavailable=true"), "pool residue")
+    names = _listed(*es.request("GET", f"/_resolve/index/lc-{tenant}-*"), "pool residue")
     out = {"indices": sum(1 for n in names if pool and f"-{pool}-" in n), "docs": 0, "by_index": {}, "text": 0}
     should = [{"term": {"pool": pool}}, {"term": {"lin_pools": pool}}] if pool else []
     if leaf_ids:
@@ -286,16 +293,16 @@ def pool_residue(es: EsClient, tenant: str, pool: Optional[str] = None, leaf_ids
     if not should:
         raise VerifierError("nothing to check")
     path = f"/lc-{tenant}-*/_search?ignore_unavailable=true&allow_partial_search_results=false"
-    st, r = es.request("POST", path, {
+    r = _complete(*es.request("POST", path, {
         "size": 0, "track_total_hits": True, "query": {"bool": {"should": should, "minimum_should_match": 1}},
-        "aggs": {"by": {"terms": {"field": "_index", "size": 200}}}})
-    r = _complete(st, r, "pool residue search")
+        "aggs": {"by": {"terms": {"field": "_index", "size": 200}}}}), "pool residue search")
     out["docs"] = _exact_total(r, "pool residue search")
     buckets = (r.get("aggregations") or {}).get("by", {}).get("buckets")
     if not isinstance(buckets, list):
         raise VerifierError("pool residue search: no per-index counts")
     out["by_index"] = {b["key"]: b["doc_count"] for b in buckets}
     for t in texts:
-        st, r = es.request("POST", path, {"size": 0, "track_total_hits": True, "query": {"match_phrase": {"text": t}}})
-        out["text"] += _exact_total(_complete(st, r, "pool residue text search"), "pool residue text search")
+        r = _complete(*es.request("POST", path, {"size": 0, "track_total_hits": True, "query": {"match_phrase": {"text": t}}}),
+                      "pool residue text search")
+        out["text"] += _exact_total(r, "pool residue text search")
     return out

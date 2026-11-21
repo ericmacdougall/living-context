@@ -19,6 +19,7 @@ from typing import Any
 from ..config import Constants
 from . import epoch_journal, fsx
 from .es import EsClient
+from .reads import IncompleteRead, api_key_created, index_created, put_doc_landed, read_doc
 from .indices import (CLASS_KINDS, REGISTRY, TENANT_CLS, TENANT_KINDS, class_index, class_patterns, check_id,
                       may_provision, physical_name, role_pattern_is_safe, shards_per_tenant, tenant_index)
 
@@ -129,30 +130,37 @@ def provision_tenant(admin: EsClient, tenant: str, classes: list[str], *, key_di
     existing = len(shards) if st == 200 and isinstance(shards, list) else max_shards_per_node
     if not may_provision(existing, len(classes), replicas, max_shards_per_node, c.shard_budget_fraction):
         raise ProvisionRefused("shard budget")
-    st, got = admin.request("GET", f"/{REGISTRY}/_doc/{tenant}")
-    if st == 200 and got.get("found"):
-        raise ProvisionRefused("tenant exists")
+    try:   # "no such tenant" only for a verified absence of its registry record (or of the registry itself), `reads.read_doc`
+        if read_doc(admin, REGISTRY, tenant, alias=True) is not None:
+            raise ProvisionRefused("tenant exists")
+    except IncompleteRead as e:
+        raise ProvisionRefused("registry unreadable") from e
     names = [(tenant_index(tenant, k), k) for k in TENANT_KINDS]
     names += [(class_index(tenant, cl, k), k) for cl in classes for k in CLASS_KINDS]
     for alias, kind in names:
         phys = physical_name(alias)
-        st, body = admin.request("PUT", f"/{phys}", {
-            "settings": {"number_of_shards": 1, "number_of_replicas": replicas, **SLOWLOG_OFF, **PURGE_SETTINGS},
-            "mappings": mapping_for(kind), "aliases": {alias: {}}})
-        if st != 200:
-            raise ProvisionRefused(f"create index failed ({st})")
+        try:   # exactly this index, acknowledged (`reads.index_created`)
+            index_created(*admin.request("PUT", f"/{phys}", {
+                "settings": {"number_of_shards": 1, "number_of_replicas": replicas, **SLOWLOG_OFF, **PURGE_SETTINGS},
+                "mappings": mapping_for(kind), "aliases": {alias: {}}}), phys)
+        except IncompleteRead as e:
+            raise ProvisionRefused("create index failed") from e
     j, _ = epoch_journal.provision(jdir, journal_size or c.j_size)
     keys: dict[str, str] = {}
     for role, rd in roles_for(tenant, classes).items():
-        st, body = (key_owner or admin).request("POST", "/_security/api_key", {
-            "name": f"lc-{tenant}-{role}", "expiration": key_expiry, "role_descriptors": {"r": rd}})
-        if st != 200:
-            raise ProvisionRefused(f"key creation failed ({st})")
+        try:   # a created key of exactly this name with its encoded value (`reads.api_key_created`)
+            body = api_key_created(*(key_owner or admin).request("POST", "/_security/api_key", {
+                "name": f"lc-{tenant}-{role}", "expiration": key_expiry, "role_descriptors": {"r": rd}}), f"lc-{tenant}-{role}")
+        except IncompleteRead as e:
+            raise ProvisionRefused("key creation failed") from e
         p = key_dir / tenant / f"{role}.key"
         write_key_file(p, body["encoded"])
         keys[role] = str(p)
-    admin.request("PUT", f"/{REGISTRY}/_doc/{tenant}?refresh=true", {
-        "tenant": tenant, "status": "active", "tier": "dedicated",
-        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat()})
+    try:   # the registry record is what makes a second provisioning of this tenant refuse: it must land
+        put_doc_landed(admin, REGISTRY, tenant, {"tenant": tenant, "status": "active", "tier": "dedicated",
+                                                 "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat()},
+                       "refresh=true", alias=True)
+    except IncompleteRead as e:
+        raise ProvisionRefused("registry record not written") from e
     return {"tenant": tenant, "classes": classes, "keys": keys, "journal": str(j),
             "shards": shards_per_tenant(len(classes), replicas)}

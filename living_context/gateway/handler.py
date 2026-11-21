@@ -31,6 +31,7 @@ from .es import EsClient, EsError
 from ..recall.direct import DirectSearch
 from .indices import class_index
 from .pool_authz import carried
+from .reads import IncompleteRead, mget_items
 from .sessions import Sessions
 
 FORBIDDEN_BODY_FIELDS = {"tenant", "principal", "principal_token", "session", "roles", "read_set", "write_set"}
@@ -283,11 +284,14 @@ class Gateway:
         for cls in sorted(p.read_set):
             if not decide(p, Op.LOOKUP, tenant=tenant, lattice=lattice, cls=cls):
                 continue
-            st, body = self._es.client(tenant, f"read-{cls}").request(
-                "POST", "/_mget", {"docs": [{"_index": class_index(tenant, cls, "leaf"), "_id": f"{ptr.id}:{ptr.version}"}]})
-            docs = body.get("docs") if st == 200 and isinstance(body, dict) else None
-            if docs and len(docs) == 1 and docs[0].get("found") is True and "error" not in docs[0]:
-                src = docs[0].get("_source") or {}
+            want = [(class_index(tenant, cls, "leaf"), f"{ptr.id}:{ptr.version}")]
+            try:   # the item must be exactly this leaf of this class (`reads.mget_items`); any other answer refuses (review round 6)
+                doc, = mget_items(*self._es.client(tenant, f"read-{cls}").request(
+                    "POST", "/_mget", {"docs": [{"_index": i, "_id": d} for i, d in want]}), want, alias=True)
+            except IncompleteRead:
+                return UNAVAILABLE
+            if doc is not None:
+                src = doc["_source"]
                 return {"ok": True, "text": src.get("text", ""), "title": src.get("title", "")}
         return UNAVAILABLE
 

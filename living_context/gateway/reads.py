@@ -341,11 +341,10 @@ def setting_value(status: int, body: Any, index: str, setting: str, alias: bool 
 
 
 def deleted_docs(status: int, body: Any, index: str, alias: bool = False) -> int:
-    """The number of deleted (not yet merged away) documents of one index from `GET /<index>/_stats/docs`: HTTP 200, every shard
-    answered, exactly one index in the answer and it is `index` (`same_index`), and its primaries' `docs.deleted` an integer that the
-    `_all` total agrees with."""
-    if status != 200 or not _shards_complete(body):
-        raise IncompleteRead("stats failed or incomplete")
+    """The number of deleted (not yet merged away) documents of one index from `GET /<index>/_stats/docs`: HTTP 200, no failed shard
+    (`broadcast`: an unassigned replica is not a failure, the primaries' numbers are what is read), exactly one index in the answer and it
+    is `index` (`same_index`), and its primaries' `docs.deleted` an integer that the `_all` total agrees with."""
+    broadcast(status, body)
     ix = body.get("indices")
     if not isinstance(ix, dict) or len(ix) != 1:
         raise IncompleteRead("stats answer not about one index")

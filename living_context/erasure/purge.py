@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from ..gateway.es import EsClient
+from ..gateway.reads import IncompleteRead, acknowledged, broadcast, deleted_docs, setting_value
 
 DEFAULT_DEADLINE_S = 120.0   # ASSUMPTION: four times the measured 30.4 s
 DEFAULT_INTERVAL_S = 5.0
@@ -31,22 +32,32 @@ class PurgeResult:
 
 
 def deleted_count(es: EsClient, index: str) -> int:
-    st, r = es.request("GET", f"/{index}/_stats/docs")
-    if st != 200:
-        raise PurgeError(f"stats failed ({st})")
-    return int(r["_all"]["primaries"]["docs"]["deleted"])
+    """The deleted (not yet merged away) documents of `index` (`reads.deleted_docs`: every shard answered, exactly this index, an
+    integer count): the purge is `ok` only when this reads 0, so a `(200, {})` or a foreign answer must never read as 0 (review round 6)."""
+    try:
+        return deleted_docs(*es.request("GET", f"/{index}/_stats/docs"), index, True)
+    except IncompleteRead as e:
+        raise PurgeError("stats not confirmed") from e
+
+
+EXPUNGE = "index.merge.policy.expunge_deletes_allowed"
 
 
 def ensure_expunge_threshold(es: EsClient, index: str) -> None:
     """The threshold must be 0, or a segment holding under the default 10 percent deleted documents is never merged and the
     count stays above zero for ever. The erase key cannot change settings (no `manage`); provisioning sets the value at
-    creation. A refused change is therefore accepted only when the index already carries 0; anything else is an error,
-    never a silent skip (the first build ignored the status and left one source index non-deterministically stuck)."""
-    st, _ = es.request("PUT", f"/{index}/_settings", {"index.merge.policy.expunge_deletes_allowed": "0"})
-    if st == 200:
+    creation. A change that is not acknowledged (`reads.acknowledged`) is therefore accepted only when the index is read back
+    carrying 0 (`reads.setting_value`); anything else is an error, never a silent skip (the first build ignored the status and left
+    one source index non-deterministically stuck)."""
+    try:
+        acknowledged(*es.request("PUT", f"/{index}/_settings", {EXPUNGE: "0"}))
         return
-    st, r = es.request("GET", f"/{index}/_settings/index.merge.policy.expunge_deletes_allowed?flat_settings=true")
-    got = next(iter(r.values()), {}).get("settings", {}).get("index.merge.policy.expunge_deletes_allowed") if st == 200 and isinstance(r, dict) else None
+    except IncompleteRead:
+        pass   # refused (the erase key has no `manage`) or not acknowledged: the readback decides
+    try:
+        got = setting_value(*es.request("GET", f"/{index}/_settings/{EXPUNGE}?flat_settings=true"), index, EXPUNGE, True)
+    except IncompleteRead as e:
+        raise PurgeError("the expunge threshold could not be read back") from e
     if got not in ("0", 0):
         raise PurgeError("the index does not carry expunge_deletes_allowed 0 and the key may not set it")
 
@@ -60,9 +71,10 @@ def purge_index(es: EsClient, index: str, *, deadline_s: float = DEFAULT_DEADLIN
     es.request("POST", f"/{index}/_flush")
     t0, passes = clock(), 0
     while True:
-        st, _ = es.request("POST", f"/{index}/_forcemerge?only_expunge_deletes=true")
-        if st not in (200, 201):
-            raise PurgeError(f"expunge failed ({st})")
+        try:   # a force merge that every primary ran (`reads.broadcast`)
+            broadcast(*es.request("POST", f"/{index}/_forcemerge?only_expunge_deletes=true"))
+        except IncompleteRead as e:
+            raise PurgeError("expunge failed") from e
         passes += 1
         left = deleted_count(es, index)
         if left == 0 or single_pass:

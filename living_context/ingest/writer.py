@@ -152,10 +152,11 @@ class Writer:
         if cas is not None and self._use_cas:
             q.append(f"if_seq_no={cas[0]}&if_primary_term={cas[1]}")
         path = f"/{index}/_doc/{doc_id}" + ("?" + "&".join(q) if q else "")
-        st, body = self._es.request("PUT", path, doc)
-        if st not in (200, 201, 409):
-            raise WriterError(f"index step failed ({st})")
-        return st, body if isinstance(body, dict) else {}
+        try:   # landed (a well-formed acknowledgement about exactly this document) or the typed version conflict; nothing else
+            landed = reads.doc_written(*self._es.request("PUT", path, doc), index, doc_id, True)
+        except IncompleteRead as e:
+            raise WriterError("index step not confirmed") from e
+        return (200, {}) if landed else (409, {})
 
     def _cget(self, cls: str, kind: str, doc_id: str, pool: Optional[str]) -> Optional[dict]:
         """A class-level document: through the class reader for a pool's document (it carries the pool term), directly otherwise."""
@@ -165,12 +166,12 @@ class Writer:
         return None if d is None else {"_source": dict(d.source), "_seq_no": d.seq_no, "_primary_term": d.primary_term}
 
     def _get(self, index: str, doc_id: str) -> Optional[dict]:
-        st, body = self._es.request("GET", f"/{index}/_doc/{doc_id}")
-        if st == 404:
-            return None
-        if st != 200 or not isinstance(body, dict):
-            raise WriterError(f"read step failed ({st})")
-        return body
+        """The document, or None for a verified absence of exactly it (`reads.doc_read` through the alias): repair re-projects, recreates
+        a head and re-queues on None, so a foreign or empty 404 must not read as "missing". Anything else raises WriterError."""
+        try:
+            return reads.doc_read(*self._es.request("GET", f"/{index}/_doc/{doc_id}"), index, doc_id, True)
+        except IncompleteRead as e:
+            raise WriterError("read step not confirmed") from e
 
     # ---- counters and heads (compare-and-set) ------------------------------------------------------
     def next_seq(self) -> int:
@@ -474,12 +475,11 @@ class Writer:
     def quarantine_list(self, cls: str) -> list[dict]:
         """Held items of a class: id, time, state (never the content). Authorisation is the gateway's (class held)."""
         idx = class_index(self.tenant, cls, "ctl")
-        self._es.request("POST", f"/{idx}/_refresh")
-        st, r = self._es.request("POST", f"/{idx}/_search", {"size": 1000, "_source": ["qid", "created_at", "state"],
-                                                              "query": {"bool": {"filter": [{"term": {"kind": "quarantine"}}],
-                                                                                 "must_not": [{"exists": {"field": "pool"}}]}}})   # not the holds of a pool
-        try:
-            hits = complete_hits(st, r)   # a partial answer would hide a held item from its reviewer
+        try:   # a refresh that did not reach every shard, or a partial answer, would hide a held item from its reviewer
+            reads.refresh(self._es, idx)
+            hits = complete_hits(*self._es.request("POST", f"/{idx}/_search", {
+                "size": 1000, "_source": ["qid", "created_at", "state"],
+                "query": {"bool": {"filter": [{"term": {"kind": "quarantine"}}], "must_not": [{"exists": {"field": "pool"}}]}}}))
         except IncompleteRead as e:
             raise WriterError("quarantine scan failed") from e
         return sorted((h["_source"] for h in hits), key=lambda d: d["created_at"])
@@ -764,11 +764,13 @@ class Writer:
             raise WriterError("refresh failed") from e
 
     @staticmethod
-    def _page(st, r) -> list:
-        try:
-            return complete_hits(st, r)   # a partial page (HTTP 200 with a failed shard) is not the end of the scan
-        except IncompleteRead as e:
-            raise WriterError("scan failed") from e
+    def _next_after(hits: list, after) -> object:
+        """The `search_after` position of the next repair page: the last hit's sort value, which must move past the previous one (a server
+        that repeats a page would otherwise be read for ever)."""
+        last = hits[-1].get("sort")
+        if not isinstance(last, list) or len(last) != 1 or (after is not None and not last[0] > after):
+            raise WriterError("scan does not advance")
+        return last[0]
 
     def repair(self, classes: Iterable[str]) -> dict:
         """Finish or undo partial writes. Source documents without a projection are re-projected from the
@@ -784,8 +786,10 @@ class Writer:
             body = {"size": 200, "sort": [{"src_seq": "asc"}], "query": {"match_all": {}}}
             if after is not None:
                 body["search_after"] = [after]
-            st, r = self._es.request("POST", f"/{src_idx}/_search", body)
-            hits = self._page(st, r)
+            try:   # a partial page (HTTP 200 with a failed shard) is not the end of the scan
+                hits = complete_hits(*self._es.request("POST", f"/{src_idx}/_search", body))
+            except IncompleteRead as e:
+                raise WriterError("scan failed") from e
             if not hits:
                 break
             for h in hits:
@@ -812,7 +816,7 @@ class Writer:
                 if self._get(heads, f"dq:{leaf_id}:{lv}") is None:
                     self._enqueue(cls, leaf_id, lv, seq)
                     out["queued"] += 1
-            after = hits[-1]["sort"][0]
+            after = self._next_after(hits, after)
         for cls in classes:  # projections whose source document is missing
             leaf = class_index(self.tenant, cls, "leaf")
             self._refresh_checked(leaf)
@@ -821,26 +825,31 @@ class Writer:
                 body = {"size": 200, "sort": [{"src_seq": "asc"}], "_source": False, "query": {"match_all": {}}}
                 if after is not None:
                     body["search_after"] = [after]
-                st, r = self._es.request("POST", f"/{leaf}/_search", body)
-                hits = self._page(st, r)
+                try:
+                    hits = complete_hits(*self._es.request("POST", f"/{leaf}/_search", body))
+                except IncompleteRead as e:
+                    raise WriterError("scan failed") from e
                 if not hits:
                     break
-                ids = [h["_id"] for h in hits]
-                st, m = self._es.request("POST", "/_mget", {"docs": [{"_index": src_idx, "_id": i} for i in ids]})
-                docs = m.get("docs") if st == 200 and isinstance(m, dict) else None
-                if not isinstance(docs, list) or len(docs) != len(ids):
+                ids = [h.get("_id") for h in hits]
+                if not all(isinstance(i, str) and i for i in ids):
                     raise WriterError("scan failed")
-                for d in docs:
-                    # only a VERIFIED absence deletes: a per-document error (an unavailable shard) is not "the source is missing"
-                    if not isinstance(d, dict) or "error" in d or d.get("found") not in (True, False):
-                        raise WriterError("source lookup incomplete")
-                    if d["found"] is False:   # through the class alias: a confirmed delete or a verified absence, else it raises
+                want = [(src_idx, i) for i in ids]
+                try:
+                    # only a VERIFIED absence deletes (`reads.mget_items`: every item in order, about exactly this source id, no item
+                    # error): an unavailable shard, a foreign or a missing item is not "the source is missing"
+                    docs = reads.mget_items(*self._es.request("POST", "/_mget", {"docs": [{"_index": i, "_id": d} for i, d in want]}),
+                                            want, alias=True)
+                except IncompleteRead as e:
+                    raise WriterError("source lookup incomplete") from e
+                for did, d in zip(ids, docs):
+                    if d is None:   # through the class alias: a confirmed delete or a verified absence, else it raises
                         try:
-                            reads.delete_doc(self._es, leaf, d["_id"], alias=True)
+                            reads.delete_doc(self._es, leaf, did, alias=True)
                         except (IncompleteRead, ValueError) as e:
                             raise WriterError("projection delete failed") from e
                         out["projections_deleted"] += 1
-                after = hits[-1]["sort"][0]
+                after = self._next_after(hits, after)
         for cls in classes:
             self._es.request("POST", f"/{class_index(self.tenant, cls, 'leaf')}/_refresh")
         return out

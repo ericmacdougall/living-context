@@ -125,3 +125,36 @@ class AliasShapesES(Base):
         self.assertEqual(st, 404, r)                                                              # the delete created nothing
         with self.assertRaises(reads.IncompleteRead):
             reads.delete_doc(er, self.alias, "d2")   # strict through the alias: the answer names the physical index and is refused
+
+    def test_round6_the_new_validators_read_the_real_shapes(self):
+        """Round 6 (C7): the answers the newly routed sites judge, as this cluster gives them. A multi-get item names the physical index and
+        carries its sequence fields; a lost `op_type=create` is a typed 409 naming the physical index (also through the alias); refresh,
+        flush and force merge answer a `_shards` section; `_stats/docs` names the one physical index with integer counts; a settings
+        change is acknowledged and reads back under the physical name; a count and an index listing are complete."""
+        adm = self.admin
+        for did in ("d1", "d2"):
+            self.assertTrue(reads.put_doc(adm, self.alias, did, {"tenant": T, "kind": "probe"}, "refresh=true", alias=True))
+        got = reads.mget_docs(adm, [(self.alias, "d1"), (self.alias, "nope"), (self.alias, "d2")], alias=True)
+        self.assertEqual([d and d["_id"] for d in got], ["d1", None, "d2"])
+        self.assertTrue(all(d is None or reads.same_index(self.alias, d["_index"], alias=True) for d in got))
+        self.assertFalse(reads.put_doc(adm, self.alias, "d1", {"tenant": T, "kind": "probe"}, "op_type=create", alias=True))
+        st, r = adm.request("PUT", f"/{self.bare}/_doc/d9?op_type=create", {"tenant": T, "kind": "probe"})
+        self.assertIn(st, (200, 201), r)
+        self.assertTrue(reads.version_conflict(*adm.request("PUT", f"/{self.bare}/_doc/d9?op_type=create", {"tenant": T}), self.bare), r)
+        reads.refresh(adm, self.alias)
+        reads.broadcast(*adm.request("POST", f"/{self.alias}/_flush"))
+        self.assertEqual(reads.complete_count(*adm.request("POST", f"/{self.alias}/_count", {"query": {"match_all": {}}})), 2)
+        self.assertTrue(reads.delete_doc(adm, self.alias, "d2", "refresh=true", alias=True))
+        n = reads.deleted_docs(*adm.request("GET", f"/{self.alias}/_stats/docs"), self.alias, True)
+        self.assertGreaterEqual(n, 0)
+        key = "index.merge.policy.expunge_deletes_allowed"
+        reads.acknowledged(*adm.request("PUT", f"/{self.alias}/_settings", {key: "0"}))
+        self.assertEqual(reads.setting_value(*adm.request("GET", f"/{self.alias}/_settings/{key}?flat_settings=true"), self.alias, key, True),
+                         "0")
+        reads.broadcast(*adm.request("POST", f"/{self.alias}/_forcemerge?only_expunge_deletes=true"))
+        st, r = adm.request("GET", f"/_resolve/index/lc-{T}-rescue*")
+        self.assertEqual(st, 200, r)
+        self.assertTrue({self.phys, self.bare} <= {x.get("name") for x in r["indices"]}, r)
+        fresh = f"lc-{T}-rescuefresh"
+        self.addCleanup(adm.request, "DELETE", f"/{fresh}")
+        reads.index_created(*adm.request("PUT", f"/{fresh}", {"settings": {"number_of_shards": 1, "number_of_replicas": 0}}), fresh)

@@ -83,6 +83,47 @@ class RepairReads(unittest.TestCase):
         with self.assertRaises(WriterError):
             repair(es)
 
+    def test_a_multi_get_item_about_another_source_deletes_nothing(self):
+        # round 6: at 4e7ee85 the item's own `_id` was deleted, so a foreign `found: false` removed ANOTHER projection
+        for name, item in {"another _id": {"_index": f"lc-{T}-src", "_id": "L2:1", "found": False},
+                           "another index": {"_index": f"lc-{T}-other", "_id": "L1:1", "found": False},
+                           "no _index": {"_id": "L1:1", "found": False}}.items():
+            with self.subTest(name):
+                es = Scripted(item)
+                with self.assertRaises(WriterError):
+                    repair(es)
+                self.assertNotIn("DELETE", [m for m, _ in es.sent])
+
+
+class Repeating(Scripted):
+    """A server that ignores `search_after` and answers the same page again, at most `limit` times (so the 4e7ee85 code, which read the
+    page for ever, ends)."""
+
+    def __init__(self, scan, limit=6):
+        super().__init__({"_index": f"lc-{T}-src", "_id": "L1:1", "found": True, "_source": {}, "_seq_no": 1, "_primary_term": 1})
+        self.scan, self.limit, self.pages = scan, limit, 0
+        hit = {"_id": "L1:1", "sort": [5], "_source": {"cls": "other", "leaf_id": "L1", "lv": 1, "src_seq": 5}}
+        setattr(self, scan, page([hit]))
+
+    def request(self, method, path, body=None, **kw):
+        if method == "POST" and path.split("?")[0].endswith("/_search") and ("src" in path) == (self.scan == "src_page"):
+            self.pages += 1
+            if self.pages > self.limit:
+                return page([])
+            return getattr(self, self.scan)
+        return super().request(method, path, body, **kw)
+
+
+class RepairProgress(unittest.TestCase):
+    def test_a_scan_that_does_not_advance_stops_with_an_error(self):
+        # round 6: a page whose last sort value does not move past the previous one is read again for ever; the repair must refuse
+        for scan in ("src_page", "leaf_page"):
+            with self.subTest(scan):
+                es = Repeating(scan)
+                with self.assertRaises(WriterError):
+                    repair(es)
+                self.assertEqual(es.pages, 2)                            # the repeat is seen on the second page, not the limit
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -21,6 +21,7 @@ from typing import Iterable
 from .es import EsClient
 from .indices import check_id
 from .provision import roles_for, write_key_file
+from .reads import IncompleteRead, api_key_created, api_keys_active, api_keys_invalidated
 
 OWNER_INDEX_PRIVILEGES = ["read", "write", "delete", "create_index", "view_index_metadata", "maintenance", "monitor"]
 
@@ -52,20 +53,30 @@ def provision_owner(admin: EsClient, tenant: str, secret_path: Path) -> str:
 
 
 def _owned_key_ids(owner: EsClient, tenant: str) -> list[str]:
-    st, r = owner.request("GET", f"/_security/api_key?owner=true&name=lc-{tenant}-*&active_only=true")
-    if st != 200 or not isinstance(r, dict):
-        raise RotationError(f"could not list the owner's keys ({st})")
-    return [k["id"] for k in r.get("api_keys", []) if not k.get("invalidated")]
+    """The ids of the owner's active keys of the tenant (`reads.api_keys_active`): an answer without the key list, such as
+    `(200, {})`, is not "no keys" (review round 6: offboarding would then invalidate nothing and report success)."""
+    try:
+        return api_keys_active(*owner.request("GET", f"/_security/api_key?owner=true&name=lc-{tenant}-*&active_only=true"),
+                               f"lc-{tenant}-")
+    except IncompleteRead as e:
+        raise RotationError("could not list the owner's keys") from e
 
 
 def invalidate(owner: EsClient, ids: Iterable[str]) -> list[str]:
+    """Invalidate `ids` and confirm it: the invalidation answer must be well formed (`reads.api_keys_invalidated`), and since this
+    cluster answers an id it did not invalidate with two empty lists and no error, the owner's active keys are read back and none of
+    `ids` may remain among them. Returns `ids` (every one is now verified inactive); anything else raises RotationError."""
     ids = list(ids)
     if not ids:
         return []
-    st, r = owner.request("DELETE", "/_security/api_key", {"ids": ids, "owner": True})
-    if st != 200 or not isinstance(r, dict):
-        raise RotationError(f"invalidate failed ({st})")
-    return list(r.get("invalidated_api_keys", []))
+    try:
+        api_keys_invalidated(*owner.request("DELETE", "/_security/api_key", {"ids": ids, "owner": True}))
+        active = set(api_keys_active(*owner.request("GET", "/_security/api_key?owner=true&active_only=true"), "lc-"))
+    except IncompleteRead as e:
+        raise RotationError("invalidation not confirmed") from e
+    if active & set(ids):
+        raise RotationError("a key is still active after its invalidation")
+    return ids
 
 
 def invalidate_all(owner: EsClient, tenant: str) -> list[str]:
@@ -85,10 +96,11 @@ def rotate(owner: EsClient, tenant: str, classes: list[str], key_dir: Path, *, e
     staged: dict[str, tuple[Path, Path]] = {}
     try:
         for role, rd in roles_for(t, classes).items():
-            st, body = owner.request("POST", "/_security/api_key", {
-                "name": f"lc-{t}-{role}", "expiration": expiry, "role_descriptors": {"r": rd}})
-            if st != 200 or not isinstance(body, dict):
-                raise RotationError(f"key creation failed ({st})")
+            try:   # a created key of exactly this name, with its id and encoded value (`reads.api_key_created`)
+                body = api_key_created(*owner.request("POST", "/_security/api_key", {
+                    "name": f"lc-{t}-{role}", "expiration": expiry, "role_descriptors": {"r": rd}}), f"lc-{t}-{role}")
+            except IncompleteRead as e:
+                raise RotationError("key creation not confirmed") from e
             created.append(body["id"])
             final = Path(key_dir) / t / f"{role}.key"
             tmp = final.with_suffix(".key.new")

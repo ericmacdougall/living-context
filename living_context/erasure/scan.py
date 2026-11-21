@@ -84,12 +84,13 @@ def find_text(es: EsClient, tenant: str, needle: str) -> list[Hit]:
     """NOT the closure: a string search over every field of every index of the tenant. It exists so the tests can show that a
     closure by string search misses a summary that paraphrases the subject (E2)."""
     pattern = f"lc-{check_id(tenant, 'tenant')}-*"
-    es.request("POST", f"/{pattern}/_refresh")
     q = '"' + needle.replace("\\", "\\\\").replace('"', '\\"') + '"'
-    st, r = es.request("POST", f"/{pattern}/_search?ignore_unavailable=true", {
-        "size": 1000, "_source": ["kind", "lin_leaf_ids", "lin_nodes"],
-        "query": {"query_string": {"query": q, "default_field": "*", "lenient": True}}})
-    if st != 200:
-        raise ScanError(f"text scan failed ({st})")
+    try:   # checked like every read, although no decision is taken from it (the E2 demonstration)
+        reads.refresh(es, pattern)
+        hits = reads.complete_hits(*es.request("POST", f"/{pattern}/_search?ignore_unavailable=true", {
+            "size": 1000, "_source": ["kind", "lin_leaf_ids", "lin_nodes"],
+            "query": {"query_string": {"query": q, "default_field": "*", "lenient": True}}}))
+    except reads.IncompleteRead as e:
+        raise ScanError("text scan failed") from e
     return [Hit(h["_index"], h["_id"], h["_source"].get("kind", ""), tuple(h["_source"].get("lin_leaf_ids", [])),
-                tuple(h["_source"].get("lin_nodes", []))) for h in r["hits"]["hits"]]
+                tuple(h["_source"].get("lin_nodes", []))) for h in hits]

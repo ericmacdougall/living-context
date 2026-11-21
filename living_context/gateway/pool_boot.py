@@ -13,7 +13,7 @@ from typing import Any, Callable, Optional
 
 from ..policy import pools as pl
 from .pool_admin import PoolService
-from .reads import IncompleteRead, delete_doc, scan
+from .reads import IncompleteRead, delete_doc, put_doc_landed, scan
 from .sessions import Sessions
 
 PAGE = 1000   # documents per page of the start-up read; the read is paged until exhausted (no cap)
@@ -24,9 +24,10 @@ def token_persister(authz: Callable[[], Any], tenant: str) -> Callable[[str, dic
         doc = {"tenant": tenant, "cls": "tenantwide", "kind": "token", "lin_leaves": [], "lin_leaf_ids": [], "lin_nodes": [],
                "lin_subjects": [d["principal"]], "lin_queries": [], "derivation": "token", "erasure_rewrite": 0, "schema_v": 1,
                "created_at": "1970-01-01T00:00:00+00:00", "hash": h, "exp": float(d.get("exp", 0)), "rec_json": json.dumps(d, sort_keys=True)}
-        st, _ = authz().request("PUT", f"/lc-{tenant}-authz/_doc/tk:{h}?refresh=true", doc)
-        if st not in (200, 201):
-            raise RuntimeError("authz write refused")
+        try:   # only a well-formed acknowledgement about exactly this record counts as written (review round 6)
+            put_doc_landed(authz(), f"lc-{tenant}-authz", f"tk:{h}", doc, "refresh=true", alias=True)
+        except IncompleteRead as e:
+            raise RuntimeError("authz write refused") from e
     return persist
 
 

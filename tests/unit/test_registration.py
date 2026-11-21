@@ -378,12 +378,14 @@ class Registration(unittest.TestCase):
                     self.assertNotIn("_search", n.value, rel + ": a search path built outside reads")
             self.assertTrue(any(isinstance(c, ast.Call) and call_name(c) == "scan" for c in ast.walk(tree)), rel)
         reads = parse("gateway/reads.py")
+        checked = ast.unparse(symbol(reads, "complete_search")) + ast.unparse(symbol(reads, "_shards_complete"))
         for check in ("timed_out", "terminated_early", "failed", "successful", "total"):
-            self.assertIn(check, ast.unparse(symbol(reads, "complete_hits")))
+            self.assertIn(check, checked)
+        self.assertIn("complete_search", {call_name(c) for c in ast.walk(symbol(reads, "complete_hits")) if isinstance(c, ast.Call)})
         self.assertIn("allow_partial_search_results=false", ast.unparse(symbol(reads, "search_path")))
         scan = symbol(reads, "scan")
         self.assertIn("_shard_doc", strings(scan))
-        self.assertIn("complete_hits", {call_name(c) for c in ast.walk(scan) if isinstance(c, ast.Call)})
+        self.assertIn("complete_search", {call_name(c) for c in ast.walk(scan) if isinstance(c, ast.Call)})
 
     def test_every_pool_write_of_the_writer_is_gated(self):
         """C4 (pools delta review): every Writer entry point that writes a pool document takes the write gate and checks the pool is

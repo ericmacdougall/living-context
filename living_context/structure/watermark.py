@@ -18,7 +18,7 @@ import time
 from typing import Callable, Optional
 
 from ..config import Constants
-from ..gateway import validator
+from ..gateway import reads, validator
 from ..gateway.es import EsClient
 from ..gateway.indices import TENANT_CLS, tenant_index
 
@@ -83,12 +83,17 @@ class WritePath:
             if job.cancelled:
                 return False
             validator.validate(doc, session_tenant=self.tenant, index=index, index_tenant=self.tenant, index_cls=doc["cls"])
-            st, _ = self._es.request("PUT", f"/{index}/_doc/{doc_id}" + ("?op_type=create" if create else ""), doc)
-            if st in (200, 201):
+            try:   # landed (`reads.doc_written`), or the typed conflict of `op_type=create` (False); nothing else
+                landed = reads.doc_written(*self._es.request("PUT", f"/{index}/_doc/{doc_id}" + ("?op_type=create" if create else ""),
+                                                             doc), index, doc_id, True)
+            except reads.IncompleteRead as e:
+                job.written.append((index, doc_id))   # it may have landed: a cancel of this job deletes it
+                job.touched.add(index)
+                raise WatermarkError("write not confirmed") from e
+            if landed:
                 job.written.append((index, doc_id))
                 job.touched.add(index)
-                return True
-            return False
+            return landed
 
     def touch(self, job: Job, index: str) -> None:
         """A retirement update (a `gen_to` entry) the job made on an index must be searchable before P moves too."""
@@ -106,7 +111,10 @@ class WritePath:
         with job.lock:         # joined: an in-flight write has finished, no later write can start
             job.cancelled = True
             for index, doc_id in job.written:
-                self._es.request("DELETE", f"/{index}/_doc/{doc_id}")
+                try:   # deleted or verifiably not there (`reads.doc_deleted`); otherwise the job stays open and P stays behind it
+                    reads.doc_deleted(*self._es.request("DELETE", f"/{index}/_doc/{doc_id}"), index, doc_id, True)
+                except reads.IncompleteRead as e:
+                    raise WatermarkError("a cancelled job's document was not confirmed deleted") from e
                 self._to_refresh.add(index)
             job.written.clear()
         with self._lock:
@@ -127,13 +135,16 @@ class WritePath:
     def _wp_index(self) -> str:
         return tenant_index(self.tenant, "ctl")
 
+    def _read_wp(self) -> Optional[dict]:
+        """The `wp` document (`reads.doc_read`: exactly it, with its sequence fields), or None for its verified absence (P = 0)."""
+        try:
+            return reads.doc_read(*self._es.request("GET", f"/{self._wp_index()}/_doc/wp"), self._wp_index(), "wp", True)
+        except reads.IncompleteRead as e:
+            raise WatermarkError("P unreadable") from e
+
     def read_p(self) -> int:
-        st, r = self._es.request("GET", f"/{self._wp_index()}/_doc/wp")
-        if st == 404:
-            return 0
-        if st != 200:
-            raise WatermarkError(f"read failed ({st})")
-        return int(r["_source"]["P"])
+        cur = self._read_wp()
+        return 0 if cur is None else int(cur["_source"]["P"])
 
     def target(self) -> int:
         with self._lock:
@@ -146,20 +157,28 @@ class WritePath:
         with self._lock:
             idxs, self._to_refresh = set(self._to_refresh), set()
         if self._refresh:
-            for idx in sorted(idxs):
-                self._es.request("POST", f"/{idx}/_refresh")
+            try:   # the searchable-publication barrier: every refresh reached every shard, or P does not move
+                for idx in sorted(idxs):
+                    reads.refresh(self._es, idx)
+            except reads.IncompleteRead as e:
+                with self._lock:
+                    self._to_refresh |= idxs   # the next advance refreshes them again
+                raise WatermarkError("refresh before advance failed") from e
         self._pause("refreshed")
         for _ in range(CAS_TRIES):
-            st, cur = self._es.request("GET", f"/{self._wp_index()}/_doc/wp")
-            have = int(cur["_source"]["P"]) if st == 200 else 0
+            cur = self._read_wp()
+            have = 0 if cur is None else int(cur["_source"]["P"])
             if target <= have:
                 return have
             doc = {"tenant": self.tenant, "cls": TENANT_CLS, "kind": "counter", "lin_leaves": [], "lin_leaf_ids": [],
                    "lin_nodes": [], "lin_subjects": [], "lin_queries": [], "derivation": "write_path", "erasure_rewrite": 0,
                    "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "schema_v": SCHEMA_V, "P": target}
-            q = "?op_type=create" if st == 404 else f"?if_seq_no={cur['_seq_no']}&if_primary_term={cur['_primary_term']}"
-            st2, _ = self._es.request("PUT", f"/{self._wp_index()}/_doc/wp{q}", doc)
-            if st2 in (200, 201):
+            q = "?op_type=create" if cur is None else f"?if_seq_no={cur['_seq_no']}&if_primary_term={cur['_primary_term']}"
+            try:
+                landed = reads.doc_written(*self._es.request("PUT", f"/{self._wp_index()}/_doc/wp{q}", doc), self._wp_index(), "wp", True)
+            except reads.IncompleteRead as e:
+                raise WatermarkError("P not stored") from e
+            if landed:
                 self._es.request("POST", f"/{self._wp_index()}/_refresh")
                 return target
         raise WatermarkError("P contended")

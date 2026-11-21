@@ -32,6 +32,7 @@ from . import pointers
 from .class_reader import ClassReader, ReaderRefused
 from .indices import pool_index
 from .pool_authz import authorize, carry, recheck
+from .reads import IncompleteRead, doc_read
 from .session_state import SessionStates, StateError
 from .sessions import Sessions
 from ..policy import Op, decide
@@ -141,10 +142,13 @@ class PoolTools:
     def _leaf(self, cls: str, pool: str, leaf_id: str, lv: int) -> Optional[dict]:
         idx = pool_index(self.tenant, cls, pool, "leaf")
         self.plan.append(idx)
-        st, r = self.es_for(cls).request("GET", f"/{idx}/_doc/{leaf_id}:{lv}")
-        if st != 200 or not isinstance(r, dict) or not r.get("found"):
+        try:   # exactly this leaf version through the pool alias, or its verified absence (`reads.doc_read`); anything else refuses
+            r = doc_read(*self.es_for(cls).request("GET", f"/{idx}/_doc/{leaf_id}:{lv}"), idx, f"{leaf_id}:{lv}", True)
+        except IncompleteRead as e:
+            raise ReaderRefused("incomplete") from e
+        if r is None:
             return None
-        src = r.get("_source") or {}
+        src = r["_source"]
         return src if src.get("pool") == pool else None   # the leaf must belong to the pool the pointer sealed
 
     # ---- pool_save -------------------------------------------------------------------------------------------------------

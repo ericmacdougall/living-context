@@ -150,6 +150,15 @@ class Executor:
                     out.add(h.search_id)
         return out
 
+    def _visible(self, er) -> None:
+        """Every acknowledged write of the tenant is searchable before the closure (or the residue recount) is read: a refresh of
+        `lc-<t>-*` that every primary ran (`reads.refresh`). A refresh that did not would let the closure miss a document the erasure
+        must reach, and the receipt certify it (review round 6), so anything else raises `ScanError` and nothing is published."""
+        try:
+            reads.refresh(er, f"lc-{self.tenant}-*")
+        except reads.IncompleteRead as e:
+            raise scan.ScanError("refresh before the closure failed") from e
+
     # ---- the request ------------------------------------------------------------------------------------------
     def erase_item(self, leaf_ids: Iterable[str], *, apply_guard: Callable[[], None] = lambda: None) -> Receipt:
         """Erase one or more items (DESIGN 14.1): every version of the named leaves and everything derived from them."""
@@ -163,7 +172,7 @@ class Executor:
         t0 = time.monotonic()
         er, rc = self._er(), Receipt()
         with self._gate.exclusive():
-            er.request("POST", f"/lc-{self.tenant}-*/_refresh")
+            self._visible(er)
             hits, leaves = self.closure(subject, item_leaves)
             self._pause("closure")
             self._check_holds(subject, leaves, hits)
@@ -206,7 +215,7 @@ class Executor:
         er, rc = self._er(), Receipt()
         leaves = set(leaf_ids)
         with self._gate.exclusive():
-            er.request("POST", f"/lc-{self.tenant}-*/_refresh")
+            self._visible(er)
             hits, found = self.closure(subject, leaves)
             leaves |= found
             if leaves:
@@ -265,7 +274,7 @@ class Executor:
         t0, er, rc = time.monotonic(), self._er(), Receipt()
         leaf_ids = sorted(set(leaf_ids))
         with self._gate.exclusive():
-            er.request("POST", f"/lc-{self.tenant}-*/_refresh")
+            self._visible(er)
             hits, lv_max = self.class_closure(leaf_ids, old_cls)
             self._check_holds("", leaf_ids, hits)
             redact = sorted({h.id for h in hits.values()})
@@ -280,7 +289,7 @@ class Executor:
         """The restore's replay of a relabel tombstone: the old-class closure only; the new-class version (a higher `lv`) stays."""
         t0, er, rc = time.monotonic(), self._er(), Receipt()
         with self._gate.exclusive():
-            er.request("POST", f"/lc-{self.tenant}-*/_refresh")
+            self._visible(er)
             hits, _ = self.class_closure(leaf_ids, old_cls)
             hits = {k: h for k, h in hits.items() if self._relabel_all or self._within(h, lv_max)}
             redact = sorted({h.id for h in hits.values()})
@@ -328,8 +337,7 @@ class Executor:
             elif h.kind in REWRITE_KINDS:
                 rc.rewritten += self._rewrite_node(h, leaves, subject)
                 touched.add(h.index)
-        def one(ix: str):
-            er.request("POST", f"/{ix}/_refresh")
+        def one(ix: str):   # purge_index refreshes and flushes the index itself before its expunge passes
             return ix, purge.purge_index(er, ix, deadline_s=self._pd, interval_s=self._pi)
 
         with ThreadPoolExecutor(max(1, min(8, len(touched)))) as ex:  # the tombstone clocks run side by side
@@ -337,7 +345,7 @@ class Executor:
                 rc.purge_s[ix] = round(res.seconds, 1)
                 rc.purge_left[ix] = res.deleted_left
                 rc.purge_ok &= res.ok
-        er.request("POST", f"/lc-{self.tenant}-*/_refresh")
+        self._visible(er)   # the residue recount reads what every applied delete left
         remaining = [h for h in scan.find(er, self.tenant, subjects=[subject] if subject else [], leaf_ids=leaves)
                      if h.kind not in KEEP_KINDS | REWRITE_KINDS]
         if cls is not None:   # the new-class copy names the same leaf ids: only the old class's documents are residue
