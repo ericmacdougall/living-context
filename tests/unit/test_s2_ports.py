@@ -1,9 +1,11 @@
 """Run control for a long stage, with a FAKE inner port (no process, no model): resume without repeating a charged call, a stop file,
 throttle back-off that never retries past the cap, and retry of failed build calls only."""
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
+from evalkit import s2_ports
 from evalkit.s2_ports import Journal, ResilientPort, StagePaused, StageStopped
 from living_context.model.budget import Budget, BudgetExceeded
 from living_context.model.port import CallResult, Task
@@ -44,6 +46,40 @@ def make(tmp, cap=100, script=None, default=None, **kw):
     delays = []
     p = ResilientPort(inner, b, j, Path(tmp) / "STOP", sleep=delays.append, **kw)
     return p, inner, b, delays
+
+
+class TornTail(unittest.TestCase):
+    """A stop in the middle of a write (killed, disk full) tears only the last line; a resume must not append onto it."""
+
+    def test_a_torn_last_journal_line_is_set_aside_and_no_call_is_charged_twice(self):
+        with tempfile.TemporaryDirectory() as d:
+            p, inner, b, _ = make(d)
+            for q in "ab":
+                p.call(Task.JUDGE_RELEVANCE, {"query": q, "text": "t"})
+            j = Path(d) / "journal.jsonl"
+            with open(j, "a") as f:
+                f.write('{"t": "pending", "key": "half-writ')            # the write that never finished
+            p2, inner2, b2, _ = make(d)
+            self.assertTrue(all(p2.call(Task.JUDGE_RELEVANCE, {"query": q, "text": "t"}).ok for q in "abc"))
+            self.assertEqual((b2.count(), inner2.calls), (3, 1))
+            p3, inner3, b3, _ = make(d)                                  # a second resume sees every row of the first
+            self.assertTrue(all(p3.call(Task.JUDGE_RELEVANCE, {"query": q, "text": "t"}).ok for q in "abc"))
+            self.assertEqual((b3.count(), inner3.calls, p3.replayed), (3, 0, 3))
+            self.assertEqual([x.read_text() for x in Path(d).glob("journal.jsonl.torn.*")], ['{"t": "pending", "key": "half-writ'])
+
+    def test_a_last_line_without_its_newline_keeps_both_rows(self):
+        with tempfile.TemporaryDirectory() as d:
+            j = Path(d) / "journal.jsonl"
+            j.write_text(json.dumps({"t": "result", "key": "k:0", "ok": True, "output": {}, "error": ""}))     # no newline
+            Journal(j).append({"t": "result", "key": "k:1", "ok": True, "output": {}, "error": ""})
+            self.assertEqual(sorted(Journal(j).results), ["k:0", "k:1"])
+
+    def test_an_unreadable_line_before_the_last_refuses_the_resume(self):
+        with tempfile.TemporaryDirectory() as d:
+            j = Path(d) / "journal.jsonl"
+            j.write_text('{"t": "result", "key": "k:0", "ok": true}\n{"t": "res\n{"t": "result", "key": "k:1", "ok": true}\n')
+            with self.assertRaises(s2_ports.JournalCorrupt):
+                Journal(j)
 
 
 class Resume(unittest.TestCase):

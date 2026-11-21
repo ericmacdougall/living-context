@@ -44,11 +44,56 @@ from living_context.model.port import CallContext, CallResult, PortRefused, Task
 from . import claude_cli
 from .claude_cli import AllowanceRefused, StageLimited, StagePaused
 
-__all__ = ["Journal", "ResilientPort", "ScopedPort", "ScopeRequired", "StageStopped", "StagePaused", "StageLimited", "BudgetExceeded"]
+__all__ = ["Journal", "JournalCorrupt", "read_resumable", "ResilientPort", "ScopedPort", "ScopeRequired", "StageStopped", "StagePaused", "StageLimited", "BudgetExceeded"]
 
 
 class StageStopped(Exception):
     """The stop file exists: the stage stops cleanly and is resumable."""
+
+
+class JournalCorrupt(Exception):
+    """A line before the last one of an append-only file does not parse: rows after it would be hidden, so nothing resumes on it."""
+
+
+def read_resumable(path: Path) -> List[dict]:
+    """The rows of an append-only JSON-lines file that a run appends to and a resume reads back (the journal, the ledger).
+
+    An interrupted write (the process ended, the disk filled) can tear only the last line. That torn tail is moved aside to
+    `<name>.torn.<k>` and cut from the file, and a last line without its newline gets one, so the next append starts on a clean
+    line and nothing the resumed run writes is merged into a line no later load can parse. A line that does not parse before the
+    last one raises `JournalCorrupt`."""
+    path = Path(path)
+    if not path.exists():
+        return []
+    raw = path.read_bytes()
+    rows: List[dict] = []
+    pos = 0
+    segs = raw.split(b"\n")
+    for i, seg in enumerate(segs):
+        if seg.strip():
+            try:
+                row = json.loads(seg)
+            except ValueError:
+                if any(s.strip() for s in segs[i + 1:]):
+                    raise JournalCorrupt("%s: line %d does not parse and rows follow it; refusing to resume on it" % (path.name, i + 1))
+                k = 0
+                while path.with_name("%s.torn.%d" % (path.name, k)).exists():
+                    k += 1
+                path.with_name("%s.torn.%d" % (path.name, k)).write_bytes(raw[pos:])
+                with open(path, "r+b") as f:
+                    f.truncate(pos)
+                    f.flush()
+                    os.fsync(f.fileno())
+                return rows
+            if isinstance(row, dict):
+                rows.append(row)
+        pos += len(seg) + 1
+    if raw and not raw.endswith(b"\n"):         # complete, but its newline was never written
+        with open(path, "ab") as f:
+            f.write(b"\n")
+            f.flush()
+            os.fsync(f.fileno())
+    return rows
 
 
 class Journal:
@@ -60,20 +105,13 @@ class Journal:
         self.rows = 0
         self.last: Optional[dict] = None
         self._lock = threading.Lock()
-        if self.path.exists():
-            for line in self.path.read_text().splitlines():
-                if not line.strip():
-                    continue
-                try:
-                    row = json.loads(line)
-                except ValueError:      # a torn last line from a kill: nothing after it can exist
-                    break
-                self.rows += 1
-                self.last = row
-                if "key" in row:
-                    self.tail[row["key"]] = row
-                if row.get("t") == "result":
-                    self.results[row["key"]] = row
+        for row in read_resumable(self.path):  # a torn last line is set aside; an unreadable earlier one refuses
+            self.rows += 1
+            self.last = row
+            if "key" in row:
+                self.tail[row["key"]] = row
+            if row.get("t") == "result":
+                self.results[row["key"]] = row
 
     def append(self, row: dict) -> None:
         with self._lock:

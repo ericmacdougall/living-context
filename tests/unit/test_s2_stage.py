@@ -80,6 +80,17 @@ def result_view(led):
     return {k: ({a: v["sessions"] for a, v in r["arms"].items()}, r["sources"]) for k, r in led.rows.items()}
 
 
+class LedgerTornTail(unittest.TestCase):
+    def test_a_torn_last_ledger_line_is_set_aside_and_the_next_row_is_kept(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "done.jsonl"
+            s2_stage.Ledger(p).append({"qref": "q1"})
+            with open(p, "a") as f:
+                f.write('{"qref": "q2", "arms": {"A0"')                 # the write that never finished
+            s2_stage.Ledger(p).append({"qref": "q2"})
+            self.assertEqual(sorted(s2_stage.Ledger(p).rows), ["q1", "q2"])
+
+
 class Resume(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

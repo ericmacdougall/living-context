@@ -24,7 +24,7 @@ from typing import Callable, Dict, List, Mapping, Optional, Sequence
 from . import arms, dataset as ds, stats
 from .score import question_scores, write_result
 from .parallel import run_ordered
-from .s2_ports import StageStopped
+from .s2_ports import StageStopped, read_resumable
 
 ARMS_H1 = ("A0", "A1", "A1-tree-only", "SHUFFLED")
 
@@ -42,13 +42,8 @@ class Ledger:
         self.path = Path(path)
         self.extra = dict(extra or {})          # recorded in every row (the model kind and model id)
         self.rows: Dict[str, dict] = {}
-        if self.path.exists():
-            for line in self.path.read_text().splitlines():
-                try:
-                    r = json.loads(line)
-                except ValueError:
-                    break
-                self.rows[r["qref"]] = r
+        for r in read_resumable(self.path):     # a torn last line is set aside; an unreadable earlier one refuses
+            self.rows[r["qref"]] = r
 
     def append(self, row: dict) -> None:
         row = {**self.extra, **row}
