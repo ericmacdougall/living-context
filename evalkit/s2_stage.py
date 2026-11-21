@@ -23,6 +23,7 @@ from typing import Callable, Dict, List, Mapping, Optional, Sequence
 
 from . import arms, dataset as ds, stats
 from .score import question_scores, write_result
+from .parallel import run_ordered
 from .s2_ports import StageStopped
 
 ARMS_H1 = ("A0", "A1", "A1-tree-only", "SHUFFLED")
@@ -66,32 +67,43 @@ class Recorder:
         return self.last
 
 
-def run_questions(dev: Sequence[ds.Question], hashes: Mapping[str, str], direct: Recorder, tree: Recorder, shuffled: Recorder,
-                  world: arms.World, ledger: Ledger, *, beta: Optional[float] = None, stop: Callable[[], bool] = lambda: False,
-                  progress: Callable[[str], None] = lambda s: None, shuffled_n: int = 0) -> None:
+def run_questions(dev: Sequence[ds.Question], hashes: Mapping[str, str], direct: Optional[Recorder], tree: Optional[Recorder],
+                  shuffled: Optional[Recorder], world: arms.World, ledger: Ledger, *, beta: Optional[float] = None,
+                  stop: Callable[[], bool] = lambda: False, progress: Callable[[str], None] = lambda s: None, shuffled_n: int = 0,
+                  retrievers: Optional[Callable[[str], tuple]] = None, workers: int = 1) -> None:
     """Completes every question not yet in the ledger, in the given order. Raises `StageStopped` (stop file) or `CapReached`
     before recording a question that did not complete; whatever the model port raised (`StagePaused`, `BudgetExceeded` outside a
-    recall) propagates, again without recording the question."""
-    for n, q in enumerate(dev, 1):
+    recall) propagates, again without recording the question.
+
+    Several workers: `retrievers(ref)` gives each question its own (direct, tree, shuffled) recorders over a port scoped to it; the
+    questions run concurrently and their rows are appended strictly in the given order (`parallel.run_ordered`)."""
+    if workers > 1 and retrievers is None:
+        raise ValueError("several workers need per-question retrievers (a shared recorder is shared state)")
+    todo = [(n, q) for n, q in enumerate(dev, 1) if qref(q.qid) not in ledger.rows]
+
+    def one(item) -> dict:
+        n, q = item
         ref = qref(q.qid)
-        if ref in ledger.rows:
-            continue
-        if stop():
-            raise StageStopped("stop file present")
+        d, t, sh = retrievers(ref) if retrievers is not None else (direct, tree, shuffled)
         g = sorted({hashes[s] for s in q.gold_session_ids})
-        shf = shuffled if (not shuffled_n or n <= shuffled_n) else None      # S3: SHUFFLED on the first `shuffled_n` questions only
-        o = arms.run_question(q.question, direct, tree, world, beta=beta or 0.0, shuffled_tree=shf)
-        for rec in (tree, shf):
+        shf = sh if (not shuffled_n or n <= shuffled_n) else None      # S3: SHUFFLED on the first `shuffled_n` questions only
+        o = arms.run_question(q.question, d, t, world, beta=beta or 0.0, shuffled_tree=shf)
+        for rec in (t, shf):
             if rec is None:
                 continue
             if rec.last is not None and not rec.last.ok and rec.last.error == "BudgetExceeded":
                 raise CapReached("call cap reached during question %d" % n)
-        src = arms.source_of_gold(o["A1"], tree.last.ids, [i for i, _ in direct.last], g, world) if o["A1"].sessions else {}
-        ledger.append({"qref": ref, "gold_n": len(g), "gold": [ds.opaque_ref(x) for x in g],
-                       "arms": {k: {"sessions": [ds.opaque_ref(s) for s in v.sessions], "failed": bool(v.failed)} for k, v in o.items()
-                                if k in ARMS_H1 or (beta is not None and k == "A0+LEN")},
-                       "sources": sorted(src.values()), "holder_calls": tree.last.holder_calls, "fallbacks": tree.last.fallbacks})
-        progress("question %d/%d done" % (n, len(dev)))
+        src = arms.source_of_gold(o["A1"], t.last.ids, [i for i, _ in d.last], g, world) if o["A1"].sessions else {}
+        return {"qref": ref, "gold_n": len(g), "gold": [ds.opaque_ref(x) for x in g],
+                "arms": {k: {"sessions": [ds.opaque_ref(s) for s in v.sessions], "failed": bool(v.failed)} for k, v in o.items()
+                         if k in ARMS_H1 or (beta is not None and k == "A0+LEN")},
+                "sources": sorted(src.values()), "holder_calls": t.last.holder_calls, "fallbacks": t.last.fallbacks}
+
+    def commit(_i, item, row) -> None:
+        ledger.append(row)
+        progress("question %d/%d done" % (item[0], len(dev)))
+
+    run_ordered(todo, one, commit, workers=workers, stop=stop, stop_exc=lambda: StageStopped("stop file present"))
 
 
 # ---- results ----------------------------------------------------------------------------------------------------------

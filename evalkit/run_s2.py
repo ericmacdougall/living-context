@@ -27,7 +27,7 @@ from living_context.embed import e5
 from living_context.model.budget import Budget, BudgetExceeded
 from living_context.model.port import PortRefused
 
-from . import arms, claude_cli, dataset as ds, s2_stage
+from . import arms, claude_cli, dataset as ds, parallel as par, s2_stage
 from .s2_ports import Journal, ResilientPort, StageLimited, StagePaused, StageStopped
 
 RC = {"COMPLETE": 0, "STOPPED": 3, "CAP_REACHED": 4, "BUILD_FAILED": 5, "PAUSED_THROTTLE": 75, "LIMIT_REACHED": 76, "ERROR": 1}
@@ -38,7 +38,7 @@ def write_state(run_dir: Path, state: str, **extra) -> int:
     return RC[state]
 
 
-def run(a, pick_questions, *, embedder=None, runner=None, loader=None) -> int:
+def run(a, pick_questions, *, embedder=None, runner=None, loader=None, tenant_factory=None) -> int:
     """`loader(a)` returns (dev questions, content hash per session id, clusters); the default reads the registered dataset (tests pass a
     synthetic loader)."""
     from living_context.structure.build import BuildFailed
@@ -53,9 +53,12 @@ def run(a, pick_questions, *, embedder=None, runner=None, loader=None) -> int:
                                      "started": time.time()}, sort_keys=True))
     else:
         old = json.loads(stamp.read_text())
-        if old.get("commit") != a.commit:        # `check_prereqs` allows this only for a run that never charged a call
-            old["earlier_commits"] = list(old.get("earlier_commits", [])) + [old.get("commit")]
+        if old.get("commit") != a.commit:        # `check_prereqs` allows this only for a run that never charged a call, or under a
+            old["earlier_commits"] = list(old.get("earlier_commits", [])) + [old.get("commit")]      # recorded amendment (see run_h1)
             old["commit"], old["restamped"] = a.commit, time.time()
+            if (getattr(a, "amendment_ref", "") or "").strip():
+                old["amendments"] = list(old.get("amendments", [])) + [{"ref": a.amendment_ref, "commit": a.commit, "at": time.time(),
+                                                                        "questions_done": 0}]
             stamp.write_text(json.dumps(old, sort_keys=True))
     if loader:
         dev, hashes, clusters = loader(a)
@@ -78,8 +81,11 @@ def run(a, pick_questions, *, embedder=None, runner=None, loader=None) -> int:
     built = run_dir / "BUILT.json"
     resumed_built = built.exists()
     ingested = (run_dir / "tenant_state.json").exists()      # written right after a complete ingest
-    et = EvalTenant(a.es_url, a.es_ca, a.es_pw_file, a.tenant, run_dir / "tenant", consts=consts, embed=pport.for_tenant(a.tenant),
-                    query_embed=qport.for_tenant(a.tenant), a0_fields=fields, attach=resumed_built or ingested)
+    if tenant_factory is not None:          # tests: an in-memory tenant with the same calls
+        et = tenant_factory(resumed_built or ingested)
+    else:
+        et = EvalTenant(a.es_url, a.es_ca, a.es_pw_file, a.tenant, run_dir / "tenant", consts=consts, embed=pport.for_tenant(a.tenant),
+                        query_embed=qport.for_tenant(a.tenant), a0_fields=fields, attach=resumed_built or ingested)
     t0 = time.time()
     if resumed_built or ingested:
         # the tenant and its leaves are intact (ids included): attach, do not ingest again; a tenant not yet built also gets its leaf
@@ -101,21 +107,34 @@ def run(a, pick_questions, *, embedder=None, runner=None, loader=None) -> int:
     budget = Budget(run_dir / "counter", a.approved_cap)
     inner = claude_cli.CappedPort(runner, budget, run_dir / "calls.jsonl", model_id=a.model, argv_record=getattr(runner, "argv", lambda: [])())
     journal = Journal(run_dir / "journal.jsonl")
-    port = ResilientPort(inner, budget, journal, run_dir / "STOP", max_retries=a.max_retries, base_delay_s=a.base_delay)
+    n_par = int(getattr(a, "concurrency", 1) or 1)
+    port = ResilientPort(inner, budget, journal, run_dir / "STOP", max_retries=a.max_retries, base_delay_s=a.base_delay,
+                         concurrency=n_par)
+    with open(run_dir / "starts.jsonl", "a") as f:      # every start or resume, with its concurrency (outputs do not depend on it)
+        f.write(json.dumps({"at": time.time(), "commit": a.commit, "concurrency": n_par,
+                            "concurrency_reason": getattr(a, "concurrency_reason", "") or "",
+                            "amendment_ref": getattr(a, "amendment_ref", "") or ""}, sort_keys=True) + "\n")
     ledger = s2_stage.Ledger(run_dir / "done.jsonl")
     state, extra = "COMPLETE", {}
     try:
         if not resumed_built:
-            tree = et.build_and_publish(port)       # on a resumed unfinished build every call is answered from the journal
+            # on a resumed unfinished build every call is answered from the journal; several workers ask each level's groups at once,
+            # each group under its own journal scope (`check_prereqs` refuses several workers over an unscoped journal of an older build)
+            kw = {"pmap": par.ordered_map(n_par), "port_for": lambda k: port.scoped("build|" + k)} if n_par > 1 else {}
+            tree = et.build_and_publish(port, **kw)
             print("tree: %d nodes, %d levels, top %d, build calls %d (replayed %d so far)" % (len(tree.nodes), tree.levels, len(tree.top),
                                                                                              tree.calls, port.replayed), flush=True)
             (run_dir / "tree.json").write_text(json.dumps({"nodes": len(tree.nodes), "levels": tree.levels, "top": len(tree.top),
                                                             "build_calls": tree.calls, "leaves": n_leaves}, indent=1))
             built.write_text(json.dumps({"at": time.time()}))
         view, world = et.view(), et.world
-        direct = s2_stage.Recorder(et.direct())
-        tr = s2_stage.Recorder(arms.TreeRetriever(port, view, a.tenant, CLS, "px", consts, workers=1))
-        sh = s2_stage.Recorder(arms.TreeRetriever(port, arms.PermutedView(view), a.tenant, CLS, "px", consts, workers=1))
+        dfn, pview = et.direct(), arms.PermutedView(view)
+
+        def retrievers(ref):
+            # one question's own recorders; above one worker each over a port scoped to its question (each recall stays one worker)
+            qp = port.scoped(ref) if n_par > 1 else port
+            return (s2_stage.Recorder(dfn), s2_stage.Recorder(arms.TreeRetriever(qp, view, a.tenant, CLS, "px", consts, workers=1)),
+                    s2_stage.Recorder(arms.TreeRetriever(qp, pview, a.tenant, CLS, "px", consts, workers=1)))
         beta = a.beta
         if a.stage == "S3":
             # S3 fits the length-prior beta once, on the development questions' A0 lists (no model call), and freezes it in the run directory
@@ -129,8 +148,9 @@ def run(a, pick_questions, *, embedder=None, runner=None, loader=None) -> int:
                 beta = arms.fit_beta(rows, world)
                 bp.write_text(json.dumps({"beta": beta, "n_questions": len(rows), "grid": "evalkit.arms.fit_beta default"}))
             print("A0+LEN beta (frozen):", beta, flush=True)
-        s2_stage.run_questions(dev, hashes, direct, tr, sh, world, ledger, beta=beta, shuffled_n=int(getattr(a, "shuffled_n", 0) or 0), stop=port.stop_requested,
-                               progress=lambda s: print(s, "counter", budget.count(), flush=True))
+        s2_stage.run_questions(dev, hashes, None, None, None, world, ledger, beta=beta, shuffled_n=int(getattr(a, "shuffled_n", 0) or 0),
+                               stop=port.stop_requested, progress=lambda s: print(s, "counter", budget.count(), flush=True),
+                               retrievers=retrievers, workers=n_par)
     except StageStopped:
         state = "STOPPED"
     except (BudgetExceeded, s2_stage.CapReached):

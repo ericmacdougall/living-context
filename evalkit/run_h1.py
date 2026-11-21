@@ -29,7 +29,7 @@ from typing import List, Optional
 
 from living_context.embed import e5, stub as embed_stub
 
-from . import arms, dataset as ds, stats
+from . import arms, dataset as ds, parallel as par, stats
 from .score import question_scores, write_result
 
 STAGES = ("DEV-STUB", "S2", "S3")
@@ -76,12 +76,28 @@ def check_prereqs(a, *, embed=embed_stub.embed) -> List[str]:
             old = {}
         rd = Path(a.run_dir)
         charged = any((rd / f).exists() for f in ("counter", "calls.jsonl", "journal.jsonl"))
+        # a recorded amendment may move a charged run to a new commit only between its build and its first question: the tree is
+        # complete (BUILT.json) and no question is in the ledger, so every recorded result comes from one commit per phase
+        done = rd / "done.jsonl"
+        amended = bool((getattr(a, "amendment_ref", "") or "").strip())
+        if amended and old.get("commit") != a.commit:
+            if not (rd / "BUILT.json").exists():
+                why.append("--amendment-ref moves a run to a new commit only after its build is complete (BUILT.json)")
+            if done.exists() and done.read_text().strip():
+                why.append("--amendment-ref moves a run to a new commit only before its first question is recorded")
         for k, now in (("commit", a.commit), ("cap", a.approved_cap), ("n_questions", a.n_questions), ("a0_fields", getattr(a, "a0_fields", "strong")),
                          ("shuffled_n", int(getattr(a, "shuffled_n", 0) or 0))):
-            if k == "commit" and not charged:
-                continue      # a run that never charged a call may continue under a corrected commit; the stamp records the earlier one
+            if k == "commit" and (not charged or amended):
+                continue      # a run that never charged a call may continue under a corrected commit, and a built run with no question
+                #               done may continue under an amendment; the stamp records the earlier commit (and the amendment)
             if old.get(k, 0 if k == "shuffled_n" else None) != now:
                 why.append("--resume must continue the same run: %s differs from the stamp (a new cap needs a new approval and a new run)" % k)
+    if a.stage in ("S2", "S3"):
+        n_par = getattr(a, "concurrency", 1)
+        why += par.check_concurrency(n_par, getattr(a, "concurrency_reason", ""))
+        rd = Path(a.run_dir)
+        if isinstance(n_par, int) and n_par > 1 and (rd / "journal.jsonl").exists() and not (rd / "BUILT.json").exists():
+            why.append("an unfinished build journaled without scopes resumes at --concurrency 1 only (its keys are unscoped)")
     if a.stage in ("S2", "S3") and (Path(a.run_dir) / "STOP").exists():
         why.append("a stop file is present in the run directory; remove it to start or resume")
     return why
@@ -130,6 +146,11 @@ def main(argv: Optional[list] = None) -> int:
     ap.add_argument("--shuffled-n", type=int, default=0, help="run SHUFFLED-SUMMARIES on the first N questions only (0 = all; S3 requires 50)")
     ap.add_argument("--max-retries", type=int, default=3, help="throttle retries per call before the stage pauses")
     ap.add_argument("--base-delay", type=float, default=30.0, help="first throttle back-off in seconds (doubles, capped at 600)")
+    ap.add_argument("--concurrency", type=int, default=par.REGISTERED_CONCURRENCY,
+                    help="model calls at once (registered %d); questions run concurrently, outputs do not depend on it" % par.REGISTERED_CONCURRENCY)
+    ap.add_argument("--concurrency-reason", default="", help="required above the registered value; recorded in starts.jsonl")
+    ap.add_argument("--amendment-ref", default="", help="a recorded deviation amendment that lets a built run with no question done "
+                    "resume under a new commit")
     a = ap.parse_args(argv)
     embedder = None
     if a.stage in ("S2", "S3") and a.embed_dir:
