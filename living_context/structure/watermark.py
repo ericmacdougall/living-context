@@ -157,7 +157,9 @@ class WritePath:
         with self._lock:
             idxs, self._to_refresh = set(self._to_refresh), set()
         if self._refresh:
-            try:   # the searchable-publication barrier: every refresh reached every shard, or P does not move
+            # the searchable-publication barrier: P moves only after every refresh answered with no failed shard (`reads.broadcast`).
+            # It does not prove that every shard copy refreshed: an unassigned copy counts as neither successful nor failed.
+            try:
                 for idx in sorted(idxs):
                     reads.refresh(self._es, idx)
             except reads.IncompleteRead as e:
