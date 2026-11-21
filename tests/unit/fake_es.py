@@ -201,6 +201,19 @@ class DocStore:
                 return statuses.pop(0), {"error": {"type": "injected"}}
         if p.endswith("/_refresh"):
             return 200, {"_shards": {"total": 1, "successful": 1, "failed": 0}}
+        if p == "/_mget":
+            out = []
+            for d in body["docs"]:
+                cur = self.docs.get((d["_index"], d["_id"]))
+                out.append({"_index": d["_index"], "_id": d["_id"], "found": cur is not None, **({"_source": dict(cur[0])} if cur else {})})
+            return 200, {"docs": out}
+        if p.endswith("/_search"):   # match_all sorted by one numeric field (the repair scans), search_after on it
+            index, field = p[1:-len("/_search")], next(iter(body["sort"][0]))
+            rows = sorted(((src.get(field, 0), did, src) for (ix, did), (src, _) in self.docs.items() if ix == index), key=lambda r: r[0])
+            if body.get("search_after"):
+                rows = [r for r in rows if r[0] > body["search_after"][0]]
+            hits = [{"_index": index, "_id": did, "_source": dict(src), "sort": [v]} for v, did, src in rows[: body.get("size", 10)]]
+            return 200, {"timed_out": False, "_shards": {"total": 1, "successful": 1, "skipped": 0, "failed": 0}, "hits": {"hits": hits}}
         m = re.match(r"^/([^/]+)/_doc/(.+)$", p)
         assert m, path
         key = (m.group(1), m.group(2))

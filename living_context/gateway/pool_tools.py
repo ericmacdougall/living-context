@@ -244,7 +244,7 @@ class PoolTools:
         opid = self.w.leaf_claim(pool.cls, pool.id, s.id, cur, mode, lv=cur + 1, new=new_id)
         if opid is None:
             return self._conflict(pool, s.id, cur)
-        done = False
+        done = failed = False
         try:
             if mode == "correct":
                 res = self.w.remember(rec.principal_token, pool.cls, req["text"], pool=pool.id, _version=(s.id, cur + 1), _head=None,
@@ -268,8 +268,11 @@ class PoolTools:
                 self.w.head_transition(pool.cls, pool.id, new_id, {"status": "pending"}, {"status": "live"})   # a crash here: repair
                 out = {"ok": True, "pointer": self._seal(pool.id, new_id, 1), "pool": pool.id,
                        "old": {"status": "superseded", "newer": self._seal(pool.id, new_id, 1)}}
+        except BaseException:
+            failed = True   # an HTTP error or an exception after the claim: the source may have landed, so the claim is settled, not dropped
+            raise
         finally:
-            self.w.leaf_release(pool.cls, pool.id, s.id, opid, abandon=not done)
+            self.w.leaf_release(pool.cls, pool.id, s.id, opid, abandon=not done, settle=failed, new=new_id)
         with self._lock:
             self._update_keys[ik] = (body, out)
         return out

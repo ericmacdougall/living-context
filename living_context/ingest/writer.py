@@ -294,13 +294,28 @@ class Writer:
         """Apply the claimed change: only while the head is still live and still carries this claim."""
         return self.head_transition(cls, pool, leaf_id, {"status": "live", "pending_op": opid}, changes, drop=PENDING) is not None
 
-    def leaf_release(self, cls: str, pool: str, leaf_id: str, opid: str, *, abandon: bool) -> None:
-        """End of the claim in this process; `abandon` also clears it on the head (the change did not happen)."""
+    def leaf_release(self, cls: str, pool: str, leaf_id: str, opid: str, *, abandon: bool, settle: bool = False,
+                     new: Optional[str] = None) -> None:
+        """End of the claim in this process. `abandon`: the change did not happen (it stopped before any write, or lost its claim),
+        so the claim is cleared on the head. `settle`: the change stopped on an ERROR after its claim (an HTTP error, a transport
+        exception), so whether its source landed is unknown: the claim is never cleared blindly. It leaves this process's in-flight set
+        and is finished or undone from what is durable (`recover_claim`, under the leaf lock: rolled forward when the source landed),
+        and a supersede's new head is settled; if the store still fails, the claim stays on the head and the next operation on the
+        leaf, or the start-up repair, settles it (review F4)."""
         try:
-            if abandon:
+            if abandon and not settle:
                 self.head_transition(cls, pool, leaf_id, {"pending_op": opid}, {}, drop=PENDING)
         finally:
             self._inflight(pool, leaf_id).discard(opid)
+        if settle:
+            try:
+                with _leaf_lock(self.tenant, pool, leaf_id):
+                    self._settle(cls, pool, leaf_id)
+                nh = self.leaf_head(cls, pool, new) if new else None
+                if nh is not None and nh.get("status") == "pending":
+                    self.settle_new_head(cls, pool, new, nh)
+            except Exception:
+                pass   # still failing: the durable claim stays for the next operation or the repair
 
     def leaf_retract(self, cls: str, pool: str, leaf_id: str, cur: int, reason: str) -> bool:
         """Retract a live leaf at version `cur` with no pending claim (one head compare-and-set). False: the head changed or a change
