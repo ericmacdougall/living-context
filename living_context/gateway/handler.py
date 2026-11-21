@@ -198,7 +198,8 @@ class Gateway:
     def send_ok(self, reply: Reply) -> bool:
         """POOLS 2.4 at the send hand-off, run by the server under the SHARED side of the tenant's send fence before every chunk:
         checks 1 to 3 for `reply.token` (it resolves: tenant prefix, `exp`, individual revocation, epoch, root and parent) and check 4
-        for every pool in `reply.needs` with its operations (the pool runtime's `send_ok`). Memory only: the session, epoch, pool
+        for every pool in `reply.needs` with its operations, and the live visibility check for every pool it names (`VIEW`; the pool
+        runtime's `send_ok`, `pool_authz.recheck`). Memory only: the session, epoch, pool
         directory and grant tables, each under its own leaf lock, which no thread holds while taking the fence (lock order: fence, then
         a leaf lock); no Elasticsearch, journal, disk or socket I/O, and the fence is never re-entered. Any failure or error is False,
         and the whole answer is aborted. Journal admission is not re-checked here: 2.4 names checks 1 to 4, and the administrator's lane

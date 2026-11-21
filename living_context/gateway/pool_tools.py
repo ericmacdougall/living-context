@@ -31,7 +31,7 @@ from ..recall.fusion import K_RRF, rrf, rrf_salted
 from . import pointers
 from .class_reader import ClassReader, ReaderRefused
 from .indices import pool_index
-from .pool_authz import authorize, carry
+from .pool_authz import authorize, carry, recheck
 from .session_state import SessionStates, StateError
 from .sessions import Sessions
 from ..policy import Op, decide
@@ -91,12 +91,12 @@ class PoolTools:
             return UNAVAILABLE
 
     def send_ok(self, token: str, needs: Mapping[str, Any]) -> bool:
-        """POOLS 2.4 at the send hand-off: checks 1 to 4 again, for `token` and every pool the response carries, with the needed
-        operations. Called by the server under the SHARED side of the tenant's send fence before every chunk; memory only (the session
-        table, the epoch table, the pool directory and grant table), no Elasticsearch, journal or socket I/O and no other fence. No cap
-        on the number of pools (`limit=None`): a query's S is bounded by the token scope, and the re-check must not refuse what the call
-        was allowed to read."""
-        return authorize(self.sessions, self.dir, self.lattices, token, needs, carry_needs=False, limit=None) is not None
+        """POOLS 2.4 at the send hand-off: checks 1 to 4 again, for `token` and every pool the response carries or names, with the
+        needed operations and `VIEW` (`pool_authz.recheck`). Called by the server under the SHARED side of the tenant's send fence before
+        every chunk; memory only (the session table, the epoch table, the pool directory and grant table), no Elasticsearch, journal or
+        socket I/O and no other fence. No cap on the number of pools: a query's S is bounded by the token scope, and the re-check must
+        not refuse what the call was allowed to read."""
+        return recheck(self.sessions, self.dir, self.lattices, token, needs)
 
     # ---- helpers ---------------------------------------------------------------------------------------------------------
     def _stage_hook(self, pool, what: str) -> None:

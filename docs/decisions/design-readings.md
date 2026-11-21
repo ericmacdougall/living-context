@@ -308,8 +308,16 @@ Each entry names the passages, the reading the build follows and the test that k
   is aborted at the hand-off, so the client sees `unavailable`, and a retry is refused.
 - The one answer sent without a token check is the receipt of a bearer revoking its own token (`token_revoke` without an id, answered `ok`,
   the token no longer resolving): it carries no pool and nothing the revoked token could read.
-- ASSUMPTION: `pool_list` and `pool_describe` answer pool metadata (label, card, class, kind, state), not content in the sense of 2.4; their
-  hand-off re-checks the token (checks 1 to 3), and visibility is decided at the call.
+- Seeing a pool (POOLS 2.4, 2.7, 4.1; F16, round 4). The earlier reading that `pool_list` and `pool_describe` answer metadata, checked by
+  the token alone at the hand-off and by mint-time scope at the call, is withdrawn: a card is administrator text visible to grantees, and
+  2.7 counts "not granted" as unavailable. Every operation that names or returns a pool passes ONE live visibility check
+  (`pool_authz.sees`) at the call and carries the pseudo-need `VIEW` for each pool it names, which the send hand-off re-runs under the
+  fence (`pool_authz.recheck`), so an ungrant, a detach or a revoke between build and hand-off aborts a built listing, description or
+  create receipt whole. ASSUMPTION (which operations confer visibility, not settled by POOLS): a scoped token sees a pool when SOME
+  operation of its scope on that pool passes check 4 now (active, in scope, live grant, class in the read set for query, retract and
+  review or the write set for save and update); a plain session of a tenant administrator sees every pool of its tenant in any state
+  (it detaches, reattaches, grants and deletes them); any other plain session sees a pool when SOME operation passes check 4 now without a
+  token scope. `VIEW` is not an operation: it is never granted, minted or delegated.
 - Journal admission (F1) is checked before dispatch for every operation and both mint forms, except the administrator's own lane, which
   `Admin.handle` admits by its own rules. It is not re-checked at the hand-off: 2.4 names checks 1 to 4, and the administrator's lane answers
   on a closed tenant. A gateway without a pool runtime admits nothing unless it is given an explicit admission.
@@ -318,7 +326,9 @@ Each entry names the passages, the reading the build follows and the test that k
   inside the exclusive side. No thread holds any of them while taking the fence, none is held across I/O, and the check never re-enters the
   fence. The write gate, the journal lock and the keystore lock are never taken under the fence.
 - Complete reads (F11, F12, F13). Every authoritative read that decides an erasure, a pool delete, a verification or a repair is complete or
-  refused: status 200, not timed out, no shard failed and every shard answered, `relation` `eq` for a count. A paginated scan over
+  refused: status 200, not timed out, no shard failed and every shard answered, `relation` `eq` for a count. An exact-name lookup
+  (`reads.aliases`, `reads.scan(missing_ok=True)`) reads as absent only on a 404 `index_not_found_exception` that names the exact name
+  asked, and a 200 must be well formed and about that name; an empty or malformed answer refuses (F11, round 4). A paginated scan over
   several indices uses a point in time with `_shard_doc` (a cursor unique across indices), never `_doc`. The verifier keeps its own
   validators (DESIGN 14.7: no shared read path with the gateway). Pool delete discovers its physical indices from the alias and the manifest,
   refuses when discovery fails, and checks after the drop that the alias and every physical index are gone.

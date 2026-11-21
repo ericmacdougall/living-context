@@ -82,6 +82,8 @@ class World:
         store = GrantStore()
         store.restore(Principal(T, "pt-user-alice", frozenset({Role.READER, Role.WRITER}), frozenset({"base"}), frozenset({"base"})))
         store.restore(Principal(T, "pt-user-admin", frozenset({Role.TENANT_ADMIN}), frozenset({"base"}), frozenset({"base"})))
+        store.restore(Principal(T, "pt-user-admin2", frozenset({Role.TENANT_ADMIN}), frozenset({"base"}), frozenset({"base"})))
+        store.restore(Principal(T, "pt-user-bob", frozenset({Role.READER, Role.WRITER}), frozenset({"base"}), frozenset({"base"})))
         grants = lambda t, k: store.get(t, k)
         fences = {}
         self.fence_for = lambda t: fences.setdefault(t, SendFence())
@@ -95,7 +97,8 @@ class World:
         self.tools = PoolTools(T, self.dir, self.sessions, LAT, self.writer, self.reader, lambda cls: self.es, self.keys,
                                consts=self.consts, model=NoModel())
         self.journal = Journal(self.epochs)
-        self.service = PoolService(T, self.dir, self.sessions, self.journal, LAT[T], lambda t, w: f"pt-{w}", grants=grants, **broken)
+        self.service = PoolService(T, self.dir, self.sessions, self.journal, LAT[T], lambda t, w: f"pt-{w}", grants=grants,
+                                   **{"authz_client": lambda: self.es, **broken})
         self.router = PoolRouter(self.service, self.tools)
         self.gw = Gateway(None, self.sessions, LAT, pools=lambda t: self.router if t == T else None)
         self.pools = []
@@ -104,10 +107,20 @@ class World:
             self.dir.grant(T, "pt-user-alice", pid, OPS)
             self.pools.append(pid)
         self.admin = self.sessions.mint(T, b"user-admin")
+        self.admin2 = self.sessions.mint(T, b"user-admin2")
 
-    def scoped(self, conversation, pools=None, ttl_s=600):
+    def scoped(self, conversation, pools=None, ttl_s=600, human=False):
         return self.sessions.mint_scoped(T, b"user-alice", conversation=conversation,
-                                         scope={p: OPS for p in (self.pools if pools is None else pools)}, ttl_s=ttl_s)
+                                         scope={p: OPS for p in (self.pools if pools is None else pools)}, ttl_s=ttl_s, human=human)
+
+    def plain(self, who="alice"):
+        """A plain session (no token scope) of `who`."""
+        return self.sessions.mint(T, f"user-{who}".encode())
+
+    def hold(self, pool, private=()):
+        """A held save of alice's in `pool` (what the write floor keeps for a human to review, POOLS 2.8), whose private source set is
+        `private`; its hold id. Planted through the writer, since this world has no session taint states."""
+        return self.writer.hold_tainted("pt-user-alice", "base", pool, list(private), TEXT, {"actor": "agent", "origin": "agent"})
 
     def admin_op(self, **req):
         return self.gw.handle(self.admin, req)

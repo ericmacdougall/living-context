@@ -9,8 +9,19 @@ and nothing is built. Every refusal is the same `None`, from which the caller re
 The send hand-off repeats checks 1 to 4 (2.4: "for every pool whose content the response carries"). What a response carries is
 collected while the request runs: `carried()` opens a collector for one request (the gateway's `serve`), every successful `authorize`
 adds its pools and operations to it (union across calls), and a call that checks pools only to choose among them (pool_query's G)
-passes `carry=False` and then `carry(...)` the pools it actually reads (S). The server re-runs `authorize(..., carry=False,
-limit=None)` over the collected needs under the shared side of the send fence at every hand-off (`PoolTools.send_ok`).
+passes `carry=False` and then `carry(...)` the pools it actually reads (S). The server re-runs the collected needs under the shared side
+of the send fence at every hand-off (`recheck`, through `PoolTools.send_ok`).
+
+Visibility (review F16, round 4). Every operation that names or returns a pool without reading its content (pool_list, pool_describe, the
+pool_create receipt) passes the ONE live visibility check, `sees`, and carries the pseudo-need `VIEW` for each pool it names, which the
+hand-off re-runs through `sees` like any content need. `sees` is POOLS 2.7 applied to a pool's directory entry (id, label, card, class,
+kind, private flag, state), which is administrator text visible to grantees (4.1):
+* a scoped token sees a pool when SOME operation of its scope on that pool passes check 4 now (active, in scope, held in the live grant
+  table, class in the read or write set);
+* a plain session of a tenant administrator sees every pool of its tenant, in any state (the administrator detaches, reattaches, grants
+  and deletes them);
+* any other plain session sees a pool when SOME operation passes check 4 now without a token scope (active, live grant, class).
+`VIEW` is not an operation (`pools.OPERATIONS`): it is never granted, minted or delegated, only checked.
 """
 from __future__ import annotations
 
@@ -19,11 +30,12 @@ import contextvars
 from dataclasses import dataclass
 from typing import Iterable, Iterator, Mapping, Optional
 
-from ..policy import ClassLattice, Principal
+from ..policy import ClassLattice, Principal, Role
 from ..policy import pools as pl
 from .sessions import Record, Sessions
 
 MAX_POOLS_PER_CALL = 32
+VIEW = "view"   # the right to see a pool's directory entry; a pseudo-need, never an operation (see the module docstring)
 _CARRIED: contextvars.ContextVar = contextvars.ContextVar("lc_pool_needs_carried", default=None)
 
 
@@ -90,3 +102,60 @@ def authorize(sessions: Sessions, directory: pl.PoolDirectory, lattices: Mapping
     if carry_needs:
         carry({pid: needs[pid] for pid in got})
     return PoolAuth(rec, p, got)
+
+
+def sees(sessions: Sessions, directory: pl.PoolDirectory, lattices: Mapping[str, ClassLattice], rec: Record,
+         pool_id: object) -> Optional[pl.Pool]:
+    """The one live visibility check (VIEW): the pool when `rec` may see its directory entry now, else None (the same None for a pool
+    that does not exist). Memory only: the pool directory and the grant table under their own leaf locks."""
+    if not isinstance(pool_id, str) or rec is None:
+        return None
+    lattice = lattices.get(rec.tenant)
+    if lattice is None:
+        return None
+    p = sessions.principal(rec)
+    if rec.scope is not None:
+        ops, scope = rec.scope.get(pool_id, frozenset()), rec.scope
+    elif Role.TENANT_ADMIN in p.roles and p.tenant == rec.tenant:
+        return directory.get(rec.tenant, pool_id)
+    else:
+        ops, scope = pl.OPERATIONS, None
+    for op in sorted(ops):
+        pool = pl.pool_allows(directory, lattice, p, pool_id, op, scope)
+        if pool is not None:
+            return pool
+    return None
+
+
+def view(sessions: Sessions, directory: pl.PoolDirectory, lattices: Mapping[str, ClassLattice], rec: Record,
+         pool_ids: Iterable[object], *, carry_needs: bool = True) -> dict:
+    """Pool id to pool, for every pool of `pool_ids` that `rec` sees now (`sees`), in the order given. Each one is carried with `VIEW`,
+    so the hand-off re-checks it. No cap: a listing names as many pools as the caller sees."""
+    got = {}
+    for pid in pool_ids:
+        pool = sees(sessions, directory, lattices, rec, pid)
+        if pool is not None:
+            got[pid] = pool
+    if carry_needs and got:
+        carry({pid: {VIEW} for pid in got})
+    return got
+
+
+def recheck(sessions: Sessions, directory: pl.PoolDirectory, lattices: Mapping[str, ClassLattice], token: str,
+            needs: Mapping[str, Iterable[str]]) -> bool:
+    """The send hand-off (POOLS 2.4, under the shared side of the send fence, before every chunk): checks 1 to 3 for `token`, then for
+    every carried pool its content operations through `authorize` (whole, no cap) and its `VIEW` through `sees`. An operation that is
+    neither is refused. Memory only; any failure is False and aborts the whole answer."""
+    rec = sessions.resolve(token)
+    if rec is None:
+        return False
+    content: dict = {}
+    for pid, ops in needs.items():
+        ops = set(ops)
+        if not ops or not ops <= (pl.OPERATIONS | {VIEW}):
+            return False
+        if VIEW in ops and sees(sessions, directory, lattices, rec, pid) is None:
+            return False
+        if ops - {VIEW}:
+            content[pid] = ops - {VIEW}
+    return not content or authorize(sessions, directory, lattices, token, content, carry_needs=False, limit=None) is not None
