@@ -2,6 +2,7 @@
 delegate, renew, revoke) goes through one validation choke point (finite, positive, bounded lifetime; tenant binding), the socket parser
 refuses non-standard JSON numbers, and the pool and token operations are refused while the tenant's journal does not admit.
 Each case was red on e979747 (F7, F8, F1 runtime half) before the fix."""
+import base64
 import json
 import math
 import unittest
@@ -95,6 +96,24 @@ class JournalAdmission(Base):
                     {"op": "pool_describe", "pool": a}, {"op": "pool_query", "query": "x"}):
             self.assertEqual(gw.handle(root, req), UNAV, req["op"])
         self.assertEqual(gw.mint(T, b"user-alice", {"conversation": "c2", "scope": {a: ["query"]}}), UNAV)
+
+    def test_f1_rescue_a_faulted_journal_closes_plain_mints_and_class_operations_too(self):
+        """Review round 3 F1: the plain-session mint line and the class operations (ping, search, lookup, write) skipped admission."""
+        w = self.world()
+        router = PoolRouter(w.svc, None)
+        calls = []
+        writer = type("W", (), {"remember": lambda self, *a, **kw: calls.append("remember")})()
+        gw = Gateway(None, w.sessions, LAT, writers=lambda t: writer, pools=lambda t: router if t == T else None)
+        proof = base64.b64encode(b"user-alice").decode()
+        ans, plain = gw.mint_line({"tenant": T, "proof": proof, "request": {"session": "plain"}})
+        self.assertTrue(ans["ok"])                                                     # the control: an open journal mints
+        self.assertEqual(gw.handle(plain, {"op": "ping"}), {"ok": True})
+        w.rev._fault("injected journal fault")
+        self.assertEqual(gw.mint_line({"tenant": T, "proof": proof, "request": {"session": "plain"}}), (UNAV, None))
+        for req in ({"op": "ping"}, {"op": "search", "cls": "base", "text": "x"}, {"op": "lookup", "pointer": "x"},
+                    {"op": "write", "cls": "base", "doc": {"text": "x"}}):
+            self.assertEqual(gw.handle(plain, req), UNAV, req["op"])
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":

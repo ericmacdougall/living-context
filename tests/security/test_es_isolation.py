@@ -78,7 +78,8 @@ class IsolationOnElasticsearch(unittest.TestCase):
         cls.stores = {t: Keystore(root / "ks" / f"{t}.db", t) for t in TENANTS}
         cls.writers = {t: Writer(lambda t=t: cls.es.client(t, "ingest"), cls.stores[t], t,
                                  Guard(TokenSource(cls.stores[t]))) for t in TENANTS}
-        cls.gw = Gateway(cls.es, cls.sessions, {t: LAT for t in TENANTS}, writers=lambda t: cls.writers[t])
+        cls.gw = Gateway(cls.es, cls.sessions, {t: LAT for t in TENANTS}, writers=lambda t: cls.writers[t],
+                         admits=lambda t: True)   # no epoch journal in this test: admission is explicit (no fail-open default)
         cls.tok = {t: cls.sessions.mint(t, b"user") for t in TENANTS}
         cls.sup = {t: cls.sessions.mint(t, b"usersuper") for t in TENANTS}
         cls.ptr = {}

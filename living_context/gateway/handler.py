@@ -71,8 +71,9 @@ class EsGate:
 class Gateway:
     def __init__(self, es: EsGate, sessions: Sessions, lattices: Mapping[str, ClassLattice],
                  writers: Optional[Callable[[str], Any]] = None, admin: Any = None,
-                 pools: Optional[Callable[[str], Any]] = None):
+                 pools: Optional[Callable[[str], Any]] = None, admits: Optional[Callable[[str], bool]] = None):
         self._es, self._sessions, self._lattices = es, sessions, lattices
+        self._admits = admits   # tenant -> does its journal admit; None: the pool runtime's `admit` (no runtime, no admission)
         self._writers = writers
         self._pools = pools   # tenant -> gateway.pool_admin.PoolService (pools, grants, token revoke) and the pool tools
         self._admin = admin   # gateway.admin.Admin: grant, revoke, remove_class, break_glass_revoke
@@ -90,11 +91,23 @@ class Gateway:
             return None
         return {"pointer": ptr, "title": src.get("title", ""), "size": src.get("size_tokens", 0)}
 
+    def _admit(self, tenant: str) -> bool:
+        """The ONE journal admission check (POOLS 2.5; DESIGN 4.4: a journal fault closes the tenant): every operation except the
+        administrator's own lane (ADMIN_OPS, which `Admin.handle` admits by its own rules) and both mint forms pass it before anything
+        is dispatched; a closed tenant is the one `unavailable`. There is no fail-open default: with neither an explicit `admits` nor a
+        pool runtime, nothing is admitted. tests/unit/test_admission_guard.py enumerates the operations and mint forms."""
+        try:
+            if self._admits is not None:
+                return self._admits(tenant) is True
+            rt = self._pools(tenant) if self._pools else None
+            return rt is not None and rt.admit() is True
+        except Exception:
+            return False
+
     def _runtime(self, tenant: str):
-        """The tenant's pool runtime, only while its epoch journal admits (POOLS 2.5; DESIGN 4.4: a journal fault closes the tenant).
-        The ONE admission point of every pool operation, token operation and scoped mint; a closed tenant is the one `unavailable`."""
+        """The tenant's pool runtime, only while its epoch journal admits."""
         rt = self._pools(tenant) if self._pools else None
-        if rt is None or not rt.admit():
+        if rt is None or not self._admit(tenant):
             return None
         return rt
 
@@ -129,6 +142,8 @@ class Gateway:
         except (binascii.Error, ValueError):
             return UNAVAILABLE, None
         req = m["request"]
+        if not self._admit(m["tenant"]):   # both mint forms: a closed tenant mints nothing (review F1)
+            return UNAVAILABLE, None
         if req == {"session": "plain"}:
             tok = self._sessions.mint(m["tenant"], proof)
             return ({"ok": True, "token": tok}, tok) if tok else (UNAVAILABLE, None)
@@ -151,10 +166,12 @@ class Gateway:
         rec = self._sessions.resolve(token)
         if rec is None:
             return UNAVAILABLE
+        op = request.get("op") if isinstance(request, dict) and isinstance(request.get("op"), str) else None
+        if op not in ADMIN_OPS and not self._admit(rec.tenant):   # before any dispatch, class operations and ping included (F1)
+            return UNAVAILABLE
         if not isinstance(request, dict) or FORBIDDEN_BODY_FIELDS & set(request):
             return REFUSED
         p = self._sessions.principal(rec)
-        op = request.get("op")
         if rec.scope is not None and (op not in SCOPED_OPS or (op == "token_revoke" and request.get("token_id") is not None)):
             return UNAVAILABLE
         if op in ADMIN_OPS:   # the operator's break-glass comes from the platform tenant, which has no lattice
