@@ -8,7 +8,10 @@ Rules (DESIGN 3, 7.1, 8.7; probe P2 mitigations, main's decision):
   files by path inside this process and never appear in a response;
 * no Elasticsearch error body, sub-response or index name is ever forwarded: every
   failure is one of two typed answers, `refused` or `unavailable`, identical for
-  forbidden, erased, missing and failed.
+  forbidden, erased, missing and failed;
+* the answer goes out with what its hand-off must re-check (`serve` returns a `Reply`): the token whose authority it carries and every
+  pool (with the operations) whose content it carries; the server runs `send_ok` under the shared side of the tenant's send fence at
+  every hand-off (POOLS 2.4, 2.5, AC-2) and aborts the whole answer when it fails.
 """
 from __future__ import annotations
 
@@ -16,6 +19,7 @@ import base64
 import binascii
 import json
 import os
+from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional
 
 from ..ids import IdError, KIND_LEAF, Pointer, decode_pointer, encode_pointer
@@ -26,6 +30,7 @@ POOL_TOOLS = frozenset({"pool_save", "pool_update", "pool_query", "pool_fetch", 
 from .es import EsClient, EsError
 from ..recall.direct import DirectSearch
 from .indices import class_index
+from .pool_authz import carried
 from .sessions import Sessions
 
 FORBIDDEN_BODY_FIELDS = {"tenant", "principal", "principal_token", "session", "roles", "read_set", "write_set"}
@@ -35,6 +40,16 @@ HELD = {"ok": False, "error": "held"}
 # A scoped or delegated token is attenuated to its pool scope (POOLS 2.6): it may call only these (default-deny, an explicit allow-list).
 # `token_revoke` is allowed without a `token_id` only (its own revocation).
 SCOPED_OPS = POOL_TOOLS | frozenset({"pool_list", "pool_describe", "token_revoke", "token_renew", "token_delegate", "ping"})
+
+
+@dataclass(frozen=True)
+class Reply:
+    """An answer and what its send hand-off re-checks (POOLS 2.4): `token`, the token whose authority the answer carries (checks 1 to 3;
+    None only for the receipt of a bearer's revocation of its own token, which carries nothing that token could still read), and
+    `needs`, pool id to the operations, for every pool whose content the answer carries (check 4)."""
+    body: Any
+    token: Optional[str]
+    needs: Mapping[str, frozenset] = field(default_factory=dict)
 
 
 class EsGate:
@@ -163,6 +178,45 @@ class Gateway:
             return UNAVAILABLE
 
     def handle(self, token: str, request: Any) -> dict:
+        """The answer alone (callers that do not send it); the socket server uses `serve`."""
+        return self.serve(token, request).body
+
+    def serve(self, token: str, request: Any) -> Reply:
+        """The answer with what its hand-off must re-check: every successful pool authorization of the request is collected
+        (`pool_authz.carried`). The ONE exemption from the token check is the receipt of a bearer revoking its own token (op
+        `token_revoke` with no `token_id`, answered `ok`, and the token no longer resolving): it carries no pool and nothing the revoked
+        token could read, and withholding it would only hide from the harness that its revoke landed (tests/unit/test_send_reply.py)."""
+        with carried() as box:
+            body = self._dispatch(token, request)
+        needs = {pid: frozenset(ops) for pid, ops in box.items()}
+        if (isinstance(request, dict) and request.get("op") == "token_revoke" and request.get("token_id") is None
+                and isinstance(body, dict) and body.get("ok") is True and body.get("denied") is True and not needs
+                and self._sessions.resolve(token) is None):
+            return Reply(body, None, {})
+        return Reply(body, token, needs)
+
+    def send_ok(self, reply: Reply) -> bool:
+        """POOLS 2.4 at the send hand-off, run by the server under the SHARED side of the tenant's send fence before every chunk:
+        checks 1 to 3 for `reply.token` (it resolves: tenant prefix, `exp`, individual revocation, epoch, root and parent) and check 4
+        for every pool in `reply.needs` with its operations (the pool runtime's `send_ok`). Memory only: the session, epoch, pool
+        directory and grant tables, each under its own leaf lock, which no thread holds while taking the fence (lock order: fence, then
+        a leaf lock); no Elasticsearch, journal, disk or socket I/O, and the fence is never re-entered. Any failure or error is False,
+        and the whole answer is aborted. Journal admission is not re-checked here: 2.4 names checks 1 to 4, and the administrator's lane
+        is answered on a closed tenant."""
+        try:
+            if reply.token is None:
+                return not reply.needs
+            rec = self._sessions.resolve(reply.token)
+            if rec is None:
+                return False
+            if not reply.needs:
+                return True
+            rt = self._pools(rec.tenant) if self._pools else None
+            return rt is not None and rt.send_ok(reply.token, reply.needs) is True
+        except Exception:
+            return False
+
+    def _dispatch(self, token: str, request: Any) -> dict:
         rec = self._sessions.resolve(token)
         if rec is None:
             return UNAVAILABLE

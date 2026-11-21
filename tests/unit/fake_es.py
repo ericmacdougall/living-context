@@ -207,6 +207,13 @@ class DocStore:
                 cur = self.docs.get((d["_index"], d["_id"]))
                 out.append({"_index": d["_index"], "_id": d["_id"], "found": cur is not None, **({"_source": dict(cur[0])} if cur else {})})
             return 200, {"docs": out}
+        if p.endswith("/_search") and "sort" not in body:   # a filter of `term` clauses (the class reader's searches)
+            index = p[1:-len("/_search")]
+            terms = [next(iter(c["term"].items())) for c in body["query"]["bool"]["filter"]]
+            hits = [{"_index": index, "_id": did, "_source": dict(src)} for (ix, did), (src, _) in sorted(self.docs.items())
+                    if ix == index and all(src.get(f) == v for f, v in terms)][: body.get("size", 10)]
+            return 200, {"timed_out": False, "_shards": {"total": 1, "successful": 1, "skipped": 0, "failed": 0},
+                         "hits": {"total": {"value": len(hits), "relation": "eq"}, "hits": hits}}
         if p.endswith("/_search"):   # match_all sorted by one numeric field (the repair scans), search_after on it
             index, field = p[1:-len("/_search")], next(iter(body["sort"][0]))
             rows = sorted(((src.get(field, 0), did, src) for (ix, did), (src, _) in self.docs.items() if ix == index), key=lambda r: r[0])

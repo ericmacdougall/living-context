@@ -200,11 +200,11 @@ class PoolService:
             return UNAVAILABLE
         if self._b["state"]:     # BROKEN variant: the state change is memory only, no journal record
             self.dir.set_state(self.tenant, pool_id, state)
-            return {"ok": True, "denied": True, "in_flight_may_complete": True, "durable": False}
+            return {"ok": True, "denied": True, "durable": False}
         res, rc = self.rev.journalled(lambda: self.dir.set_state(self.tenant, pool_id, state),
                                       lambda np: {"t": "pool_state", "pool": np.id, "state": np.state, "counter": np.state_counter},
                                       persist=self._persist_pool)
-        return {"ok": True, "denied": True, "in_flight_may_complete": True, "durable": rc["durable_at"] is not None}
+        return {"ok": True, "denied": True, "durable": rc["durable_at"] is not None}
 
     def grant(self, p: Principal, req: Mapping[str, Any]) -> dict:
         who, pool_id = req.get("who"), req.get("pool")
@@ -244,7 +244,7 @@ class PoolService:
         opset = None if ops is None else sorted(set(ops))
         if self._b["outside"]:    # BROKEN variant: the table is changed outside the fence and no record is appended
             self.dir.remove_grant(self.tenant, target, pool_id, opset)
-            return {"ok": True, "denied": True, "in_flight_may_complete": True, "durable": False}
+            return {"ok": True, "denied": True, "durable": False}
 
         def record(c):
             r = {"t": "pool_grant_rm", "principal": target, "pool": pool_id, "ops": opset, "counter": c}
@@ -256,7 +256,7 @@ class PoolService:
             self._unconfirmed.pop((target, pool_id, c), None)   # the authz copy no longer holds the grant: the record is not needed
 
         _, rc = self.rev.journalled(lambda: self.dir.remove_grant(self.tenant, target, pool_id, opset), record, persist=persist)
-        return {"ok": True, "denied": True, "in_flight_may_complete": True, "durable": rc["durable_at"] is not None}
+        return {"ok": True, "denied": True, "durable": rc["durable_at"] is not None}
 
     def token_revoke(self, p: Principal, rec: Record, token_id: Any) -> dict:
         """The harness revokes the token it holds (the bearer); a tenant administrator revokes any token of the tenant by id."""
@@ -274,7 +274,7 @@ class PoolService:
                 raise KeyError("no such token in this tenant")   # nothing is journalled; `handle` answers unavailable
             return r
         res, rc = self.rev.journalled(apply, lambda r: {"t": "token_revoke", "hash": r[0], "exp": r[1]})
-        return {"ok": True, "denied": True, "in_flight_may_complete": True, "durable": rc["durable_at"] is not None}
+        return {"ok": True, "denied": True, "durable": rc["durable_at"] is not None}
 
     def delete(self, p: Principal, pool_id: Any) -> dict:
         """An erasure of scope `pool` (POOLS 9.4): requested by a tenant administrator and confirmed by a second, distinct one. The

@@ -264,8 +264,8 @@ Each entry names the passages, the reading the build follows and the test that k
 - DESIGN 20 names one gateway process per tenant. Reading kept: the epoch journal takes a non-blocking POSIX lock (`lockf`) beside it, so a
   second process stays closed; a restart inside one process is not refused. Updates of one pool leaf are serialized by a process-wide lock per
   leaf and by a durable claim on the leaf head (`pending_op`, set by an expected-field compare-and-swap); see the delta repair below.
-- The receipts of ungrant, detach and token revoke say `denied` for new calls and carry `in_flight_may_complete`: the hand-off check is
-  epoch-only, and a response already handed off for that pool or token can still go out (the paused-sender hook for pool grants is not built).
+- The receipts of ungrant, detach and token revoke say `denied`. (Replaced by the rescue reading below: the `in_flight_may_complete` flag
+  and its epoch-only hand-off are withdrawn.)
 
 ## Pools delta repair (goodqa#16441): readings
 
@@ -289,5 +289,41 @@ Each entry names the passages, the reading the build follows and the test that k
 - Provenance is kept in the pool source (`prov_json`), so a repair re-projects the stored origin. A version with no recorded origin reads
   as `unknown` (`writer.origin_of`, the one place origin is read): it ranks below `agent`, its title is wrapped like an agent's, the
   envelope carries `origin="unknown"`, and it never lets an agent correct or retract.
-- Still open (ASSUMPTION, unchanged): the hand-off check of pool grants and token liveness is epoch-only; a response already handed off can go
-  out after an ungrant or a revoke (`in_flight_may_complete`).
+- (Withdrawn by the rescue below: the epoch-only hand-off of pool grants and token liveness, and `in_flight_may_complete`.)
+
+## Pools rescue (goodqa#16441, review findings F1, F3, F4, F10 to F14): readings
+
+- Send hand-off (POOLS 2.4, 2.5, AC-2; F10). The epoch-only reading is withdrawn. `Gateway.serve` returns the answer with what its hand-off
+  re-checks: the token whose authority it carries, and every pool, with its operations, whose content it carries (every successful
+  `authorize` of the request, collected per request; a query carries S, the pools it read, not G, the pools it chose among). The server runs
+  the epoch check and `Gateway.send_ok` (checks 1 to 4 again: `Sessions.resolve`, then `authorize` over the carried pools, memory only, no
+  cap on the number of pools) under the shared side of the tenant's send fence before EVERY chunk. A failure aborts the whole answer: when
+  nothing of it was sent, the typed `unavailable` line goes instead; when part was sent, the connection is closed, so a line is never
+  completed after the boundary and never sent with items dropped. Aborts are counted (`Server.aborted`), and so is an answer still unsent at
+  its send deadline (`Server.expired`; the connection is closed, since the next answer would follow a partial line).
+- What a removal's `denied` means now: from its return, no new call passes the checks for the removed pool or token, and no chunk of an
+  answer carrying that pool or authority is handed to the kernel. A chunk that was checked before the removal may still be written (the
+  removal waits for it on the exclusive side). A call that passed its checks before an ungrant or a token revoke may still complete its own
+  write (a save or update already authorized lands in Elasticsearch; a detach is also refused by the writer's active-pool check); its answer
+  is aborted at the hand-off, so the client sees `unavailable`, and a retry is refused.
+- The one answer sent without a token check is the receipt of a bearer revoking its own token (`token_revoke` without an id, answered `ok`,
+  the token no longer resolving): it carries no pool and nothing the revoked token could read.
+- ASSUMPTION: `pool_list` and `pool_describe` answer pool metadata (label, card, class, kind, state), not content in the sense of 2.4; their
+  hand-off re-checks the token (checks 1 to 3), and visibility is decided at the call.
+- Journal admission (F1) is checked before dispatch for every operation and both mint forms, except the administrator's own lane, which
+  `Admin.handle` admits by its own rules. It is not re-checked at the hand-off: 2.4 names checks 1 to 4, and the administrator's lane answers
+  on a closed tenant. A gateway without a pool runtime admits nothing unless it is given an explicit admission.
+- Lock order. DESIGN 4.4 says the fence is the innermost lock. Reading: the hand-off check takes the in-memory leaf locks of the session
+  table, the epoch table, the pool directory and the grant store inside the shared side, as `revoke_hash` and `remove_grant` already did
+  inside the exclusive side. No thread holds any of them while taking the fence, none is held across I/O, and the check never re-enters the
+  fence. The write gate, the journal lock and the keystore lock are never taken under the fence.
+- Complete reads (F11, F12, F13). Every authoritative read that decides an erasure, a pool delete, a verification or a repair is complete or
+  refused: status 200, not timed out, no shard failed and every shard answered, `relation` `eq` for a count. A paginated scan over
+  several indices uses a point in time with `_shard_doc` (a cursor unique across indices), never `_doc`. The verifier keeps its own
+  validators (DESIGN 14.7: no shared read path with the gateway). Pool delete discovers its physical indices from the alias and the manifest,
+  refuses when discovery fails, and checks after the drop that the alias and every physical index are gone.
+- Pool sources and projections (F3): a resumed or repaired projection takes its provenance, tokens and sequence from the stored source
+  document, never from the caller.
+- Leaf claims after an error (F4): an ordinary error (an HTTP error or an exception) after a claimed change's source may have landed settles
+  the claim (forward when the source is durable, back otherwise) instead of dropping it.
+- Keystore (F14): every public method that uses the SQLite connection holds the keystore lock, enforced by wrapping every public member.

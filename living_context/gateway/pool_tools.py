@@ -31,7 +31,7 @@ from ..recall.fusion import K_RRF, rrf, rrf_salted
 from . import pointers
 from .class_reader import ClassReader, ReaderRefused
 from .indices import pool_index
-from .pool_authz import authorize
+from .pool_authz import authorize, carry
 from .session_state import SessionStates, StateError
 from .sessions import Sessions
 from ..policy import Op, decide
@@ -89,6 +89,14 @@ class PoolTools:
                     "pool_holds": self.holds, "pool_hold_show": self.hold_show, "pool_release": self.release, "pool_retract": self.retract}[op](token, req)
         except (ReaderRefused, wmod.WriterError, StateError):
             return UNAVAILABLE
+
+    def send_ok(self, token: str, needs: Mapping[str, Any]) -> bool:
+        """POOLS 2.4 at the send hand-off: checks 1 to 4 again, for `token` and every pool the response carries, with the needed
+        operations. Called by the server under the SHARED side of the tenant's send fence before every chunk; memory only (the session
+        table, the epoch table, the pool directory and grant table), no Elasticsearch, journal or socket I/O and no other fence. No cap
+        on the number of pools (`limit=None`): a query's S is bounded by the token scope, and the re-check must not refuse what the call
+        was allowed to read."""
+        return authorize(self.sessions, self.dir, self.lattices, token, needs, carry_needs=False, limit=None) is not None
 
     # ---- helpers ---------------------------------------------------------------------------------------------------------
     def _stage_hook(self, pool, what: str) -> None:
@@ -470,10 +478,11 @@ class PoolTools:
             return UNAVAILABLE
         if hint is not None and (not isinstance(hint, list) or not all(isinstance(h, str) for h in hint)):
             return UNAVAILABLE
-        # G: the pools of the token scope with `query` that pass check 4 now; a hint outside G fails the whole call
+        # G: the pools of the token scope with `query` that pass check 4 now; a hint outside G fails the whole call. G is only the
+        # choice: the response carries S (below), so the hand-off re-checks S, not G (carry_needs=False here, `carry(S)` below)
         G = {}
         for pid, ops in rec.scope.items():
-            a = authorize(self.sessions, self.dir, self.lattices, token, {pid: {pl.QUERY}}) if pl.QUERY in ops else None
+            a = authorize(self.sessions, self.dir, self.lattices, token, {pid: {pl.QUERY}}, carry_needs=False) if pl.QUERY in ops else None
             if a is not None:
                 G[pid] = a.pools[pid]
         if hint:
@@ -487,6 +496,7 @@ class PoolTools:
             raised = []
         if not isinstance(text, str) or not text.strip() or len(text) > 4096:
             return err("invalid") if (G or hint) else UNAVAILABLE
+        carry({pid: {pl.QUERY} for pid in S})   # every pool read for this response is re-checked at its hand-off (2.4)
         if not S:
             return UNAVAILABLE if not G else {"ok": True, "items": [], "pools": [], "taint_raised": raised}
         if hint and self.states is not None:
@@ -571,6 +581,9 @@ class PoolRouter:
     def admit(self) -> bool:
         """Whether the tenant's epoch journal admits (open, lane open). A fault closes the tenant; nothing pool-related runs then."""
         return self.service.rev.admit()
+
+    def send_ok(self, token: str, needs: Mapping[str, Any]) -> bool:
+        return self.tools.send_ok(token, needs)
 
     def handle(self, op: str, p, rec, req, *, token: str = ""):
         if op in ("pool_save", "pool_update", "pool_query", "pool_fetch", "pool_holds", "pool_hold_show", "pool_release", "pool_retract"):

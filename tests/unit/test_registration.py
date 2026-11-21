@@ -127,7 +127,7 @@ def operations(tree):
     """Discover comparisons and mapping dispatch, including delegated handlers."""
     out = set()
     for fn in (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
-               and n.name in ("handle", "_token_op")):
+               and n.name in ("handle", "_dispatch", "_token_op")):   # `Gateway.handle` and `serve` reach `_dispatch`
         for n in ast.walk(fn):
             if isinstance(n, ast.Compare) and isinstance(n.left, ast.Name) and n.left.id == "op":
                 for right in n.comparators:
@@ -277,7 +277,9 @@ class Registration(unittest.TestCase):
             ops |= operations(tree)
         self.assertFalse(SCOPED_ALLOWED & SCOPED_DENIED)
         self.assertEqual(SCOPED_ALLOWED | SCOPED_DENIED, ops)
-        handle = symbol(handler, "handle")
+        handle = symbol(handler, "_dispatch")   # what `Gateway.handle` and `Gateway.serve` both run
+        self.assertIn("self._dispatch(token, request)", ast.unparse(symbol(handler, "serve")))
+        self.assertEqual(ast.unparse(symbol(handler, "handle").body[-1]), "return self.serve(token, request).body")
         gate = next(n for n in handle.body if isinstance(n, ast.If) and "SCOPED_OPS" in ast.unparse(n.test))
         self.assertEqual(ast.unparse(gate.test), "rec.scope is not None and (op not in SCOPED_OPS or (op == 'token_revoke' and request.get('token_id') is not None))")
         self.assertEqual(ast.unparse(gate.body[0]), "return UNAVAILABLE")
