@@ -1312,3 +1312,38 @@ The rest of 10.3 (S6-H2 and the loop stages) is not restated here.
   split (7.4) and decide nothing.
 - What it does not change: S0 must still pass in full before any stage that relies on a security claim; these stages make none. No
   hypothesis, arm, threshold or statistic moves, and the held-out and fresh question sets stay unloaded.
+
+### 14.4 DEVIATION (run control only): S3's questions resume under a new commit at adaptive concurrency (2026-11-20)
+
+- Registered: a stage runs as one stamped run on the commit it started with; model calls run at concurrency 2 (10.3,
+  `evalkit/parallel.py` `REGISTERED_CONCURRENCY`); an allowance refusal stops the stage. S3 started on commit c34c5a2 and ran its
+  build one call at a time.
+- Amended: S3's question phase resumes on a later commit, the one named at the resume (`--commit`, recorded in STAMP.json under
+  `amendments` with `--amendment-ref DEV-14.4`, and in `starts.jsonl`), with up to 8 model calls at once. Reason: the owner asked
+  in chat on 2026-11-20 to "figure out how to make it not take more than 2 hours to answer the thesis", and that "running it faster,
+  not more shallow, is better than pretending insignificant data is an answer"; the owner chose the subscription only (no API key,
+  no spend). At one call at a time S3's 94 questions take about 6 hours.
+- State at the resume (read on the run host, nothing written): STATE `STOPPED` by the stop file; BUILT.json present (1,209 nodes,
+  3 levels, top 5, 18,120 leaves); no question in the ledger; counter 1,216 = 1,136 build_l1 (2 of them refused by the allowance and
+  asked again before this amendment) + 76 build_upper + 4 route.
+- What changes:
+  1. The commit. `run_h1` moves a charged run to a new commit only under a recorded amendment, only when BUILT.json exists and the
+     ledger is empty, so every recorded result comes from one commit per phase (build on c34c5a2, questions on the new commit).
+     The stamp keeps the earlier commits.
+  2. Concurrency. Up to 8 calls at once, adaptive: it starts at 2, halves on a throttle or an allowance refusal, and doubles after
+     a clean window of max(8, 2 x the limit) answered calls, never above 8 (`--concurrency 8 --concurrency-reason ...`). Every
+     call row and journal `pending` row records the concurrency at the time; STATE records `concurrency_changes`.
+  3. Allowance refusals. Under adaptive concurrency a refused call is backed off and asked again up to `--max-retries` times
+     before the stage stops (`LIMIT_REACHED`); each retry is one charged call, inside the cap.
+  4. Four calls charged twice. The 4 route calls of the first question were charged at one call at a time with journal keys
+     that name no question. The concurrent question loop keys every call by its question, so those 4 calls are asked again and
+     charged a second time (4 of the 17,252 cap). Their first answers stay in `calls.jsonl` and `journal.jsonl` and are not used.
+  5. `calls.jsonl` is in completion order, not question order; the ledger (`done.jsonl`) stays in the seeded question order.
+- What it does not change: the cap (17,252) and the approval, the model, the system prompt, the prompts and the CLI invocation,
+  the tree (no rebuild), the questions and their order, the arms, the metrics and every statistic. Each question's recall runs on
+  one worker over its own scoped journal, so with a deterministic model the ledger and results are the same at any concurrency
+  (`tests/unit/test_run_s3_parallel.py`: 1 and 4 workers, and a serial run stopped after its build and resumed under this
+  amendment at 4 workers, with seeded node ids). The real model answers two identical calls independently at any concurrency,
+  as before.
+- Sharing the account: S3's questions and the early S6-H1 build (14.5) run at the same time on one subscription; their ceilings
+  together stay under 16 calls at once (S3 at most 8).
