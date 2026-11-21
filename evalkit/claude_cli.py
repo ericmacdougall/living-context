@@ -382,6 +382,10 @@ class CappedPort:
                    "argv": self._argv, "prompt_version": PROMPT_VERSION, "http_status": rep.status,
                    "prompt_tokens": int(rep.prompt_tokens or 0), "completion_tokens": int(rep.completion_tokens or 0),
                    "reasoning_tokens": int(rep.reasoning_tokens or 0), "cached_tokens": int(rep.cached_tokens or 0),
+                   # the CLI's fields, read by the summaries: input + cache_read = prompt tokens, output = completion (reasoning in)
+                   "input_tokens": max(0, int(rep.prompt_tokens or 0) - int(rep.cached_tokens or 0)),
+                   "cache_creation_input_tokens": 0, "cache_read_input_tokens": int(rep.cached_tokens or 0),
+                   "output_tokens": int(rep.completion_tokens or 0),
                    "model_reported": rep.model or "", "upstream_provider": rep.upstream_provider or "",
                    "finish_reason": rep.finish_reason or "", "cost_usd": rep.cost_usd, "stdout_chars": len(rep.text or "")}
             if rep.model:

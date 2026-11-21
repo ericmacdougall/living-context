@@ -28,7 +28,7 @@ from living_context.model.budget import Budget, BudgetExceeded
 from living_context.model.port import PortRefused
 
 from . import arms, claude_cli, dataset as ds, model_kind as mk, parallel as par, s2_stage
-from .s2_ports import Journal, ResilientPort, StageLimited, StagePaused, StageStopped
+from .s2_ports import Journal, ResilientPort, StageLimited, StagePaused, StageStopped, read_resumable
 
 RC = {"COMPLETE": 0, "STOPPED": 3, "CAP_REACHED": 4, "BUILD_FAILED": 5, "PAUSED_THROTTLE": 75, "LIMIT_REACHED": 76, "ERROR": 1}
 
@@ -109,6 +109,7 @@ def run(a, pick_questions, *, embedder=None, runner=None, loader=None, tenant_fa
                                                                               et.leaf_count_in_es()), flush=True)
 
     budget = Budget(run_dir / "counter", a.approved_cap)
+    read_resumable(run_dir / "calls.jsonl")          # a torn last row of an interrupted run is set aside before new rows follow it
     inner = mk.capped_port(a, run_dir, budget, prepared=prepared)
     journal = Journal(run_dir / "journal.jsonl")
     n_par = int(getattr(a, "concurrency", 1) or 1)

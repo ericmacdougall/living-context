@@ -20,12 +20,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from evalkit import claude_cli as cc, model_kind as mk, muse_api as ma, run_h1, run_s6h1 as rs
+from evalkit import claude_cli as cc, model_kind as mk, muse_api as ma, run_h1, run_s2, run_s6h1 as rs
 from evalkit.s2_ports import Journal, ResilientPort
 from living_context.model.budget import Budget
 from living_context.model.port import Task
 from tests.security.test_run_s2_es import Runner
-from tests.unit import test_run_h1_guards as hg, test_run_s6h1 as t6
+from tests.unit import test_run_h1_guards as hg, test_run_s3_parallel as s3p, test_run_s6h1 as t6
 from tests.unit.test_muse_api import OR_KEY, Stub, completion, err_body
 from tests.unit.test_parallel import in_threads, route_inputs, seeded_node_ids
 
@@ -353,6 +353,49 @@ class Stage(unittest.TestCase):
                        (t6.args(base, s3, run, resume=True, **vars(margs(max_tokens=2048))), True)):
             why = rs._stamped_prereqs(a, run, man, rs.fz.ROOT)
             self.assertEqual(any("max_tokens differs from the stamp" in w for w in why), bad, why)
+
+
+@mock.patch.dict(run_h1.REGISTERED_N, {"S3": 10})          # the synthetic S3 of test_run_s3_parallel: 10 questions, SHUFFLED on 4
+@mock.patch.dict(run_h1.SHUFFLED_N, {"S3": 4})
+class S3OnMuse(unittest.TestCase):
+    def test_s3_runs_on_the_real_port_and_its_summaries_and_ledger_carry_the_model(self):
+        d = Path(tempfile.mkdtemp())
+        live = Live(Upstream())
+        self.addCleanup(live.close)
+        a = s3p.args(d, concurrency=4, concurrency_reason="test", **vars(margs(rpm=10 ** 6)))
+        with seeded_node_ids():
+            rc = run_s2.run(a, run_h1.pick_questions, embedder=t6.RealEmbed(), runner=live.runner, loader=s3p.loader,
+                            tenant_factory=t6.factory(d))
+        self.assertEqual(rc, 0)
+        summ = json.loads((d / "results" / "summaries.json").read_text())
+        for task in ("route", "build_l1"):
+            self.assertGreater(summ["by_task"][task]["input_tokens"], 0, task)        # prompt tokens, cached part included
+            self.assertGreater(summ["by_task"][task]["output_tokens"], 0, task)
+        self.assertEqual(summ["by_task"]["route"]["input_tokens"], 1200 * summ["by_task"]["route"]["calls"])
+        state = json.loads((d / "STATE.json").read_text())
+        self.assertEqual((state["state"], state["models_reported"], state["providers_reported"]), ("COMPLETE", [MODEL], ["Meta"]))
+        led = [json.loads(l) for l in (d / "done.jsonl").read_text().splitlines()]
+        self.assertEqual(len(led), 10)
+        self.assertTrue(all(tuple(r[k] for k in mk.IDENTITY) == ("muse", MODEL, "openrouter", "low", 4096) for r in led))
+        stamp = json.loads((d / "STAMP.json").read_text())
+        self.assertEqual((stamp["model_kind"], stamp["reasoning_effort"], stamp["port"]["provider"]), ("muse", "low", "openrouter"))
+
+    def test_a_torn_last_call_row_is_set_aside_on_resume_and_the_summaries_still_read(self):
+        d = Path(tempfile.mkdtemp())
+        live = Live(Upstream())
+        self.addCleanup(live.close)
+        a = s3p.args(d, **vars(margs(rpm=10 ** 6)))
+        with seeded_node_ids():
+            self.assertEqual(run_s2.run(a, run_h1.pick_questions, embedder=t6.RealEmbed(), runner=live.runner, loader=s3p.loader,
+                                        tenant_factory=t6.factory(d)), 0)
+        with open(d / "calls.jsonl", "a") as f:
+            f.write('{"n": 99999, "task": "rou')                 # the write that never finished
+        (d / "done.jsonl").write_text("")                         # a resume that has questions to ask again
+        with seeded_node_ids():
+            self.assertEqual(run_s2.run(s3p.args(d, resume=True, **vars(margs(rpm=10 ** 6))), run_h1.pick_questions,
+                                        embedder=t6.RealEmbed(), runner=live.runner, loader=s3p.loader, tenant_factory=t6.factory(d)), 0)
+        self.assertTrue(json.loads((d / "results" / "summaries.json").read_text())["calls"] > 0)
+        self.assertEqual(len(list(d.glob("calls.jsonl.torn.*"))), 1)
 
 
 if __name__ == "__main__":

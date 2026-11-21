@@ -288,7 +288,7 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
     from living_context.structure.build import BuildFailed
     from . import arms, claude_cli, s2_stage
     from .eval_tenant import CLS
-    from .s2_ports import Journal, ResilientPort, StageLimited, StagePaused, StageStopped
+    from .s2_ports import Journal, ResilientPort, StageLimited, StagePaused, StageStopped, read_resumable
 
     run_dir = Path(a.run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -404,6 +404,7 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
                                 "at": time.time()}, sort_keys=True) + "\n")
 
     budget = Budget(run_dir / "counter", a.approved_cap)
+    read_resumable(run_dir / "calls.jsonl")          # a torn last row of an interrupted run is set aside before new rows follow it
     inner = mk.capped_port(a, run_dir, budget, prepared=prepared)
     journal = Journal(run_dir / "journal.jsonl")
     adaptive = n_par > 1 and not getattr(a, "fixed_concurrency", False)
