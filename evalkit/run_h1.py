@@ -101,8 +101,9 @@ def check_prereqs(a, *, embed=embed_stub.embed) -> List[str]:
         n_par = getattr(a, "concurrency", 1)
         why += par.check_concurrency(n_par, getattr(a, "concurrency_reason", ""))
         rd = Path(a.run_dir)
-        if isinstance(n_par, int) and n_par > 1 and (rd / "journal.jsonl").exists() and not (rd / "BUILT.json").exists():
-            why.append("an unfinished build journaled without scopes resumes at --concurrency 1 only (its keys are unscoped)")
+        from .s2_ports import UNSCOPED_REFUSAL, journal_unscoped
+        if journal_unscoped(rd / "journal.jsonl"):       # review F2: one key scheme at every worker count, no migration
+            why.append(UNSCOPED_REFUSAL % journal_unscoped(rd / "journal.jsonl"))
     if a.stage in ("S2", "S3") and (Path(a.run_dir) / "STOP").exists():
         why.append("a stop file is present in the run directory; remove it to start or resume")
     return why

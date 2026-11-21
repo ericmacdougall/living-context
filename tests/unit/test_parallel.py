@@ -338,6 +338,24 @@ class Port(unittest.TestCase):
                 port.call(Task.ROUTE, route_inputs(1))
             self.assertEqual(b.count(), 0)
 
+    def test_a_port_that_requires_scopes_refuses_an_unscoped_call_at_one_worker_and_an_unscoped_journal(self):
+        # review F2: the stage runners key every call by its question or build group at every worker count
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            b = Budget(tmp / "counter", 100)
+            inner = cc.CappedPort(SafeRunner(), b, tmp / "calls.jsonl", model_id="m")
+            port = ResilientPort(inner, b, Journal(tmp / "journal.jsonl"), tmp / "STOP", concurrency=1, require_scope=True)
+            with self.assertRaises(ScopeRequired):
+                port.call(Task.ROUTE, route_inputs(1))
+            self.assertEqual(b.count(), 0)
+            self.assertTrue(port.scoped("q1").call(Task.ROUTE, route_inputs(1)).ok)
+            ResilientPort(inner, b, Journal(tmp / "journal.jsonl"), tmp / "STOP", concurrency=4, require_scope=True)   # scoped: fine
+            loose = ResilientPort(inner, b, Journal(tmp / "journal.jsonl"), tmp / "STOP", concurrency=1)
+            self.assertTrue(loose.call(Task.ROUTE, route_inputs(2)).ok)                # an unscoped key enters the journal
+            for n in (1, 4):
+                with self.assertRaises(ScopeRequired):
+                    ResilientPort(inner, b, Journal(tmp / "journal.jsonl"), tmp / "STOP", concurrency=n, require_scope=True)
+
     def test_replayed_answers_go_to_the_same_scope_whatever_the_interleaving(self):
         """Two questions ask the same prompt three times each. Run 1: A first, then B. Resume (run 2): B first, then A. Each question
         must get back exactly its own answers; with one shared occurrence key A would get B's."""

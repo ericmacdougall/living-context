@@ -44,7 +44,7 @@ from living_context.model.port import CallContext, CallResult, PortRefused, Task
 from . import claude_cli
 from .claude_cli import AllowanceRefused, StageLimited, StagePaused
 
-__all__ = ["Journal", "JournalCorrupt", "NotAdmitted", "read_resumable", "Tally", "ResilientPort", "ScopedPort", "ScopeRequired", "StageStopped", "StagePaused", "StageLimited", "BudgetExceeded"]
+__all__ = ["Journal", "JournalCorrupt", "NotAdmitted", "UNSCOPED_REFUSAL", "journal_unscoped", "unscoped_keys", "read_resumable", "Tally", "ResilientPort", "ScopedPort", "ScopeRequired", "StageStopped", "StagePaused", "StageLimited", "BudgetExceeded"]
 
 
 class StageStopped(Exception):
@@ -136,7 +136,34 @@ class Journal:
 
 
 class ScopeRequired(Exception):
-    """More than one worker and a call without a scope: the journal key would depend on worker interleaving."""
+    """A call without a scope where every call needs one (more than one worker, or a port that requires scopes), or a journal with
+    unscoped keys under a port that requires scopes: the journal key would depend on the worker count or interleaving."""
+
+
+UNSCOPED_REFUSAL = ("the journal holds %d call(s) journaled without a question or build scope (an older commit at one worker): a "
+                    "resume keys every call by its question or build group at any worker count, so it would ask answered calls "
+                    "again and could replace their answers; refused, with no migration (start a new run directory)")
+
+
+def unscoped_keys(keys) -> int:
+    """How many journal keys carry no scope (`<sha>:<n>`; a scoped key is `<scope>|<sha>:<n>`)."""
+    return sum(1 for k in keys if "|" not in str(k))
+
+
+def journal_unscoped(path: Path) -> int:
+    """Unscoped keys in a journal file, read without changing it (a torn last row is skipped); 0 when there is none."""
+    path = Path(path)
+    if not path.exists():
+        return 0
+    keys = set()
+    for line in path.read_text().splitlines():
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(r, dict) and r.get("key") is not None:
+            keys.add(r["key"])
+    return unscoped_keys(keys)
 
 
 class ScopedPort:
@@ -229,7 +256,7 @@ class ResilientPort:
                  render: Callable[[str, Mapping[str, Any]], str] = claude_cli.render,
                  retry_failed: tuple = ("build_l1", "build_upper"), failure_retries: int = 2,
                  clock: Callable[[], float] = time.time, concurrency: int = 1, adaptive: bool = False,
-                 start_concurrency: Optional[int] = None):
+                 start_concurrency: Optional[int] = None, require_scope: bool = False):
         if int(concurrency) < 1:
             raise ValueError("concurrency must be at least 1")
         self._inner, self._budget, self.journal, self._stop = inner, budget, journal, Path(stop_file)
@@ -260,6 +287,11 @@ class ResilientPort:
         if hasattr(inner, "admit"):                             # the inner port asks the gate again after its pacer, before its charge
             inner.admit, inner.on_halt = self._admit, self.halt
         self._lost_keys = self._lost_in_flight(journal)
+        # the stage runners key every call by its question or build group at every worker count (review F2): one key scheme, so a
+        # resume with another worker count replays what was answered; a journal written under another scheme is refused here
+        self.require_scope = bool(require_scope)
+        if self.require_scope and unscoped_keys(journal.tail):
+            raise ScopeRequired(UNSCOPED_REFUSAL % unscoped_keys(journal.tail))
 
     def _charged(self, n: int) -> None:
         key = getattr(self._tls, "key", None)
@@ -331,7 +363,7 @@ class ResilientPort:
         `failure_retries` times, because a failed build call aborts the whole generation (DESIGN 7.6); a failed route or organise
         call is the product's own fallback path and is never retried."""
         scope = scope if scope is not None else self.scope
-        if scope is None and self.concurrency > 1:
+        if scope is None and (self.concurrency > 1 or self.require_scope):
             raise ScopeRequired("a call without a scope at concurrency %d" % self.concurrency)
         tries = 0
         while True:

@@ -211,6 +211,9 @@ def _shared_prereqs(a, rd: Path, root: Path, mem_available) -> List[str]:
     n_par = getattr(a, "concurrency", par.REGISTERED_CONCURRENCY)
     why += par.check_concurrency(n_par, getattr(a, "concurrency_reason", ""))
     n_par = n_par if isinstance(n_par, int) and n_par >= 1 else 1
+    from .s2_ports import UNSCOPED_REFUSAL, journal_unscoped
+    if journal_unscoped(rd / "journal.jsonl"):           # review F2: one key scheme at every worker count
+        why.append(UNSCOPED_REFUSAL % journal_unscoped(rd / "journal.jsonl"))
     try:
         mp = mem_proof(getattr(a, "mem_proof", ""), root)
     except (OSError, ValueError) as e:
@@ -409,7 +412,7 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
     journal = Journal(run_dir / "journal.jsonl")
     adaptive = n_par > 1 and not getattr(a, "fixed_concurrency", False)
     port = ResilientPort(inner, budget, journal, run_dir / "STOP", max_retries=a.max_retries, base_delay_s=a.base_delay,
-                         concurrency=n_par, adaptive=adaptive, start_concurrency=min(n_par, 2) if adaptive else None)
+                         concurrency=n_par, adaptive=adaptive, start_concurrency=min(n_par, 2) if adaptive else None, require_scope=True)
     with open(run_dir / "starts.jsonl", "a") as f:      # every start or resume, with its concurrency (outputs do not depend on it)
         f.write(json.dumps({"at": time.time(), "commit": a.commit, "mode": "prebuild" if prebuild else "stamped",
                             "concurrency": n_par, "cluster_workers": cluster_workers,

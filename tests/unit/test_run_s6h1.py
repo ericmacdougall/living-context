@@ -72,6 +72,16 @@ class Guards(unittest.TestCase):
         w = self.why(**kw)
         self.assertTrue(any(text in x for x in w), w)
 
+    def test_a_journal_with_unscoped_keys_is_refused_at_any_worker_count(self):
+        # review F2: S6-H1 and its early build key every call by its question or build group at every worker count
+        Path(self.run).mkdir(parents=True, exist_ok=True)
+        for n in (1, 4):
+            kw = dict(concurrency=n, concurrency_reason="test" if n > 2 else "")
+            Path(self.run, "journal.jsonl").write_text(json.dumps({"t": "result", "key": "%s:0" % ("b" * 32), "ok": True}) + "\n")
+            self.has("journaled without a question or build scope", **kw)
+            Path(self.run, "journal.jsonl").write_text(json.dumps({"t": "result", "key": "q1|%s:0" % ("b" * 32), "ok": True}) + "\n")
+            self.assertFalse(any("without a question or build scope" in x for x in self.why(**kw)))
+
     def test_everything_in_place_passes(self):
         self.assertEqual(self.why(), [])
 

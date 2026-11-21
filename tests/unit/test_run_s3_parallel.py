@@ -113,9 +113,9 @@ class S3Parallel(unittest.TestCase):
         rows = (d / "calls.jsonl").read_text().splitlines()
         self.assertEqual(int((d / "counter").read_text()), len(rows))                   # every charge is one logged call
         n_ref = len((ref / "calls.jsonl").read_text().splitlines())
-        # the recall calls charged before the stop were journaled without a question scope and are asked again under it: exactly
-        # those calls are charged twice (disclosed in the amendment); every build call was charged once
-        self.assertEqual(len(rows) - n_ref, recall_before)
+        # one journal key scheme at every worker count (review F2): the recall calls answered before the stop are replayed, not
+        # asked again; nothing is charged twice (at the 14.4 commit, those calls were journaled unscoped and charged twice)
+        self.assertEqual(len(rows), n_ref)
 
     def test_a_run_stopped_with_questions_done_resumes_to_the_same_ledger_with_shuffled_on_the_same_questions(self):
         ref = Path(tempfile.mkdtemp())
@@ -159,13 +159,52 @@ class S3Parallel(unittest.TestCase):
         Path(d, "done.jsonl").write_text('{"qref": "q1"}\n')
         self.assertIn("before its first question", " ".join(run_h1.check_prereqs(args(d, **kw), embed=t6.RealEmbed())))
 
-    def test_an_unfinished_unscoped_build_resumes_at_one_worker_only(self):
+    def test_a_run_stopped_mid_question_resumes_across_one_and_many_workers_without_asking_an_answered_call_again(self):
+        # review F2: stopped after the first recall call of the run was answered and journaled, then resumed with the worker count
+        # changed in each direction; every answered call is replayed (its answer kept), and the charges are the uninterrupted run's
+        for first, then in ((1, 4), (4, 1)):
+            with self.subTest(first=first, then=then):
+                conc = lambda n: dict(concurrency=n, concurrency_reason="test" if n > 1 else "")
+                ref, d = Path(tempfile.mkdtemp()), Path(tempfile.mkdtemp())
+                self.assertEqual(self.go(ref, SafeRunner(), **conc(first)), 0)
+                self.assertEqual(self.go(d, FirstRecallStop(stop_file=d / "STOP"), **conc(first)), 3)
+                answered = [json.loads(l) for l in (d / "journal.jsonl").read_text().splitlines()]
+                answered = [r for r in answered if r["t"] == "result" and r["task"] not in ("build_l1", "build_upper")]
+                self.assertGreaterEqual(len(answered), 1)                      # a question was under way, an answer journaled
+                (d / "STOP").unlink()
+                self.assertEqual(run_h1.check_prereqs(args(d, resume=True, **conc(then)), embed=t6.RealEmbed()), [])
+                self.assertEqual(self.go(d, SafeRunner(), resume=True, **conc(then)), 0)
+                n_ref = int((ref / "counter").read_text())
+                self.assertEqual(int((d / "counter").read_text()), n_ref)       # no call asked twice
+                self.assertEqual(len((d / "calls.jsonl").read_text().splitlines()), n_ref)
+                self.assertEqual(self.outputs(d)[0], self.outputs(ref)[0])     # the ledger, byte for byte
+                final = {}
+                for l in (d / "journal.jsonl").read_text().splitlines():
+                    r = json.loads(l)
+                    if r["t"] == "result":
+                        final.setdefault(r["key"], r)
+                self.assertTrue(all(final[r["key"]] == r for r in answered))  # the first answer of each key stands
+
+    def test_the_journal_keys_are_the_same_at_one_and_four_workers(self):
+        keys = []
+        for n in (1, 4):
+            d = Path(tempfile.mkdtemp())
+            self.assertEqual(self.go(d, SafeRunner(), concurrency=n, concurrency_reason="test" if n > 1 else ""), 0)
+            keys.append({json.loads(l)["key"] for l in (d / "journal.jsonl").read_text().splitlines()})
+        self.assertEqual(keys[0], keys[1])
+        self.assertTrue(all("|" in k for k in keys[0]))                # every call under its question's or build group's scope
+
+    def test_a_journal_with_unscoped_keys_is_refused_at_any_worker_count_and_a_scoped_one_is_not(self):
         d = Path(tempfile.mkdtemp())
         Path(d, "STAMP.json").write_text(json.dumps({"commit": "c1", "cap": 100000, "n_questions": 10, "a0_fields": "strong", "shuffled_n": 4}))
-        Path(d, "journal.jsonl").write_text("")
-        kw = dict(resume=True, concurrency=4, concurrency_reason="test")
-        self.assertIn("resumes at --concurrency 1", " ".join(run_h1.check_prereqs(args(d, **kw), embed=t6.RealEmbed())))
-        self.assertEqual(run_h1.check_prereqs(args(d, resume=True), embed=t6.RealEmbed()), [])
+        scoped = {"t": "result", "key": "build|0|%s:0" % ("a" * 32), "task": "build_l1", "ok": True}
+        unscoped = {"t": "result", "key": "%s:0" % ("b" * 32), "task": "route", "ok": True}
+        for n in (1, 4, 16):
+            kw = dict(resume=True, concurrency=n, concurrency_reason="test" if n > 1 else "")
+            for journal, refused in (([scoped], False), ([unscoped], True), ([scoped, unscoped], True)):
+                Path(d, "journal.jsonl").write_text("".join(json.dumps(r) + "\n" for r in journal))
+                why = " ".join(run_h1.check_prereqs(args(d, **kw), embed=t6.RealEmbed()))
+                self.assertEqual("journaled without a question or build scope" in why, refused, (n, journal))
 
 
 if __name__ == "__main__":

@@ -115,7 +115,7 @@ def run(a, pick_questions, *, embedder=None, runner=None, loader=None, tenant_fa
     n_par = int(getattr(a, "concurrency", 1) or 1)
     adaptive = n_par > 1 and not getattr(a, "fixed_concurrency", False)
     port = ResilientPort(inner, budget, journal, run_dir / "STOP", max_retries=a.max_retries, base_delay_s=a.base_delay,
-                         concurrency=n_par, adaptive=adaptive, start_concurrency=min(n_par, 2) if adaptive else None)
+                         concurrency=n_par, adaptive=adaptive, start_concurrency=min(n_par, 2) if adaptive else None, require_scope=True)
     with open(run_dir / "starts.jsonl", "a") as f:      # every start or resume, with its concurrency (outputs do not depend on it)
         f.write(json.dumps({"at": time.time(), "commit": a.commit, "concurrency": n_par,
                             "concurrency_reason": getattr(a, "concurrency_reason", "") or "",
@@ -124,10 +124,9 @@ def run(a, pick_questions, *, embedder=None, runner=None, loader=None, tenant_fa
     state, extra = "COMPLETE", {}
     try:
         if not resumed_built:
-            # on a resumed unfinished build every call is answered from the journal; several workers ask each level's groups at once,
-            # each group under its own journal scope (`check_prereqs` refuses several workers over an unscoped journal of an older build)
-            kw = {"pmap": par.ordered_map(n_par), "port_for": lambda k: port.scoped("build|" + k)} if n_par > 1 else {}
-            tree = et.build_and_publish(port, **kw)
+            # on a resumed unfinished build every call is answered from the journal; each group is asked under its own journal scope
+            # at EVERY worker count (review F2: one key scheme, so a resume with another worker count replays what was answered)
+            tree = et.build_and_publish(port, pmap=par.ordered_map(n_par), port_for=lambda k: port.scoped("build|" + k))
             print("tree: %d nodes, %d levels, top %d, build calls %d (replayed %d so far)" % (len(tree.nodes), tree.levels, len(tree.top),
                                                                                              tree.calls, port.replayed), flush=True)
             (run_dir / "tree.json").write_text(json.dumps({"nodes": len(tree.nodes), "levels": tree.levels, "top": len(tree.top),
@@ -137,8 +136,8 @@ def run(a, pick_questions, *, embedder=None, runner=None, loader=None, tenant_fa
         dfn, pview = et.direct(), arms.PermutedView(view)
 
         def retrievers(ref):
-            # one question's own recorders; above one worker each over a port scoped to its question (each recall stays one worker)
-            qp = port.scoped(ref) if n_par > 1 else port
+            # one question's own recorders, over a port scoped to its question at every worker count (each recall stays one worker)
+            qp = port.scoped(ref)
             return (s2_stage.Recorder(dfn),
                     s2_stage.tallied(qp, lambda p: arms.TreeRetriever(p, view, a.tenant, CLS, "px", consts, workers=1)),
                     s2_stage.tallied(qp, lambda p: arms.TreeRetriever(p, pview, a.tenant, CLS, "px", consts, workers=1)))

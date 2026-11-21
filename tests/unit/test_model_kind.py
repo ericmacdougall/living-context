@@ -450,6 +450,12 @@ class Stage(unittest.TestCase):
         calls = [json.loads(l) for l in (r1 / "calls.jsonl").read_text().splitlines()]
         self.assertTrue(calls and all((c["reasoning_tokens"], c["upstream_provider"]) == (7, "Meta") for c in calls))
 
+    def test_the_journal_keys_are_the_same_at_one_and_four_workers(self):
+        (r1, _), (r4, _) = self.go(1), self.go(4)
+        keys = [{json.loads(l)["key"] for l in (r / "journal.jsonl").read_text().splitlines()} for r in (r1, r4)]
+        self.assertEqual(keys[0], keys[1])                         # review F2: one key scheme, so any resume replays what was answered
+        self.assertTrue(keys[0] and all("|" in k for k in keys[0]))
+
     def test_an_early_build_on_another_kind_or_setting_is_refused_to_the_stamped_run(self):
         base, s3, man, run = t6.setup_dirs()
         for pre_kw, now_kw, word in (({}, None, "model_kind"), ({}, {"reasoning_effort": "high"}, "reasoning_effort"),
