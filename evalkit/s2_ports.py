@@ -170,8 +170,17 @@ class ResilientPort:
         self._backing_off = 0
         self._halt: Optional[BaseException] = None
         self.replayed = self.fresh = self.lost = self.throttled = self.limited = 0
+        # allowance refusals since the last answered call, across every worker: the stage halts when they pass max_retries (or one
+        # call's own refusals do), so several workers refused together never multiply the charged retries (a per-call count allowed
+        # workers x retries). Throttles stay per call: a burst of 429s in flight together halves the limit and goes on.
+        self._refused = 0
         self.delays: List[float] = []
         self._lost_keys = self._lost_in_flight(journal, budget.count())
+
+    def _bump(self) -> int:
+        with self._lock:
+            self._refused += 1
+            return self._refused
 
     @staticmethod
     def _lost_in_flight(journal: Journal, count: int) -> set:
@@ -279,7 +288,7 @@ class ResilientPort:
                         self.limited += 1
                     self.journal.append({"t": "limited", "key": key, "task": name, "attempt": attempt, "ts": self._clock()})
                     attempt += 1
-                    if not self.slots.adaptive or attempt > self._retries:
+                    if not self.slots.adaptive or max(attempt, self._bump()) > self._retries:
                         self.halt(e)              # a fixed concurrency stops at once; an adaptive one after its bounded retries
                         raise
                     self.slots.halve("allowance refusal")
@@ -297,7 +306,7 @@ class ResilientPort:
                         self.throttled += 1
                     self.journal.append({"t": "throttled", "key": key, "task": name, "attempt": attempt, "ts": self._clock()})
                     attempt += 1
-                    if attempt > self._retries:
+                    if attempt > self._retries:   # per call: a burst of throttles in flight together halves and goes on
                         self.halt(e)
                         raise
                     self.slots.halve("throttle")
@@ -327,6 +336,7 @@ class ResilientPort:
                 continue
             with self._lock:
                 self.fresh += 1
+                self._refused = 0
             self.slots.clean()
             self.journal.append({"t": "result", "key": key, "task": name, "ok": res.ok, "output": res.output, "error": res.error,
                                  "ts": self._clock()})

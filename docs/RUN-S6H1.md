@@ -83,8 +83,10 @@ python -m evalkit.run_s6h1 --dataset <dataset> --es-url <es-url> --es-ca <es-ca>
   leaves, 4,850 of them one window; 50 checked equal.
 - Adaptive concurrency (default above `--concurrency 1`; `--fixed-concurrency` turns it off): model calls start 2 at once, halve on a
   throttle or an allowance refusal, and double after a clean window of max(8, 2 x the limit) answered calls, never above
-  `--concurrency`. An allowance refusal is backed off and asked again up to `--max-retries` times before the stage stops
-  (LIMIT_REACHED); at a fixed concurrency it stops at once. Every call row and journal `pending` row records the concurrency at the
+  `--concurrency`. An allowance refusal is backed off and asked again; the stage stops (LIMIT_REACHED) when one call's refusals,
+  or the refusals across all workers since the last answered call, pass `--max-retries`; at a fixed concurrency it stops at once. A
+  throttle is retried per call (`--max-retries` each), so a burst of throttles in flight together halves the limit and goes on;
+  five non-zero CLI exits in a row (throttles included) still stop the stage. Every call row and journal `pending` row records the concurrency at the
   time; STATE records `limited`, `concurrency_now` and `concurrency_changes`. Outputs do not depend on the concurrency.
 
 ## Early build (EXPERIMENT 14.5)

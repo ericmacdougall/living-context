@@ -82,9 +82,9 @@ def in_threads(fns):
 
 class LimitAt(SafeRunner):
     """Allowance refusals (the CLI's headless envelope) at the given call numbers; records (in flight, limit) at every call."""
-    def __init__(self, at=(), **kw):
+    def __init__(self, at=(), slow_refusal=0.0, **kw):
         super().__init__(**kw)
-        self.at, self.port, self.seen = set(at), None, []
+        self.at, self.port, self.seen, self.slow = set(at), None, [], slow_refusal
 
     def __call__(self, prompt):
         with self.lock:
@@ -94,6 +94,39 @@ class LimitAt(SafeRunner):
         if k in self.at:
             with self.lock:
                 self.n += 1
+            time.sleep(self.slow)
+            return cc.RunOut(1, json.dumps({"type": "result", "is_error": True, "result": "You've hit your session limit"}), "", 0.01)
+        return super().__call__(prompt)
+
+
+class BurstThrottle(SafeRunner):
+    """Throttles (HTTP 429 text) the first `burst` calls, each held `hold` seconds so they are in flight together."""
+    def __init__(self, burst, hold=0.05, **kw):
+        super().__init__(**kw)
+        self.burst, self.hold, self.thrown = burst, hold, 0
+
+    def __call__(self, prompt):
+        with self.lock:
+            mine = self.thrown < self.burst
+            if mine:
+                self.thrown += 1
+        if mine:
+            time.sleep(self.hold)
+            return cc.RunOut(1, "", "rate limit exceeded", 0.01)
+        return super().__call__(prompt)
+
+
+class RefuseOne(SafeRunner):
+    """An allowance refusal for every call whose prompt holds `needle`; every other call is answered."""
+    def __init__(self, needle, slow_refusal=0.0, **kw):
+        super().__init__(**kw)
+        self.needle, self.slow, self.refused = needle, slow_refusal, 0
+
+    def __call__(self, prompt):
+        if self.needle in prompt:
+            with self.lock:
+                self.refused += 1
+            time.sleep(self.slow)
             return cc.RunOut(1, json.dumps({"type": "result", "is_error": True, "result": "You've hit your session limit"}), "", 0.01)
         return super().__call__(prompt)
 
@@ -154,6 +187,50 @@ class Adaptive(unittest.TestCase):
             self.assertTrue(all(isinstance(e, cc.StageLimited) for e in errs if e is not None))
             self.assertTrue(any(e is not None for e in errs))
             self.assertLessEqual(port.limited, 1 + 3 + 8)          # the retries of one call, plus calls already in flight
+
+    def test_refusals_of_calls_in_flight_together_do_not_multiply_the_retries(self):
+        # 8 calls in flight are refused together: the stage halts after max_retries refusals counted across workers (plus the
+        # calls already in flight), not after max_retries per worker (a per-call count gave about 25 here)
+        with tempfile.TemporaryDirectory() as tmp:
+            r = LimitAt(at=range(1, 1000), slow_refusal=0.05)
+            b, inner, port = capped(tmp, r, concurrency=8, adaptive=True, start_concurrency=8, max_retries=3)
+            r.port = port
+            errs = in_threads([lambda w=w: port.scoped("q%d" % w).call(Task.ROUTE, route_inputs(w)) for w in range(8)])
+            self.assertTrue(all(isinstance(e, cc.StageLimited) for e in errs), errs)
+            # MEASURED locally, 8 runs each: shared count 5 to 8 refused charges; a per-call count 11 to 16
+            self.assertLessEqual(port.limited, 8)
+            self.assertLessEqual(b.count(), 8)
+
+    def test_a_burst_of_throttles_in_flight_together_halves_and_goes_on(self):
+        # 4 calls in flight are throttled together, more than max_retries: each backs off once and is asked again (a count shared
+        # across workers halted the stage at the 4th, where 14.4 says a throttle halves the limit and the stage goes on). Five
+        # non-zero exits in a row still stop it in the CLI port (MAX_CLI_FAILURE_STREAK), throttles included.
+        with tempfile.TemporaryDirectory() as tmp:
+            r = BurstThrottle(4, scale_ms=8)
+            b, inner, port = capped(tmp, r, concurrency=4, adaptive=True, start_concurrency=4, max_retries=3)
+            errs = in_threads([lambda w=w: port.scoped("q%d" % w).call(Task.ROUTE, route_inputs(w)) for w in range(4)])
+            self.assertEqual(errs, [None] * 4)                                   # every call in flight was throttled, none answered
+            self.assertEqual(port.throttled, 4)
+            self.assertEqual(b.count(), 4 + 4)                                   # each throttled call charged once, then asked again
+            self.assertEqual(port.slots.changes[0], (4, 2, "throttle"))
+
+    def test_one_call_refused_again_and_again_stops_at_its_own_retries_while_others_answer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = RefuseOne("Prompt: question 5000\n", scale_ms=40, slow_refusal=0.03)
+            b, inner, port = capped(tmp, r, concurrency=4, adaptive=True, start_concurrency=4, max_retries=3)
+            fns = [lambda: port.scoped("x").call(Task.ROUTE, route_inputs(5000))]
+            fns += [lambda w=w: [port.scoped("q%d" % w).call(Task.ROUTE, route_inputs(w * 100 + i)) for i in range(20)]
+                    for w in range(1, 4)]
+            errs = in_threads(fns)
+            self.assertIsInstance(errs[0], cc.AllowanceRefused)
+            self.assertEqual(r.refused, 1 + 3)                                   # the first refusal and max_retries retries
+
+    def test_throttles_and_refusals_separated_by_answers_never_add_up_to_a_halt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = LimitAt(at=(20, 40, 60, 80, 100), scale_ms=8, throttle=(10, 50, 90, 110))
+            b, inner, port = adaptive_port(tmp, r)
+            self.assertEqual(run_workers(port), [None] * 12)
+            self.assertEqual((port.limited, port.throttled), (5, 4))           # more refusals than max_retries, each one answered after
 
     def test_a_fixed_concurrency_stops_at_the_first_allowance_refusal_and_a_failing_cli_always_stops(self):
         with tempfile.TemporaryDirectory() as tmp:
