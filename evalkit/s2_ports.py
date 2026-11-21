@@ -250,9 +250,13 @@ class AdaptiveSlots:
                 self._set(max(1, self.limit // 2), why)
 
 
+RETRY_AFTER_CEILING_S = 3600.0     # the longest provider-requested wait honoured in a run; above it the stage stops resumably (ASSUMPTION)
+
+
 class ResilientPort:
     def __init__(self, inner, budget: Budget, journal: Journal, stop_file: Path, *, max_retries: int = 3, base_delay_s: float = 30.0,
-                 max_delay_s: float = 600.0, sleep: Callable[[float], None] = time.sleep,
+                 max_delay_s: float = 600.0, sleep: Optional[Callable[[float], None]] = None,
+                 retry_after_ceiling_s: float = RETRY_AFTER_CEILING_S,
                  render: Callable[[str, Mapping[str, Any]], str] = claude_cli.render,
                  retry_failed: tuple = ("build_l1", "build_upper"), failure_retries: int = 2,
                  clock: Callable[[], float] = time.time, concurrency: int = 1, adaptive: bool = False,
@@ -261,7 +265,9 @@ class ResilientPort:
             raise ValueError("concurrency must be at least 1")
         self._inner, self._budget, self.journal, self._stop = inner, budget, journal, Path(stop_file)
         self._retries, self._base, self._max = max_retries, base_delay_s, max_delay_s
+        # `sleep` is a test hook; by default a back-off waits at the halt gate, so a halt or the stop file ends it at once
         self._sleep, self._render, self._clock = sleep, render, clock
+        self._ra_ceiling = float(retry_after_ceiling_s)
         self._retry_failed, self._fail_retries = tuple(retry_failed), failure_retries
         self.concurrency = int(concurrency)
         self._occ: Dict[str, int] = {}
@@ -346,6 +352,22 @@ class ResilientPort:
                 if self._backing_off == 0:
                     return
                 self._gate.wait(0.5)
+
+    def _backoff_wait(self, delay: float) -> None:
+        """The back-off, at the halt gate: a halt or the stop file ends it at once (the throttled call is asked again on resume)."""
+        if self._sleep is not None:
+            self._sleep(delay)
+            return
+        end = time.monotonic() + delay
+        with self._gate:
+            while True:
+                err = self._halted()
+                if err is not None:
+                    raise err
+                left = end - time.monotonic()
+                if left <= 0:
+                    return
+                self._gate.wait(min(left, 0.5))
 
     def _admit(self, block: bool) -> None:
         """The inner port's admission (review F1): after its pacer wait (`block`, waiting out a back-off too), during that wait and
@@ -440,11 +462,20 @@ class ResilientPort:
                         self.throttled += 1
                     self.journal.append({"t": "throttled", "key": key, "task": name, "attempt": attempt, "ts": self._clock()})
                     attempt += 1
+                    retry_after = getattr(e, "retry_after_s", None)
+                    if retry_after is not None and float(retry_after) > self._ra_ceiling:
+                        # the provider asks for a longer wait than a run sits through: stop resumably now, with no retry spent
+                        when = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + float(retry_after)))
+                        err = StagePaused("the provider asked for a wait of %.0f s, above the ceiling of %.0f s: the stage stops "
+                                          "here; resume after %s" % (float(retry_after), self._ra_ceiling, when),
+                                          retry_after_s=float(retry_after))
+                        self.halt(err)
+                        raise err from None
                     if attempt > self._retries:   # per call: a burst of throttles in flight together halves and goes on
                         self.halt(e)
                         raise
                     self.slots.halve("throttle")
-                    paused, retry_after = True, getattr(e, "retry_after_s", None)
+                    paused = True
                 except BudgetExceeded as e:
                     # nothing was charged beyond the cap and nothing is retried; no other worker charges after it
                     self.journal.append({"t": "uncharged", "key": key, "task": name, "error": "BudgetExceeded", "ts": self._clock()})
@@ -459,13 +490,14 @@ class ResilientPort:
             if paused:
                 # the throttled call was charged once by the inner port; the retry below is one new charged call. Every other
                 # worker waits at the gate meanwhile, so a throttle never multiplies into charged retries across workers
-                delay = min(self._max, max(self._base * (2 ** (attempt - 1)), float(retry_after or 0)))   # Retry-After is a floor
+                # only the exponential back-off is capped; Retry-After is a minimum, honoured in full up to the ceiling above
+                delay = max(min(self._max, self._base * (2 ** (attempt - 1))), float(retry_after or 0))
                 with self._gate:
                     self._backing_off += 1
                 try:
                     with self._lock:
                         self.delays.append(delay)
-                    self._sleep(delay)
+                    self._backoff_wait(delay)
                 finally:
                     with self._gate:
                         self._backing_off -= 1

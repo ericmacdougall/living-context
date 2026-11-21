@@ -161,8 +161,8 @@ def run(a, pick_questions, *, embedder=None, runner=None, loader=None, tenant_fa
         state = "STOPPED"
     except (BudgetExceeded, s2_stage.CapReached):
         state = "CAP_REACHED"
-    except StagePaused:
-        state = "PAUSED_THROTTLE"
+    except StagePaused as e:
+        state, extra = "PAUSED_THROTTLE", {"error": str(e), "retry_after_s": getattr(e, "retry_after_s", None)}
     except StageLimited as e:                     # allowance exhausted or the CLI keeps failing: stop at once, no retry, no back-off
         state, extra = "LIMIT_REACHED", {"error": str(e)}
     except (BuildFailed, PortRefused) as e:       # a refused prompt (a gold-style id or marker in it) stops the stage before any charge

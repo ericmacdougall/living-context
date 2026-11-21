@@ -449,8 +449,8 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
         state = "STOPPED"
     except (BudgetExceeded, s2_stage.CapReached):
         state = "CAP_REACHED"
-    except StagePaused:
-        state = "PAUSED_THROTTLE"
+    except StagePaused as e:
+        state, extra = "PAUSED_THROTTLE", {"error": str(e), "retry_after_s": getattr(e, "retry_after_s", None)}
     except StageLimited as e:
         state, extra = "LIMIT_REACHED", {"error": str(e)}
     except (BuildFailed, PortRefused) as e:

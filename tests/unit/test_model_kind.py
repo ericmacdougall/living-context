@@ -239,6 +239,47 @@ class Port(unittest.TestCase):
                 self.assertEqual(b.count(), 2)
                 self.assertTrue(rows(tmp)[0]["throttled"])
 
+    def test_a_retry_after_above_the_back_off_cap_is_waited_in_full(self):
+        # review3: Retry-After is a minimum; only the exponential back-off is capped (600 s here)
+        with tempfile.TemporaryDirectory() as tmp:
+            b, port, delays = port_over(self, tmp, Upstream(retry_after=1200, throttle=(1,)))
+            self.assertTrue(port.call(Task.ROUTE, route_inputs(1)).ok)
+            self.assertEqual((delays, b.count()), ([1200.0], 2))
+
+    def test_a_retry_after_above_the_ceiling_stops_the_stage_resumably_without_a_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            up = Upstream(retry_after=7200, throttle=(1,))
+            b, port, delays = port_over(self, tmp, up)
+            with self.assertRaises(cc.StagePaused) as e:
+                port.call(Task.ROUTE, route_inputs(1))
+            self.assertIn("above the ceiling", str(e.exception))
+            self.assertEqual(e.exception.retry_after_s, 7200.0)
+            self.assertEqual((delays, b.count(), up.n), ([], 1, 1))       # no retry burnt, nothing waited
+            with self.assertRaises(cc.StagePaused):                           # every worker is halted
+                port.call(Task.ROUTE, route_inputs(2))
+            self.assertEqual(b.count(), 1)
+
+    def test_a_stop_file_ends_a_long_back_off_at_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            up = Upstream(retry_after=1200, throttle=(1,))
+            live = Live(up)
+            self.addCleanup(live.close)
+            b = Budget(Path(tmp) / "counter", 1000)
+            p = mk.capped_port(margs(), Path(tmp), b, runner=live.runner)
+            p._pacer = None
+            port = ResilientPort(p, b, Journal(Path(tmp) / "journal.jsonl"), Path(tmp) / "STOP", base_delay_s=1.0)   # the real wait
+            t, box = started(lambda: port.call(Task.ROUTE, route_inputs(1)))
+            for _ in range(100):
+                if up.n:
+                    break
+                time.sleep(0.05)
+            time.sleep(0.3)                                                   # inside the 1,200 s back-off now
+            (Path(tmp) / "STOP").write_text("")
+            t.join(5)
+            self.assertFalse(t.is_alive())
+            self.assertIsInstance(box.get("err"), StageStopped)
+            self.assertEqual((b.count(), up.n), (1, 1))
+
     def test_throttles_never_count_as_failures_of_the_streak(self):
         with tempfile.TemporaryDirectory() as tmp:          # 6 calls, each throttled once then answered: more than the streak of 5
             b, port, _ = port_over(self, tmp, Upstream(throttle=(1, 3, 5, 7, 9, 11)))
@@ -508,6 +549,18 @@ class S3OnMuse(unittest.TestCase):
         self.assertTrue(all(tuple(r[k] for k in mk.IDENTITY) == ("muse", MODEL, "openrouter", "low", 4096) for r in led))
         stamp = json.loads((d / "STAMP.json").read_text())
         self.assertEqual((stamp["model_kind"], stamp["reasoning_effort"], stamp["port"]["provider"]), ("muse", "low", "openrouter"))
+
+    def test_a_retry_after_above_the_ceiling_pauses_the_stage_and_says_why(self):
+        d = Path(tempfile.mkdtemp())
+        live = Live(Upstream(retry_after=7200, throttle=(1,)))
+        self.addCleanup(live.close)
+        with seeded_node_ids():
+            rc = run_s2.run(s3p.args(d, **vars(margs(rpm=10 ** 6))), run_h1.pick_questions, embedder=t6.RealEmbed(),
+                            runner=live.runner, loader=s3p.loader, tenant_factory=t6.factory(d))
+        self.assertEqual(rc, run_s2.RC["PAUSED_THROTTLE"])
+        state = json.loads((d / "STATE.json").read_text())
+        self.assertIn("above the ceiling", state["error"])
+        self.assertEqual(state["retry_after_s"], 7200.0)
 
     def test_a_torn_last_call_row_is_set_aside_on_resume_and_the_summaries_still_read(self):
         d = Path(tempfile.mkdtemp())
