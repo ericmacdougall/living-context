@@ -325,7 +325,7 @@ class Writer:
                 text = self._ks.decrypt(leaf_id, lv, base64.b64decode(src["ct"]), base64.b64decode(src["nonce"])).decode()
             except KeystoreError:
                 return False
-            self._project(cls, leaf_id, lv, int(src["src_seq"]), text, list(src.get("lin_subjects", [])), pool, source_prov(src))
+            self._project(cls, leaf_id, lv, text, src, pool)
             return True
 
     def _create_pool_head(self, cls: str, pool: str, leaf_id: str, lv: int, status: str, extra: Optional[dict] = None) -> bool:
@@ -423,9 +423,9 @@ class Writer:
         try:
             self._pause("allocated")
             tokens = sorted({self._ks.subject_token(s) for s in declared + subjects.identifiers(text)} | ({principal} if pool else set()))   # the writer is in a pool leaf's lineage (POOLS 3.8)
-            self._append_source(cls, leaf_id, lv, seq, text, tokens, source_ref, pool, prov)
+            src = self._append_source(cls, leaf_id, lv, seq, text, tokens, source_ref, pool, prov)
             self._pause("source")
-            self._project(cls, leaf_id, lv, seq, text, tokens, pool, prov)
+            self._project(cls, leaf_id, lv, text, src, pool)   # from the STORED source: a resumed save keeps the first writer's provenance
             self._pause("projection")
             if pool is None or _head is not None:
                 self.advance_head(cls, leaf_id, lv, pool, status=_head or "live", extra=head_extra)
@@ -653,11 +653,13 @@ class Writer:
         self._put(idx, cid, doc, cls=cls, cas=(cur["_seq_no"], cur["_primary_term"]))
 
     # ---- steps --------------------------------------------------------------------------------------
-    def _append_source(self, cls, leaf_id, lv, seq, text, tokens, source_ref, pool=None, prov=None) -> None:
+    def _append_source(self, cls, leaf_id, lv, seq, text, tokens, source_ref, pool=None, prov=None) -> dict:
+        """Append the source version (or find it, on a resume) and return the STORED source document: the projection is built from
+        it, so a retry by another caller cannot change the version's provenance or lineage (review F3)."""
         with _src_lock(self.tenant, leaf_id, lv):  # check, key and append are one step (retries race otherwise)
-            self._append_source_locked(cls, leaf_id, lv, seq, text, tokens, source_ref, pool, prov)
+            return self._append_source_locked(cls, leaf_id, lv, seq, text, tokens, source_ref, pool, prov)
 
-    def _append_source_locked(self, cls, leaf_id, lv, seq, text, tokens, source_ref, pool=None, prov=None) -> None:
+    def _append_source_locked(self, cls, leaf_id, lv, seq, text, tokens, source_ref, pool=None, prov=None) -> dict:
         idx, did = tenant_index(self.tenant, "src"), f"{leaf_id}:{lv}"
         have = self._get(idx, did)
         self._pause("src_checked")
@@ -670,7 +672,7 @@ class Writer:
                     same = False
                 if not same:
                     raise WriterError("version already written with another text")
-            return  # resumed after the append
+            return have["_source"]  # resumed after the append: the stored version, not the retrying caller's
         if self._ks.has_key(leaf_id, lv):  # a key made before a crash that never reached the append
             self._ks.destroy_exact_version(leaf_id, lv)   # this version only: the live earlier versions of the leaf keep their keys
         ct, nonce, key_ref = self._ks.encrypt(leaf_id, lv, text.encode(), tokens)
@@ -685,11 +687,17 @@ class Writer:
             self._ks.decrypt(leaf_id, lv, base64.b64decode(stored["_source"]["ct"]), base64.b64decode(stored["_source"]["nonce"]))
         except KeystoreError as e:
             raise WriterError("stored source does not open under its key") from e
+        return stored["_source"]
 
-    def _project(self, cls, leaf_id, lv, seq, text, tokens, pool=None, prov=None) -> None:
-        extra = dict(prov or {})
+    def _project(self, cls, leaf_id, lv, text, src, pool=None) -> None:
+        """Write the projection of the source version `src` (the STORED source document): its lineage (`lin_subjects`), its sequence
+        and, for a pool, its provenance (`source_prov`) come from the source, never from a caller, so every path that creates or resumes a
+        projection (a save, a resume, a repair, a release) carries the version's own writer and origin (review F3, class C6;
+        tests/unit/test_writer_resume_prov.py enumerates the paths)."""
+        extra = dict(source_prov(src)) if pool else {}
         if pool:
             extra.update(pool=pool, lv=lv)
+        tokens, seq = list(src.get("lin_subjects", [])), int(src["src_seq"])
         doc = self._base("leaf", cls, lin_subjects=tokens, **extra, lin_leaf_ids=[leaf_id], src_seq=seq, text=text,
                          title=title.build_title(text, n=self._c.title_terms), entities=entities.extract(text),
                          size_tokens=segment.tokens_of(text, self._c.chars_per_token_bound),
@@ -780,7 +788,7 @@ class Writer:
                     except KeystoreError:
                         out["erased_skipped"] += 1
                         continue
-                    self._project(cls, leaf_id, lv, seq, text, list(s.get("lin_subjects", [])))
+                    self._project(cls, leaf_id, lv, text, s)
                     out["reprojected"] += 1
                 heads = class_index(self.tenant, cls, "ctl")
                 if self._get(heads, f"lh:{leaf_id}") is None:

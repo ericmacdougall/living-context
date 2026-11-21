@@ -332,8 +332,8 @@ class Registration(unittest.TestCase):
         self.assertIn("self._create_pool_head", ast.unparse(helper))
         self.assertNotIn("self.advance_head", ast.unparse(helper))
         ensure = ast.unparse(symbol(writer, "_ensure_projection"))
-        self.assertIn("self._project", ensure)
-        self.assertIn("source_prov(src)", ensure)
+        self.assertIn("self._project(cls, leaf_id, lv, text, src, pool)", ensure)   # the projection is built from the stored source
+        self.assertIn("source_prov(src)", ast.unparse(symbol(writer, "_project")))   # which carries its provenance (F3)
         self.assertTrue({"src", "leaf", "ctl"} <= set().union(*index_calls(repair).values()))
 
     def test_every_key_holding_kind_is_destroyed_by_the_pool_delete(self):

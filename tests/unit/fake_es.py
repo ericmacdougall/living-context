@@ -183,3 +183,41 @@ class ShardedFake(FakeEs):
                  "_source": {k: v for k, v in src.items() if fields is None or fields is True or k in fields}}
                 for key, _, name, did, src in hits[:size]]
         return 200, {"timed_out": False, "_shards": self._shards(len(snapshot)), "hits": {"hits": page}}
+
+
+class DocStore:
+    """Documents by (index, id) with the write semantics the writer relies on: `op_type=create` answers 409 when the id exists,
+    `if_seq_no`/`if_primary_term` is a compare-and-set (409 on a mismatch), GET answers `_seq_no`/`_primary_term`, refresh is a no-op.
+    `fail` maps a (method, index-substring) to a status answered once per entry in its list (an injected HTTP error)."""
+
+    def __init__(self):
+        self.docs, self.seq, self.fail, self.sent = {}, 0, {}, []
+
+    def request(self, method, path, body=None, **kw):
+        p, _, qs = path.partition("?")
+        self.sent.append((method, p))
+        for (m, sub), statuses in list(self.fail.items()):
+            if m == method and sub in p and statuses:
+                return statuses.pop(0), {"error": {"type": "injected"}}
+        if p.endswith("/_refresh"):
+            return 200, {"_shards": {"total": 1, "successful": 1, "failed": 0}}
+        m = re.match(r"^/([^/]+)/_doc/(.+)$", p)
+        assert m, path
+        key = (m.group(1), m.group(2))
+        params = dict(x.split("=", 1) for x in qs.split("&") if x)
+        cur = self.docs.get(key)
+        if method == "GET":
+            if cur is None:
+                return 404, {"found": False}
+            return 200, {"found": True, "_id": key[1], "_source": dict(cur[0]), "_seq_no": cur[1], "_primary_term": 1}
+        if method == "DELETE":
+            return (200, {"result": "deleted"}) if self.docs.pop(key, None) is not None else (404, {"result": "not_found"})
+        if method == "PUT":
+            if params.get("op_type") == "create" and cur is not None:
+                return 409, {"error": {"type": "version_conflict_engine_exception"}}
+            if "if_seq_no" in params and (cur is None or int(params["if_seq_no"]) != cur[1]):
+                return 409, {"error": {"type": "version_conflict_engine_exception"}}
+            self.seq += 1
+            self.docs[key] = (dict(body), self.seq)
+            return (201 if cur is None else 200), {"result": "created" if cur is None else "updated"}
+        raise AssertionError(path)
