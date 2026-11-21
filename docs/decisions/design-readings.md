@@ -332,6 +332,15 @@ Each entry names the passages, the reading the build follows and the test that k
   several indices uses a point in time with `_shard_doc` (a cursor unique across indices), never `_doc`. The verifier keeps its own
   validators (DESIGN 14.7: no shared read path with the gateway). Pool delete discovers its physical indices from the alias and the manifest,
   refuses when discovery fails, and checks after the drop that the alias and every physical index are gone.
+- Single-document answers (the F11 class, round 5). A document delete, and an erasure's document read and compare-and-set rewrite, go
+  through `reads.delete_doc`, `reads.read_doc` and `reads.put_doc`, which own the request. A delete is done only on HTTP 200 `deleted`, or on
+  a verified absence: a 404 `not_found` (a read: `found: false`) about exactly the `_index` and `_id` sent, or a 404
+  `index_not_found_exception` naming the index. Anything else refuses and the step stays retryable. An erasure asks by the concrete `_index`
+  of its scan hit and accepts only that name. A request through an alias (authz records, the class leaf in repair, the start-up's expired
+  tokens, the taint record) also accepts the physical form of the alias: the alias, `-p` and 8 hex characters (`indices.physical_name`).
+  Reading: that naming rule is the only link between an alias and its index that the answer carries; the cluster test pins that
+  Elasticsearch answers with that name. The conversation taint read (`session_state.es_load`) reads "no taint" only on such a verified
+  absence; anything else answers unavailable.
 - Pool sources and projections (F3): a resumed or repaired projection takes its provenance, tokens and sequence from the stored source
   document, never from the caller.
 - Leaf claims after an error (F4): an ordinary error (an HTTP error or an exception) after a claimed change's source may have landed settles

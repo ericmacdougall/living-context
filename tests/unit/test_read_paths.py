@@ -124,7 +124,6 @@ ALLOWED = {
     ("gateway/provision.py", "provision_tenant", "POST"): (1, "checked", "administrator provisioning: a failure raises"),
     ("gateway/session_state.py", "es_persist.persist", "GET"): (1, "checked", "the taint CAS read; 404 is a fresh record, anything else raises"),
     ("gateway/session_state.py", "es_persist.persist", "PUT"): (1, "checked", "the taint CAS write; a conflict or failure raises"),
-    ("gateway/session_state.py", "es_load.load", "GET"): (1, "checked", "404 is no record; anything else but 200 raises"),
     # --- ingest ---------------------------------------------------------------------------------------------------------------------
     ("ingest/writer.py", "Writer._put", "PUT"): (1, "checked", "the one document write: a failure raises WriterError"),
     ("ingest/writer.py", "Writer._get", "GET"): (1, "checked", "404 is None; anything else but 200 raises"),

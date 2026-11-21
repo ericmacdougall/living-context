@@ -110,6 +110,8 @@ class SessionStates:
 import datetime
 import hashlib
 
+from .reads import IncompleteRead, read_doc
+
 
 def _doc_id(key: tuple) -> str:
     return "cv:" + hashlib.sha256("\x00".join(key).encode()).hexdigest()[:40]
@@ -147,12 +149,16 @@ def es_persist(client: Callable[[], object], tenant: str) -> Callable[[tuple, Ca
 
 
 def es_load(client: Callable[[], object], tenant: str) -> Callable[[tuple], Optional[Taint]]:
+    """`load(key)`: the stored taint, or None ("no taint yet") only for a verified absence of exactly this record (`reads.read_doc`: a
+    404 `found: false` about this `_index` and `_id`, or the index absent). Any other answer raises `StateError`: an empty or foreign 404,
+    or a 200 that is not this record found, would otherwise read as the floor and lower the taint after a restart (review round 5)."""
     def load(key: tuple) -> Optional[Taint]:
-        st, r = client().request("GET", f"/lc-{tenant}-ctl/_doc/{_doc_id(key)}")
-        if st == 404:
+        try:
+            r = read_doc(client(), f"lc-{tenant}-ctl", _doc_id(key), alias=True)
+        except IncompleteRead as e:
+            raise StateError("taint unreadable") from e
+        if r is None:
             return None
-        if st != 200 or not isinstance(r, dict):
-            raise StateError("taint unreadable")
-        s = r.get("_source") or {}
+        s = r["_source"]
         return Taint(s.get("taint_cls") or None, frozenset(s.get("taint_private", [])))
     return load
