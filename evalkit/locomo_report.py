@@ -285,6 +285,9 @@ def build(run: Run, resamples: int) -> dict:
         # the A0 computed at recall time must be the A0 of the all-questions stage
         same = sum(run.done_row(q)["arms"]["A0"]["leaves"] == run.a0.get(q, {}).get("leaves") for q in qids)
         blk["a0_recall_time_equals_a0_all"] = {"same": same, "of": len(qids)}
+        # a recall whose holder calls equal the conversation's node count opened every node: the model was offered every leaf of the pool
+        blk["routing"] = {"holder_calls_equal_node_count": sum(run.done_row(q).get("holder_calls") == (run.built.get(run.q[q]["conv"]) or {}).get("nodes")
+                                                               for q in qids), "of": len(qids)}
         res["batches"][name] = blk
     if sh_done:
         sb = block(run, sh_done, ("A0", "A1", "A1-tree-only", "SHUFFLED"), resamples)
@@ -329,7 +332,11 @@ def render(res: dict, run: Run) -> str:
         L += md_block("A0, A1 and A1-tree-only on the same %d questions" % b["n"], b, ARMS, names)
         L += md_category("Per category", b["by_category"], ARMS, names)
         L += ["Tree recalls that failed (scored 0, kept): %d of %d. A0 at recall time equals the A0 of the all-questions stage on %d of %d questions." % (
-            b["tree_failed_recalls"], b["n"], b["a0_recall_time_equals_a0_all"]["same"], b["a0_recall_time_equals_a0_all"]["of"]), ""]
+            b["tree_failed_recalls"], b["n"], b["a0_recall_time_equals_a0_all"]["same"], b["a0_recall_time_equals_a0_all"]["of"]),
+              "Routing: in %d of %d recalls the number of holder calls equals the number of level-1 nodes of the conversation's tree (%s), that is, the recall "
+              "opened every node and the model was offered every leaf of the pool. Where this is all of them, A1 and A1-tree-only measure a model pass over the "
+              "leaf descriptors of the whole pool compared with flat search, not a selective descent of the tree." % (
+                  b["routing"]["holder_calls_equal_node_count"], b["routing"]["of"], ", ".join(str((run.built.get(i) or {}).get("nodes")) for i in sorted(run.built))), ""]
     if res.get("tree_only_mean_list_length"):
         L += ["A1-tree-only returns on average %s leaves per question (scored as returned, not padded to 10); the pools hold 25 to 60 leaves." % ", ".join(
             "%.2f in %s" % (v, k) for k, v in res["tree_only_mean_list_length"].items()), ""]
