@@ -258,11 +258,12 @@ class CappedPort:
         name = task.value
         prompt = render(name, inputs)
         self._check_prompt(prompt)            # before the counter: a refused prompt costs nothing
-        with self._lock:                      # one call at a time: one process, one counter
+        with self._lock:                      # the charge and its bookkeeping are atomic; the process itself runs outside the lock
             self.port_calls += 1
             n = self._budget.charge()         # BEFORE the process; raises BudgetExceeded at the cap, nothing is spawned
             self.spawned += 1
-            ro = self._run(prompt)
+        ro = self._run(prompt)                # several processes may run at once (the caller bounds how many: `ResilientPort`)
+        with self._lock:
             row = {"n": n, "task": name, "prompt_chars": len(prompt), "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:16],
                    "latency_s": round(ro.latency_s, 3), "rc": ro.rc, "stdout_chars": len(ro.stdout), "argv": self._argv,
                    "prompt_version": PROMPT_VERSION}

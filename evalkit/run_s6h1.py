@@ -26,13 +26,14 @@ import time
 from pathlib import Path
 from typing import Callable, List, Optional
 
-from . import dataset as ds, s6h1_budget as bud, s6h1_freeze as fz, s6h1_stage as st
+from . import dataset as ds, parallel as par, s6h1_budget as bud, s6h1_freeze as fz, s6h1_stage as st
 
 STAGE = "S6-H1"
 TENANT = "s6h1"
 REGISTERED_POOL = 18_464            # distinct session contents of all 500 questions (EXPERIMENT 3.3, MEASURED)
 EXPECTED_LEAVES = 78_700            # 18,464 x 4.262 leaves per session (S3's dev static pool; counts only)
 MEM_MARGIN_MB = 2_048               # free memory beyond the proven peak that the host must have at the start
+CLI_CHILD_MB = 256                  # one headless CLI process (MEASURED: 238 MB peak RSS each, 4 at once on the run host)
 RC = {"COMPLETE": 0, "STOPPED": 3, "CAP_REACHED": 4, "BUILD_FAILED": 5, "PAUSED_THROTTLE": 75, "LIMIT_REACHED": 76, "ERROR": 1,
       "REFUSED": 2}
 STAMP_KEYS = ("commit", "cap", "approval_ref", "release_ref", "freeze_sha256", "a0_fields", "model")
@@ -128,17 +129,21 @@ def check_prereqs(a, *, embed=None, manifest_path: Path = fz.MANIFEST, root: Pat
             why.append("the stamp registry has no row for this run; refusing to resume an unregistered run")
     if (rd / "STOP").exists():
         why.append("a stop file is present in the run directory; remove it to start or resume")
+    n_par = getattr(a, "concurrency", par.REGISTERED_CONCURRENCY)
+    why += par.check_concurrency(n_par, getattr(a, "concurrency_reason", ""))
+    n_par = n_par if isinstance(n_par, int) and n_par >= 1 else 1
     try:
         mp = mem_proof(getattr(a, "mem_proof", ""), root)
     except (OSError, ValueError) as e:
         why.append(str(e))
     else:
         free = mem_available()
-        if free is not None and free < float(mp["peak_rss_mb"]) + MEM_MARGIN_MB:
-            why.append("the host has %.0f MB available, less than the proven build peak %.0f MB plus %d MB" % (free, mp["peak_rss_mb"],
-                                                                                                         MEM_MARGIN_MB))
+        need = float(mp["peak_rss_mb"]) + n_par * CLI_CHILD_MB + MEM_MARGIN_MB
+        if free is not None and free < need:
+            why.append("the host has %.0f MB available, less than the proven build peak %.0f MB plus %d CLI processes of %d MB plus %d MB"
+                       % (free, mp["peak_rss_mb"], n_par, CLI_CHILD_MB, MEM_MARGIN_MB))
     try:
-        est = bud.estimate(EXPECTED_LEAVES, bud.measured_rates(a.rates_from))
+        est = bud.estimate(EXPECTED_LEAVES, bud.measured_rates(a.rates_from), concurrency=n_par)
         why += bud.refusal(est, a.approved_cap or 0)
     except (OSError, ValueError) as e:
         why.append("the call estimate needs the measured rates of earlier stages (--rates-from): %s" % e)
@@ -230,7 +235,8 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
         et.close()
         return write_state(run_dir, "REFUSED", leaves=n_leaves, error="%d leaves exceed the %d whose build memory was proven; prove the "
                            "larger size with evalkit.s6h1_mem first" % (n_leaves, proven_max_leaves))
-    est = bud.estimate(n_leaves, bud.measured_rates(a.rates_from))
+    n_par = int(getattr(a, "concurrency", par.REGISTERED_CONCURRENCY) or 1)
+    est = bud.estimate(n_leaves, bud.measured_rates(a.rates_from), concurrency=n_par)
     (run_dir / "budget.json").write_text(json.dumps(est, indent=1, sort_keys=True))
     print("call estimate at %d leaves: expected %d, top %d, cap %d" % (n_leaves, est["expected"], est["top"], a.approved_cap), flush=True)
     why = bud.refusal(est, a.approved_cap)
@@ -241,6 +247,7 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
         stamp.write_text(json.dumps({"stage": STAGE, "commit": a.commit, "cap": a.approved_cap, "approval_ref": a.approval_ref,
                                      "release_ref": a.release_ref, "freeze_sha256": fsha, "a0_fields": a.a0_fields, "model": a.model,
                                      "beta": vals["beta"], "mem_proof_sha256": fz._sha(Path(a.mem_proof)), "leaves": n_leaves,
+                                     "concurrency": n_par, "concurrency_reason": getattr(a, "concurrency_reason", "") or "",
                                      "started": time.time()}, sort_keys=True))
         with open(a.stamp_registry, "a") as f:
             f.write(json.dumps({"stage": STAGE, "run_dir": os.path.realpath(a.run_dir), "commit": a.commit, "freeze_sha256": fsha,
@@ -250,24 +257,32 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
     budget = Budget(run_dir / "counter", a.approved_cap)
     inner = claude_cli.CappedPort(runner, budget, run_dir / "calls.jsonl", model_id=a.model, argv_record=getattr(runner, "argv", lambda: [])())
     journal = Journal(run_dir / "journal.jsonl")
-    port = ResilientPort(inner, budget, journal, run_dir / "STOP", max_retries=a.max_retries, base_delay_s=a.base_delay)
+    port = ResilientPort(inner, budget, journal, run_dir / "STOP", max_retries=a.max_retries, base_delay_s=a.base_delay,
+                         concurrency=n_par)
+    with open(run_dir / "starts.jsonl", "a") as f:      # every start or resume, with its concurrency (outputs do not depend on it)
+        f.write(json.dumps({"at": time.time(), "commit": a.commit, "concurrency": n_par,
+                            "concurrency_reason": getattr(a, "concurrency_reason", "") or ""}, sort_keys=True) + "\n")
     ledger = s2_stage.Ledger(run_dir / "done.jsonl")
     shuffled_qids = st.shuffled_subset(fs, vals["thresholds"]["shuffled_n"])
     state, extra = "COMPLETE", {}
     try:
         if not resumed_built:
-            tree = et.build_and_publish(port)
+            tree = et.build_and_publish(port, pmap=par.ordered_map(n_par), port_for=lambda k: port.scoped("build|" + k))
             (run_dir / "tree.json").write_text(json.dumps({"nodes": len(tree.nodes), "levels": tree.levels, "top": len(tree.top),
                                                             "build_calls": tree.calls, "leaves": n_leaves}, indent=1))
             built.write_text(json.dumps({"at": time.time()}))
             print("tree: %d nodes, %d levels, top %d, build calls %d" % (len(tree.nodes), tree.levels, len(tree.top), tree.calls), flush=True)
         view, world = et.view(), et.world
-        direct = s2_stage.Recorder(et.direct())
-        tr = s2_stage.Recorder(arms.TreeRetriever(port, view, TENANT, CLS, "px", consts, workers=1))
-        sh = s2_stage.Recorder(arms.TreeRetriever(port, arms.PermutedView(view), TENANT, CLS, "px", consts, workers=1))
-        st.run_questions(fs, hashes, direct, tr, sh, world, ledger, beta=vals["beta"], shuffled_qids=shuffled_qids,
+        pview, dfn = arms.PermutedView(view), et.direct()
+
+        def retrievers(ref):
+            # one question's own recorders over a port scoped to it; each recall stays one worker (deterministic call order)
+            qp = port.scoped(ref)
+            return (s2_stage.Recorder(dfn), s2_stage.Recorder(arms.TreeRetriever(qp, view, TENANT, CLS, "px", consts, workers=1)),
+                    s2_stage.Recorder(arms.TreeRetriever(qp, pview, TENANT, CLS, "px", consts, workers=1)))
+        st.run_questions(fs, hashes, None, None, None, world, ledger, beta=vals["beta"], shuffled_qids=shuffled_qids,
                          stop=port.stop_requested, progress=lambda s: print(s, "counter", budget.count(), flush=True),
-                         scope=lambda ref: setattr(port, "scope", ref))
+                         retrievers=retrievers, workers=n_par)
     except StageStopped:
         state = "STOPPED"
     except (BudgetExceeded, s2_stage.CapReached):
@@ -317,6 +332,10 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--threads", type=int, default=6)
     ap.add_argument("--max-retries", type=int, default=3)
     ap.add_argument("--base-delay", type=float, default=30.0)
+    ap.add_argument("--concurrency", type=int, default=par.REGISTERED_CONCURRENCY,
+                    help="model calls at once (registered %d; questions and build groups run concurrently, outputs do not depend on it)"
+                    % par.REGISTERED_CONCURRENCY)
+    ap.add_argument("--concurrency-reason", default="", help="required above the registered value; recorded in the stamp")
     return ap
 
 

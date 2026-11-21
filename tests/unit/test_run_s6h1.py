@@ -52,7 +52,8 @@ def args(base, s3, run, **kw):
     a = dict(stage="S6-H1", dataset="", es_url="", es_ca="", es_pw_file="", run_dir=str(run), s3_run_dir=str(s3),
              stamp_registry=str(base / "stamps.jsonl"), embed_dir="", binary="fake", model=MODEL, rates_from=[str(logs())],
              model_kind="claude", approved_cap=35574, approval_ref=APPROVAL, release_ref=REF, commit=COMMIT, a0_fields="strong",
-             resume=False, threads=1, max_retries=2, base_delay=0.0, mem_proof=str(base / "mem.json"))
+             resume=False, threads=1, max_retries=2, base_delay=0.0, mem_proof=str(base / "mem.json"), concurrency=1,
+             concurrency_reason="")
     a.update(kw)
     return argparse.Namespace(**a)
 
@@ -141,7 +142,16 @@ class Guards(unittest.TestCase):
 
     def test_a_host_without_the_proven_peak_free_is_refused(self):
         self.has("less than the proven build peak", free=9000.0)
-        self.assertEqual(self.why(free=9000.0 + rs.MEM_MARGIN_MB), [])
+        self.assertEqual(self.why(free=9000.0 + rs.CLI_CHILD_MB + rs.MEM_MARGIN_MB), [])
+        # each concurrent CLI process needs its own memory on top of the proven build peak
+        self.has("4 CLI processes", free=9000.0 + rs.CLI_CHILD_MB + rs.MEM_MARGIN_MB, concurrency=4, concurrency_reason="probe")
+        self.assertEqual(self.why(free=9000.0 + 4 * rs.CLI_CHILD_MB + rs.MEM_MARGIN_MB, concurrency=4, concurrency_reason="probe"), [])
+
+    def test_concurrency_above_the_registered_value_needs_a_recorded_reason(self):
+        self.has("above the registered 2", free=64000.0, concurrency=4)
+        self.assertEqual(self.why(concurrency=2), [])
+        self.assertEqual(self.why(concurrency=4, concurrency_reason="probe of 2026-11-21, no 429 at 8"), [])
+        self.has("at least 1", concurrency=0)
 
     def test_an_estimate_over_the_cap_is_refused(self):
         self.has("exceeds the approved cap", approved_cap=20000)
@@ -174,8 +184,8 @@ class MemTenant:
     def load_leaves(self, n):
         return n
 
-    def build_and_publish(self, port):
-        self.tree = build.build_tree(self.mc.leaves, port, rs.TENANT, "base")
+    def build_and_publish(self, port, **kw):
+        self.tree = build.build_tree(self.mc.leaves, port, rs.TENANT, "base", **kw)
         return self.tree
 
     def view(self):

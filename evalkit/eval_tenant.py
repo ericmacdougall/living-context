@@ -170,8 +170,9 @@ class EvalTenant:
         return int(r["count"]) if st == 200 else -1
 
     # ---- structure ----------------------------------------------------------------------------------------------
-    def build_and_publish(self, port) -> build.Tree:
-        tree = build.build_tree(self.leaves, port, self.tenant, CLS, consts=self.consts)
+    def build_and_publish(self, port, **build_kw) -> build.Tree:
+        """`build_kw` reaches `build_tree` (`pmap`, `port_for`, `idgen`: concurrent group calls with a per-group journal scope)."""
+        tree = build.build_tree(self.leaves, port, self.tenant, CLS, consts=self.consts, **build_kw)
         pub = Publisher(lambda: self.gate.client(self.tenant, "structure"), self.tenant, CLS)
         gen = pub.publish(tree, watermark=self.max_seq)
         if gen is None:

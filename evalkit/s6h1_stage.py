@@ -22,9 +22,10 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from . import arms, dataset as ds, stats
+from .parallel import run_ordered
 from .s2_ports import StageStopped
 from .s2_stage import CapReached, Ledger, Recorder, _scores, qref
 from .score import write_result
@@ -51,42 +52,58 @@ def stratum_of(fs: ds.FreshSet) -> Dict[str, str]:
     return out
 
 
-def run_questions(fs: ds.FreshSet, hashes: Mapping[str, str], direct: Recorder, tree: Recorder, shuffled: Recorder, world: arms.World,
-                  ledger: Ledger, *, beta: float, shuffled_qids: Sequence[str], stop: Callable[[], bool] = lambda: False,
-                  progress: Callable[[str], None] = lambda s: None, scope: Callable[[Optional[str]], None] = lambda s: None) -> None:
+def run_questions(fs: ds.FreshSet, hashes: Mapping[str, str], direct: Optional[Recorder], tree: Optional[Recorder],
+                  shuffled: Optional[Recorder], world: arms.World, ledger: Ledger, *, beta: float, shuffled_qids: Sequence[str],
+                  stop: Callable[[], bool] = lambda: False, progress: Callable[[str], None] = lambda s: None,
+                  scope: Callable[[Optional[str]], None] = lambda s: None,
+                  retrievers: Optional[Callable[[str], Tuple[Recorder, Recorder, Recorder]]] = None, workers: int = 1) -> None:
     """Every fresh question not yet in the ledger, in the seeded order; SHUFFLED only on `shuffled_qids`. A question is recorded only
-    when it completed; the stop file and the cap end the loop before recording (as in S2). `scope(ref)` is called before each question
-    (the run sets the journal scope of its port, so a resume replays only the in-flight question's own calls)."""
+    when it completed; the stop file and the cap end the loop before recording (as in S2).
+
+    One worker: the given recorders, and `scope(ref)` is called before each question (the run sets the journal scope of its port, so a
+    resume replays only the in-flight question's own calls). Several workers: `retrievers(ref)` gives each question its own
+    (direct, tree, shuffled) recorders over a port scoped to that question, questions run concurrently, and their rows are appended
+    strictly in the seeded order (`parallel.run_ordered`), so the ledger is byte-identical at any concurrency."""
+    if workers > 1 and retrievers is None:
+        raise ValueError("several workers need per-question retrievers (a shared recorder is shared state)")
     by = {q.qid: q for q in fs.questions}
     strata = stratum_of(fs)
     shuf = set(shuffled_qids)
     order = seeded_order(list(by))
-    for n, qid in enumerate(order, 1):
+    todo = [(n, qid) for n, qid in enumerate(order, 1) if qref(qid) not in ledger.rows]
+
+    def one(item) -> dict:
+        n, qid = item
         q = by[qid]
         ref = qref(qid)
-        if ref in ledger.rows:
-            continue
-        if stop():
-            raise StageStopped("stop file present")
+        if retrievers is not None:
+            d, t, sh = retrievers(ref)
+        else:
+            scope(ref)
+            d, t, sh = direct, tree, shuffled
         g = sorted({hashes[s] for s in q.gold_session_ids}) if not q.is_abstention else []
-        scope(ref)
-        o = arms.run_question(q.question, direct, tree, world, beta=beta, shuffled_tree=shuffled if qid in shuf else None)
-        for rec in (tree, shuffled if qid in shuf else None):
+        o = arms.run_question(q.question, d, t, world, beta=beta, shuffled_tree=sh if qid in shuf else None)
+        for rec in (t, sh if qid in shuf else None):
             if rec is not None and rec.last is not None and not rec.last.ok and rec.last.error == "BudgetExceeded":
                 raise CapReached("call cap reached during question %d" % n)
-        dlist = list(direct.last)[:arms.WINDOW]
-        tids = list(tree.last.ids)[:arms.WINDOW] if tree.last is not None and tree.last.ok else []
+        dlist = list(d.last)[:arms.WINDOW]
+        tids = list(t.last.ids)[:arms.WINDOW] if t.last is not None and t.last.ok else []
         src = arms.source_of_gold(o["A1"], tids, [i for i, _ in dlist], g, world) if (g and o["A1"].sessions) else {}
         sess = lambda lid: ds.opaque_ref(world.leaf_session[lid]) if lid in world.leaf_session else None
-        ledger.append({
+        return {
             "qref": ref, "stratum": strata[qid], "qtype": q.qtype, "gold_n": len(g), "gold": [ds.opaque_ref(x) for x in g],
             "arms": {k: {"sessions": [ds.opaque_ref(s) for s in v.sessions], "failed": bool(v.failed), "offered": len(v.leaves)}
                      for k, v in o.items() if k in ARMS_S6},
-            "sources": sorted(src.values()), "holder_calls": tree.last.holder_calls, "fallbacks": tree.last.fallbacks,
+            "sources": sorted(src.values()), "holder_calls": t.last.holder_calls, "fallbacks": t.last.fallbacks,
             "direct50": [[lid, sess(lid), float(score), int(world.session_tokens.get(world.leaf_session.get(lid, ""), 0))]
                          for lid, score in dlist],
-            "tree50": [[lid, sess(lid)] for lid in tids]})
-        progress("question %d/%d done" % (n, len(order)))
+            "tree50": [[lid, sess(lid)] for lid in tids]}
+
+    def commit(_i, item, row) -> None:
+        ledger.append(row)
+        progress("question %d/%d done" % (item[0], len(order)))
+
+    run_ordered(todo, one, commit, workers=workers, stop=stop, stop_exc=lambda: StageStopped("stop file present"))
 
 
 # ---- the decision -------------------------------------------------------------------------------------------------------------------

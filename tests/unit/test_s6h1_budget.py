@@ -10,11 +10,12 @@ from pathlib import Path
 from evalkit import s6h1_budget as bud
 
 
-def logs(route=3522, organise=502, build=399, questions=30, shuffled=True, build_failed=0, throttled=0):
+def logs(route=3522, organise=502, build=399, questions=30, shuffled=True, build_failed=0, throttled=0, limited=0):
     d = Path(tempfile.mkdtemp())
     rows = [{"task": "route"}] * route + [{"task": "organise"}] * organise + [{"task": "build_l1", "schema_ok": True}] * (build - build_failed)
     rows += [{"task": "build_l1", "error": "cli_error", "schema_ok": False}] * build_failed
     rows += [{"task": "route", "throttled": True, "error": "throttled"}] * throttled
+    rows += [{"task": "build_l1", "limited": True, "error": "limit"}] * limited
     (d / "calls.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
     arms = {"A0": {}, "A1": {}, "A1-tree-only": {}}
     if shuffled:
@@ -53,11 +54,23 @@ class Estimate(unittest.TestCase):
         self.assertEqual(e["recalls"], 312 + 50)
         self.assertEqual(e["per_recall_code_bound"], 24 + 36 + 12)
         base = 5249 + 362 * 72
-        top = base + math.ceil(2 * 5249 * wilson_upper(0, 399)) + math.ceil(base * wilson_upper(0, 4423))
+        top = base + math.ceil(2 * 5249 * wilson_upper(0, 399)) + 2 * math.ceil(base * wilson_upper(0, 4423))   # throttle, refusal
         self.assertEqual(e["top"], top)
         self.assertEqual(e["expected"], round(5247 + 362 * 4024 / 60))
         self.assertLessEqual(e["top"], bud.APPROVED_CAP)
         self.assertEqual(bud.refusal(e, bud.APPROVED_CAP), [])
+
+    def test_concurrency_multiplies_the_throttle_and_refusal_allowances_only(self):
+        r = bud.measured_rates([logs(limited=2)])                    # S3 met two allowance refusals in its first ~1,050 calls
+        e1, e4 = bud.estimate(78_700, r), bud.estimate(78_700, r, concurrency=4)
+        self.assertEqual(r["limited"], 2)
+        self.assertEqual(e4["allowance_throttle"], 4 * e1["allowance_throttle"])
+        self.assertEqual(e4["allowance_refused_reasked"], 4 * e1["allowance_refused_reasked"])
+        self.assertEqual(e4["allowance_build_retry"], e1["allowance_build_retry"])
+        self.assertEqual(e4["top"] - e1["top"], 3 * (e1["allowance_throttle"] + e1["allowance_refused_reasked"]))
+        self.assertEqual(e4["expected"], e1["expected"])
+        self.assertEqual(bud.refusal(e4, bud.APPROVED_CAP), [])           # concurrency 4 stays within the approved cap
+        self.assertEqual(bud.refusal(bud.estimate(78_700, r, concurrency=8), bud.APPROVED_CAP), [])
 
     def test_the_top_never_uses_a_rate_below_the_code_bound(self):
         r = bud.measured_rates([logs(route=600, organise=0)])        # 10 calls per recall measured
