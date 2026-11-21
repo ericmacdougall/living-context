@@ -348,21 +348,27 @@ class CappedPort:
         name = task.value
         prompt = render(name, inputs)
         self._check_prompt(prompt)            # before the counter: a refused prompt costs nothing
-        if self._pacer is not None:           # the wait is part of the halt gate: a stop or halt during it ends it, uncharged
-            self._pacer.wait(check=lambda: self.admit(False))
-        while self.admit(True) and self._pacer is not None:
-            # a back-off that began during the wait held this call: its pacer turn is spent, so it takes a new one (the workers a
-            # back-off releases together never charge in one unpaced burst)
-            self._pacer.wait(check=lambda: self.admit(False))
-        with self._lock:                      # the charge and its bookkeeping are atomic; the process itself runs outside the lock
-            self.admit(False)                 # immediately before the charge, under the lock every stopping call halts under
-            self.port_calls += 1
-            try:
-                n = self._budget.charge()     # BEFORE the process; raises BudgetExceeded at the cap, nothing is spawned
-            except BudgetExceeded as e:
-                self.on_halt(e)
-                raise
-            self.spawned += 1
+        n = None
+        while n is None:
+            if self._pacer is not None:       # the wait is part of the halt gate: a stop or halt during it ends it, uncharged
+                self._pacer.wait(check=lambda: self.admit(False))
+            while self.admit(True) and self._pacer is not None:
+                # a back-off that began during the wait held this call: its pacer turn is spent, so it takes a new one (the workers
+                # a back-off releases together never charge in one unpaced burst)
+                self._pacer.wait(check=lambda: self.admit(False))
+            with self._lock:                  # the charge and its bookkeeping are atomic; the process itself runs outside the lock
+                # immediately before the charge, under the lock every stopping call halts under and every back-off is published
+                # under: a back-off that began after the admission above holds this call (review F3 of goodqa#16562)
+                if not self.admit(False):
+                    self.port_calls += 1
+                    try:
+                        n = self._budget.charge()   # BEFORE the process; raises BudgetExceeded at the cap, nothing is spawned
+                    except BudgetExceeded as e:
+                        self.on_halt(e)
+                        raise
+                    self.spawned += 1
+            if n is None:
+                self.admit(True)              # outside the lock: wait the back-off out, then a new pacer turn and admission
         self.on_charge(n)                     # journaled before the process: a kill from here on leaves a charged call with no outcome
         ro = self._run(prompt)                # several processes may run at once (the caller bounds how many: `ResilientPort`)
         if isinstance(ro, ApiReply):

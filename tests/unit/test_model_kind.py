@@ -528,6 +528,98 @@ class PacedHalt(unittest.TestCase):
             self.assertIsNone(box.get("err"))
             self.assertEqual((len(turns), up.n, b.count()), (2, 1, 1))   # a new pacer turn, then the one charge
 
+    def backoff_scene(self, tmp):
+        """Review F3 of goodqa#16562: A's first request is throttled and its back-off is held until the test ends it; worker B is
+        watched for its first charge or its first wait at the gate. Returns the counter, the port, the upstream and the events."""
+        ev = {k: threading.Event() for k in ("b_charged", "b_waiting", "in_backoff", "end_backoff")}
+
+        def held(delay):
+            ev["in_backoff"].set()
+            ev["end_backoff"].wait(10)
+        up = Upstream(throttle=(1,))
+        b, port, _ = port_over(self, tmp, up, concurrency=2, sleep=held)
+
+        class Gate(threading.Condition):
+            def wait(self, timeout=None):
+                if threading.current_thread().name == "B":
+                    ev["b_waiting"].set()
+                return super().wait(timeout)
+        port._gate = Gate()
+        append = port.journal.append
+
+        def journal(row):
+            append(row)
+            if row.get("t") == "charged" and threading.current_thread().name == "B":
+                ev["b_charged"].set()
+            hook = getattr(port, "_test_on_row", None)
+            if hook is not None:
+                hook(row)
+        port.journal.append = journal
+        return b, port, up, ev
+
+    @staticmethod
+    def first_of(ev):
+        for _ in range(400):
+            for k in ("b_charged", "b_waiting"):
+                if ev[k].is_set():
+                    return k
+            time.sleep(0.025)
+        return None
+
+    def both_answered_after(self, ev, a, abox, bt, bbox, b, up):
+        ev["end_backoff"].set()
+        a.join(10)
+        bt.join(10)
+        self.assertFalse(a.is_alive() or bt.is_alive())
+        self.assertIsNone(abox.get("err"))
+        self.assertIsNone(bbox.get("err"))
+        self.assertEqual((b.count(), up.n), (3, 3))          # A's throttled request, A's retry and B, each charged once
+
+    def test_no_worker_charges_between_a_throttle_leaving_the_charge_lock_and_its_back_off(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b, port, up, ev = self.backoff_scene(tmp)
+            box = {}
+
+            def on_row(row):
+                # A's throttle has left the charge lock and is recorded; B starts here and must not charge before A's back-off
+                if row.get("t") == "throttled" and threading.current_thread().name == "A" and "bt" not in box:
+                    box["bt"], box["bbox"] = started(lambda: port.scoped("qb").call(Task.ROUTE, route_inputs(2)), "B")
+                    box["first"], box["count"] = self.first_of(ev), b.count()
+            port._test_on_row = on_row
+            a, abox = started(lambda: port.scoped("qa").call(Task.ROUTE, route_inputs(1)), "A")
+            self.assertTrue(ev["in_backoff"].wait(10))
+            self.assertEqual((box["first"], box["count"]), ("b_waiting", 1))
+            self.assertEqual(b.count(), 1)                    # still nothing more during the back-off
+            self.both_answered_after(ev, a, abox, box["bt"], box["bbox"], b, up)
+
+    def test_a_worker_past_its_blocking_admission_does_not_charge_during_a_back_off_that_began_after_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b, port, up, ev = self.backoff_scene(tmp)
+            inner, b_passed, b_go = port._inner, threading.Event(), threading.Event()
+            real = inner.admit
+
+            def admit(block):
+                r = real(block)
+                if block and threading.current_thread().name == "B" and not b_passed.is_set():
+                    b_passed.set()                        # B passed its blocking admission: no back-off then
+                    b_go.wait(10)
+                return r
+            inner.admit = admit
+            turns = []
+
+            class Turns:
+                def wait(self, check=None):
+                    turns.append(threading.current_thread().name)
+            inner._pacer = Turns()
+            bt, bbox = started(lambda: port.scoped("qb").call(Task.ROUTE, route_inputs(2)), "B")
+            self.assertTrue(b_passed.wait(10))
+            a, abox = started(lambda: port.scoped("qa").call(Task.ROUTE, route_inputs(1)), "A")
+            self.assertTrue(ev["in_backoff"].wait(10))       # A was throttled and its back-off has begun
+            b_go.set()                                         # B now reaches the charge lock
+            self.assertEqual((self.first_of(ev), b.count()), ("b_waiting", 1))
+            self.both_answered_after(ev, a, abox, bt, bbox, b, up)
+            self.assertEqual(turns.count("B"), 2)             # held at the lock, B waited the back-off out and took a new turn
+
     def test_every_worker_halted_by_a_pause_sees_its_requested_wait(self):
         with tempfile.TemporaryDirectory() as tmp:
             b, port, _ = port_over(self, tmp, Upstream(), concurrency=2)

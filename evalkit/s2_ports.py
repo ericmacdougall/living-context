@@ -378,7 +378,24 @@ class ResilientPort:
             h = exc if (not self.slots.adaptive or max(attempts, self._bump()) > self._retries) else None
         if h is not None:
             self.halt(h)
+        else:
+            self._begin_backoff()
         return h
+
+    def _begin_backoff(self) -> None:
+        """A back-off of this thread's call is published here, when it is decided (under the inner charge lock when the inner port
+        reports outcomes, review F3 of goodqa#16562): no worker charges from then until `_end_backoff`."""
+        with self._gate:
+            self._backing_off += 1
+        self._tls.backoff = True
+
+    def _end_backoff(self) -> None:
+        """Ends the back-off this thread's call published, if any (after its wait, or on any exception before it)."""
+        if getattr(self._tls, "backoff", False):
+            self._tls.backoff = False
+            with self._gate:
+                self._backing_off -= 1
+                self._gate.notify_all()
 
     def _on_outcome(self, kind: str, exc: BaseException) -> None:
         """Called by the inner port under its charge lock (review F1 of goodqa#16562): the decision is made and published before any
@@ -407,14 +424,17 @@ class ResilientPort:
 
     def _admit(self, block: bool) -> bool:
         """The inner port's admission (review F1): after its pacer wait (`block`, waiting out a back-off too: True when it did),
-        during that wait and immediately before its charge (never blocking: it holds the charge lock then)."""
+        during that wait and immediately before its charge (never blocking: it holds the charge lock then). Not blocking, True
+        means a back-off is in force (review F3 of goodqa#16562): the inner port releases its lock, waits it out, takes a new pacer
+        turn and asks again, uncharged meanwhile."""
         if block:
             return self._wait_gate(inner=True)
         with self._gate:
             err = self._halted()
+            backing_off = self._backing_off > 0
         if err is not None:
             raise NotAdmitted(err)
-        return False
+        return backing_off
 
     def call(self, task: Task, inputs: Mapping[str, Any], *, ctx: Optional[CallContext] = None, scope: Optional[str] = None) -> CallResult:
         """One logical call. A failed BUILD call is asked again, as a new charged call with its own journal key, up to
@@ -458,80 +478,78 @@ class ResilientPort:
             return CallResult(False, error="lost_in_flight")
         attempt = 0
         while True:
-            self._wait_gate()
-            self.slots.acquire()
+            self._tls.backoff = False
             try:
-                self._wait_gate()                 # a halt or back-off may have started while this worker waited for a slot
-                self.journal.append({"t": "pending", "key": key, "task": name, "count_before": self._budget.count(),
-                                     "concurrency": self.slots.limit, "ts": self._clock()})
-                self._tls.key, self._tls.attempt, self._tls.decision = key, attempt, None
+                self._wait_gate()
+                self.slots.acquire()
                 try:
-                    res = self._inner.call(task, inputs, ctx=ctx)
-                except NotAdmitted as e:
-                    # halted or stopped while it waited in the pacer: never charged, never sent; a resume asks it again
-                    self.journal.append({"t": "uncharged", "key": key, "task": name, "error": "halted", "ts": self._clock()})
-                    raise e.exc from None
-                except PortRefused as e:
-                    # a refused prompt is refused before the charge: close the key, so a resume asks it (and refuses it) again
-                    self.journal.append({"t": "uncharged", "key": key, "task": name, "error": "PortRefused", "ts": self._clock()})
-                    raise
-                except AllowanceRefused as e:
-                    with self._lock:
-                        self.limited += 1
-                    self.journal.append({"t": "limited", "key": key, "task": name, "attempt": attempt, "ts": self._clock()})
-                    attempt += 1
-                    if self._decision("refusal", e, attempt) is not None:
-                        raise                     # a fixed concurrency stops at once; an adaptive one after its bounded retries
-                    self.slots.halve("allowance refusal")
-                    paused, retry_after = True, None
-                except StageLimited as e:
-                    # an allowance refusal or a failing CLI: the refused call is not answered, so a resume asks it again (it is charged
-                    # again, honestly); nothing is retried here, and no other worker charges after it
-                    with self._lock:
-                        self.limited += 1
-                    self.journal.append({"t": "limited", "key": key, "task": name, "ts": self._clock()})
-                    self.halt(e)
-                    raise
-                except StagePaused as e:
-                    with self._lock:
-                        self.throttled += 1
-                    self.journal.append({"t": "throttled", "key": key, "task": name, "attempt": attempt, "ts": self._clock()})
-                    attempt += 1
-                    retry_after = getattr(e, "retry_after_s", None)
-                    h = self._decision("throttle", e, attempt)   # above the ceiling, or past max_retries (per call): a halt
-                    if h is e:
+                    self._wait_gate()                 # a halt or back-off may have started while this worker waited for a slot
+                    self.journal.append({"t": "pending", "key": key, "task": name, "count_before": self._budget.count(),
+                                         "concurrency": self.slots.limit, "ts": self._clock()})
+                    self._tls.key, self._tls.attempt, self._tls.decision = key, attempt, None
+                    try:
+                        res = self._inner.call(task, inputs, ctx=ctx)
+                    except NotAdmitted as e:
+                        # halted or stopped while it waited in the pacer: never charged, never sent; a resume asks it again
+                        self.journal.append({"t": "uncharged", "key": key, "task": name, "error": "halted", "ts": self._clock()})
+                        raise e.exc from None
+                    except PortRefused as e:
+                        # a refused prompt is refused before the charge: close the key, so a resume asks it (and refuses it) again
+                        self.journal.append({"t": "uncharged", "key": key, "task": name, "error": "PortRefused", "ts": self._clock()})
                         raise
-                    if h is not None:
-                        raise h from None         # the ceiling pause, with no retry spent
-                    self.slots.halve("throttle")
-                    paused = True
-                except BudgetExceeded as e:
-                    # nothing was charged beyond the cap and nothing is retried; no other worker charges after it
-                    self.journal.append({"t": "uncharged", "key": key, "task": name, "error": "BudgetExceeded", "ts": self._clock()})
-                    self.halt(e)
-                    raise
-                else:
-                    paused = False
+                    except AllowanceRefused as e:
+                        with self._lock:
+                            self.limited += 1
+                        self.journal.append({"t": "limited", "key": key, "task": name, "attempt": attempt, "ts": self._clock()})
+                        attempt += 1
+                        if self._decision("refusal", e, attempt) is not None:
+                            raise                     # a fixed concurrency stops at once; an adaptive one after its bounded retries
+                        self.slots.halve("allowance refusal")
+                        paused, retry_after = True, None
+                    except StageLimited as e:
+                        # an allowance refusal or a failing CLI: the refused call is not answered, so a resume asks it again (it is charged
+                        # again, honestly); nothing is retried here, and no other worker charges after it
+                        with self._lock:
+                            self.limited += 1
+                        self.journal.append({"t": "limited", "key": key, "task": name, "ts": self._clock()})
+                        self.halt(e)
+                        raise
+                    except StagePaused as e:
+                        with self._lock:
+                            self.throttled += 1
+                        self.journal.append({"t": "throttled", "key": key, "task": name, "attempt": attempt, "ts": self._clock()})
+                        attempt += 1
+                        retry_after = getattr(e, "retry_after_s", None)
+                        h = self._decision("throttle", e, attempt)   # above the ceiling, or past max_retries (per call): a halt
+                        if h is e:
+                            raise
+                        if h is not None:
+                            raise h from None         # the ceiling pause, with no retry spent
+                        self.slots.halve("throttle")
+                        paused = True
+                    except BudgetExceeded as e:
+                        # nothing was charged beyond the cap and nothing is retried; no other worker charges after it
+                        self.journal.append({"t": "uncharged", "key": key, "task": name, "error": "BudgetExceeded", "ts": self._clock()})
+                        self.halt(e)
+                        raise
+                    else:
+                        paused = False
+                    finally:
+                        self._tls.key = None
                 finally:
-                    self._tls.key = None
-            finally:
-                self.slots.release()
-            if paused:
-                # the throttled call was charged once by the inner port; the retry below is one new charged call. Every other
-                # worker waits at the gate meanwhile, so a throttle never multiplies into charged retries across workers
-                # only the exponential back-off is capped; Retry-After is a minimum, honoured in full up to the ceiling above
-                delay = max(min(self._max, self._base * (2 ** (attempt - 1))), float(retry_after or 0))
-                with self._gate:
-                    self._backing_off += 1
-                try:
+                    self.slots.release()
+                if paused:
+                    # the throttled call was charged once by the inner port; the retry below is one new charged call. Every other
+                    # worker waits at the gate meanwhile, so a throttle never multiplies into charged retries across workers
+                    # only the exponential back-off is capped; Retry-After is a minimum, honoured in full up to the ceiling above
+                    delay = max(min(self._max, self._base * (2 ** (attempt - 1))), float(retry_after or 0))
+                    # the back-off was published when it was decided (`_decide`); the finally below ends it
                     with self._lock:
                         self.delays.append(delay)
                     self._backoff_wait(delay)
-                finally:
-                    with self._gate:
-                        self._backing_off -= 1
-                        self._gate.notify_all()
-                continue
+                    continue
+            finally:
+                self._end_backoff()       # ends the back-off this try published: after its wait, or on an exception
             with self._lock:
                 self.fresh += 1
                 self._refused = 0
