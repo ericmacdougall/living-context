@@ -13,9 +13,10 @@ each part. The method is experimental and **not proven**; see
 | DESIGNED | Specified in a design document; no code, or only the interfaces it needs. |
 
 The tags were assigned by reading the modules and tests on the two branch lines
-(next section), not from design intent. Tests that need Elasticsearch fail when
-no cluster is configured rather than skipping (see
-[CONTRIBUTING.md](../CONTRIBUTING.md)). The tags record that tests exist; they
+(next section), not from design intent. Run security tests through
+`python tools/run_security.py`, which exits non-zero on any failure, error, skip
+or empty run; under plain `unittest` a few tests skip when no cluster or model
+is configured (see [CONTRIBUTING.md](../CONTRIBUTING.md)). The tags record that tests exist; they
 are not a record of a fresh test run for this document.
 
 **Built is not evaluated.** A BUILT+TESTED component can still be unmeasured.
@@ -37,13 +38,55 @@ lines:
 
 The measured results come from the evaluation line.
 
+## Diagram
+
+The same diagram as a figure is in the [README](../README.md). Solid boxes were
+measured in the pilot; dashed boxes are designed and partly built, not evaluated.
+
+```mermaid
+flowchart TD
+    subgraph WRITE["Write side: structure"]
+        direction TB
+        L["Leaves<br/>size-bounded segments of sessions"]
+        L1["Level-1 summaries<br/>one per group of 16 leaves"]
+        UP["Upper index<br/>summaries of summaries, recursive"]
+        L --> L1 --> UP
+    end
+
+    subgraph READ["Read side: recall for a prompt"]
+        direction TB
+        Q["Prompt"]
+        R["Parallel route fan-out<br/>each index holder (an LLM call) picks<br/>children that may be relevant"]
+        O["Organise<br/>assemble pointers with sizes, no content"]
+        T["Tree list"]
+        F["Flat hybrid list<br/>BM25 + dense, no model calls"]
+        X["RRF fusion"]
+        P["Pointer set returned to the agent"]
+        Q --> R --> O --> T --> X
+        Q --> F --> X
+        X --> P
+    end
+
+    UP -. "index holders answer route calls" .-> R
+    L -. "flat hybrid index" .-> F
+
+    G["Graph cross-links between leaves<br/>(arm A2)"]
+    FB["Feedback: offered / opened / reflected /<br/>reverse audit, then reorganise<br/>adopted only if replay helps"]
+    G -.-> R
+    P -.-> FB
+    FB -.-> WRITE
+
+    classDef designed stroke-dasharray: 5 5,stroke:#888,color:#555;
+    class G,FB designed;
+```
+
 ## Summary
 
 | Component | Status | Evaluated |
 |---|---|---|
 | Ingest (segmentation, write path) | BUILT+TESTED | Used to build the pilot pool; not separately evaluated |
-| Structure: summary tree build and rebuild | BUILT+TESTED | Yes (pilot, via the evaluation harness) |
-| Recall: parallel fan-out | BUILT+TESTED | Yes (arm A1, A1-tree-only, SHUFFLED) |
+| Structure: summary tree build and rebuild | BUILT+TESTED | Build: yes (pilot, via the evaluation harness). Rebuild: no |
+| Recall: parallel fan-out | BUILT+TESTED | Ranking yes (arm A1, A1-tree-only, SHUFFLED); the parallel execution was not exercised or timed in the pilot |
 | Recall: flat hybrid search and RRF fusion | BUILT+TESTED | Yes (arm A0, and the fusion in A1) |
 | Graph cross-links | BUILT+TESTED (on the stub) | **No** (H2 not measured) |
 | Feedback: protocol log, reflection, reverse audit | BUILT+TESTED (on the stub) | **No** (H3, H4 not measured) |
@@ -93,8 +136,10 @@ labels, and a failed call falls back to embedding routing and is flagged. The
 parent merges pointers and sums sizes in code, and an "organise" step assembles
 the pointer set. What leaves is a pointer contract (ids, sizes, paths), not
 content. A reader of several access classes gets one digest per class, merged by
-reciprocal rank. Modules: `living_context/recall/` (`fanout.py`, `entry.py`,
-`digest.py`, `lookup.py`, `view.py`).
+reciprocal rank. Organise output shapes the outline only; it does not change the
+ranked list. The embedding fallback uses the stub embedder. Modules:
+`living_context/recall/` (`fanout.py`, `entry.py`, `digest.py`, `lookup.py`,
+`view.py`).
 
 ### Flat hybrid search and fusion: BUILT+TESTED
 
