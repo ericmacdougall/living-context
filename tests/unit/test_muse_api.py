@@ -4,6 +4,7 @@ keys below are recognisable strings in temporary files; the tests assert they ap
 import json
 import os
 import re
+import sys
 import tempfile
 import threading
 import time
@@ -23,7 +24,9 @@ OR_KEY = "sk-or-v1-" + "fa1e" * 16
 KEYS = {"meta": META_KEY, "openrouter": OR_KEY}
 MODELS = {"meta": "muse-spark-1.3-contributor", "openrouter": "meta/muse-spark-1.3-contributor"}
 PATHS = {"meta": "/v1/chat/completions", "openrouter": "/api/v1/chat/completions"}
-SECRETS = (META_KEY, OR_KEY, ma.LOOPBACK_DUMMY_KEY)
+SECRET_VALUE = "sk-or-v1-" + "5ec7e7a1" * 8                 # what the fake gcloud prints
+SECRETS = (META_KEY, OR_KEY, ma.LOOPBACK_DUMMY_KEY, SECRET_VALUE)
+PROJECT, SECRET_NAME = "example-project-123", "EXAMPLE_SECRET_NAME"      # placeholders, never a real project or secret
 CTX = CallContext("t", "base", "px", ("base",))
 JUDGE = {"query": "q", "text": "t"}
 
@@ -110,7 +113,7 @@ def completion(text, model, *, prompt_tokens=120, cached=20, completion_tokens=3
 
 def err_body(status, *, etype="server_error", code=None, metadata=None, message=None):
     # the stub plants every secret in the server's own text: none of it may come back out of the port
-    e = {"message": message or ("leak? %s %s %s" % SECRETS), "type": etype, "param": None, "code": code if code is not None else status}
+    e = {"message": message or ("leak? " + " ".join(SECRETS)), "type": etype, "param": None, "code": code if code is not None else status}
     if metadata:
         e["metadata"] = metadata
     return json.dumps({"error": e}).encode()
@@ -412,9 +415,10 @@ class Responses(Base):
         self.assertFalse(THROTTLE.search(ro.stdout) or LIMIT.search(ro.stdout) or THROTTLE.search(ro.stderr) or LIMIT.search(ro.stderr))
 
     def test_secrets_the_server_echoes_in_any_field_are_scrubbed(self):
-        # the stub echoes both fake file keys and the dummy into the answer text, the id, the model and the error identifiers
-        echo = " ".join(SECRETS)
+        # the stub echoes the port's own file key and the dummy into the answer text (where only those exact strings are scrubbed),
+        # and either provider's key into the id, the model and the error identifiers (where every key shape is scrubbed)
         for pv in self.each():
+            echo = "%s %s" % (KEYS[pv], ma.LOOPBACK_DUMMY_KEY)
             cases = [
                 lambda *a: (200, {}, completion("answer " + echo, MODELS[pv], extra={"id": OR_KEY})),
                 lambda *a: (200, {}, completion("x", OR_KEY)),
@@ -426,7 +430,22 @@ class Responses(Base):
             for reply in cases:
                 ro, env, _ = self.run_one(pv, reply)          # run_one asserts no secret in stdout, stderr, repr or argv
             ro, env, _ = self.run_one(pv, cases[0])
-            self.assertEqual(env["result"], "answer " + " ".join([ma.REDACTED] * 3))
+            self.assertEqual(env["result"], "answer " + " ".join([ma.REDACTED] * 2))
+
+    def test_an_answer_with_key_like_words_comes_back_unchanged_and_parses(self):
+        text = '{"answer": "the ring bearer Frodo; a pallbearer at risk-or-reward; llm_config LLM_ sk-or- Bearer"}'
+        for pv in self.each():
+            ro, env, _ = self.run_one(pv, lambda *a: (200, {}, completion(text, MODELS[pv])))
+            self.assertEqual((ro.rc, env["result"]), (0, text))
+
+    def test_a_plain_error_whose_latency_reads_429_is_not_read_as_a_throttle(self):
+        p = ma.MusePort(self.files["meta"], _loopback_test_port=9)
+        env = p._error_env("http_500", http_status=500, error_type="server_error")
+        with mock.patch.object(ma.time, "monotonic", return_value=0.4295):
+            ro = p._finish(env, 0.0, None)
+        out = json.loads(ro.stdout)
+        self.assertEqual((ro.rc, out["error"], out["duration_ms"], out["muse"].get("withheld")), (1, "http_500", None, True))
+        self.assertFalse(THROTTLE.search(ro.stdout) or LIMIT.search(ro.stdout) or THROTTLE.search(ro.stderr))
 
     def test_every_fixed_error_phrase_is_inert(self):
         for err in ("redirect_refused", "response_too_large", "malformed_json", "missing_choices", "missing_message", "provider_error",
@@ -485,6 +504,112 @@ class ThroughCappedPort(Base):
                 p.call(Task.JUDGE_RELEVANCE, JUDGE, ctx=CTX)
             log = (Path(d) / "calls.jsonl").read_text()
             self.assertEqual(leaks(log), [])
+
+
+# ---- the Secret Manager source (a fake gcloud in a temp dir) ------------------------------------------------------------
+FAKE_GCLOUD = '''#!%s
+import json, sys, time
+from pathlib import Path
+d = Path(__file__).parent
+with open(d / "calls.log", "a") as f:
+    f.write(json.dumps(sys.argv[1:]) + "\\n")
+cfg = json.loads((d / "mode.json").read_text())
+sys.stdout.write(cfg.get("stdout", "")); sys.stdout.flush()
+sys.stderr.write(cfg.get("stderr", "")); sys.stderr.flush()
+time.sleep(cfg.get("sleep", 0))
+sys.exit(cfg.get("rc", 0))
+'''
+
+
+class KeySecret(Base):
+    def setUp(self):
+        super().setUp()
+        ma._clear_secret_cache()
+        self.addCleanup(ma._clear_secret_cache)
+        self.gdir = self.kd.root / "bin"
+        self.gdir.mkdir()
+        self.gcloud = self.gdir / "gcloud"
+        self.gcloud.write_text(FAKE_GCLOUD % sys.executable)
+        os.chmod(self.gcloud, 0o700)
+        self.mode(stdout=SECRET_VALUE + "\n")
+
+    def mode(self, **cfg):
+        (self.gdir / "mode.json").write_text(json.dumps(cfg))
+
+    def calls(self):
+        p = self.gdir / "calls.log"
+        return [json.loads(l) for l in p.read_text().splitlines()] if p.exists() else []
+
+    def make(self, provider="openrouter", **kw):
+        kw.setdefault("key_secret", (PROJECT, SECRET_NAME))
+        kw.setdefault("gcloud", str(self.gcloud))
+        return ma.MusePort(provider=provider, **kw)
+
+    def refused(self, *words, **kw):
+        with self.assertRaises(ma.MuseConfigError) as cm:
+            self.make(**kw)
+        for w in words:
+            self.assertIn(w, str(cm.exception))
+        self.assertEqual(exc_leaks(cm.exception), [])
+        self.assertNotIn(PROJECT, str(cm.exception))
+        self.assertNotIn(SECRET_NAME, str(cm.exception))
+        return cm.exception
+
+    def test_the_value_is_fetched_with_a_fixed_argv_and_sent_only_to_the_providers_host(self):
+        p = self.make()
+        self.assertEqual(self.calls(), [["secrets", "versions", "access", "latest", "--secret", SECRET_NAME, "--project", PROJECT,
+                                         "--quiet"]])
+        self.assertEqual(leaks(repr(p), p.argv(), vars(p), (self.gdir / "calls.log").read_text(), dict(os.environ)), [])
+        self.assertNotIn(PROJECT, " ".join(p.argv()))
+        seen = []
+
+        def fake_open(req, timeout):
+            seen.append((req.full_url, req.get_header("Authorization")))
+            raise TimeoutError("not sent")
+        with mock.patch.object(p, "_open", side_effect=fake_open):
+            ro = p("hello")
+        self.assertEqual(seen, [("https://openrouter.ai/api/v1/chat/completions", "Bearer " + SECRET_VALUE)])
+        self.assertClean(ro, p)
+
+    def test_the_value_is_fetched_once_per_process(self):
+        with Stub(lambda *a: (200, {}, completion("ok", MODELS["openrouter"]))) as s:
+            ports = [self.make(_loopback_test_port=s.port) for _ in range(3)]
+            outs = [ports[i % 3]("q%d" % i) for i in range(6)]
+        self.assertEqual(len(self.calls()), 1)
+        for ro in outs:
+            self.assertEqual(json.loads(ro.stdout)["result"], "ok")
+            self.assertClean(ro)
+        self.assertEqual({r["headers"]["Authorization"] for r in s.requests}, {"Bearer " + ma.LOOPBACK_DUMMY_KEY})
+
+    def test_a_failing_gcloud_reports_only_its_exit_code(self):
+        self.mode(stdout=SECRET_VALUE, stderr="ERROR: %s %s %s" % (SECRET_VALUE, PROJECT, SECRET_NAME), rc=3)
+        self.refused("exited with code 3")
+
+    def test_a_hanging_gcloud_times_out_without_its_partial_output(self):
+        self.mode(stdout=SECRET_VALUE + "\n", sleep=5)
+        self.refused("timed out", secret_timeout=0.5)
+
+    def test_a_value_for_another_provider_or_not_one_key_is_refused(self):
+        self.mode(stdout=META_KEY + "\n")
+        self.refused("expected prefix")                                  # a Meta key is never sent to OpenRouter
+        self.mode(stdout=OR_KEY + "\n")
+        self.refused("expected prefix", provider="meta")
+        for out in ("", "\n", "%s\n%s\n" % (SECRET_VALUE, SECRET_VALUE), SECRET_VALUE + " trailing words"):
+            self.mode(stdout=out)
+            self.refused()
+
+    def test_the_source_arguments_are_checked(self):
+        with self.assertRaises(ma.MuseConfigError):
+            ma.MusePort(self.files["openrouter"], provider="openrouter", key_secret=(PROJECT, SECRET_NAME), gcloud=str(self.gcloud))
+        with self.assertRaises(ma.MuseConfigError):
+            ma.MusePort(provider="openrouter")
+        for ks in ((PROJECT,), ("Bad_Project", SECRET_NAME), (PROJECT, "bad name"), (PROJECT, "a/b"), "x"):
+            with self.subTest(ks=ks):
+                self.refused(key_secret=ks)
+        self.refused("absolute path", gcloud="gcloud")
+        os.chmod(self.gcloud, 0o600)
+        self.refused("absolute path")
+        self.assertEqual(self.calls(), [])
 
 
 # ---- threads ---------------------------------------------------------------------------------------------------------

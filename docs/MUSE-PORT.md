@@ -62,6 +62,14 @@ whether a quota sent as a 429 can be told apart from an ordinary throttle (it ca
   with one bare key or one `NAME=value` line (`export` and quotes allowed, `#` comments ignored). The key must start with the
   provider's prefix (`LLM_` for Meta, `sk-or-v1-` for OpenRouter), so a key file for one provider is refused for the other, at
   construction and at every call. Errors name the path and the reason, never the contents.
+- **Secret Manager source.** Instead of `key_file`, `key_secret=(<project>, <secret name>)` with `gcloud=<absolute path to
+  gcloud>`; exactly one of the two sources is accepted. Both names are given at run time and are not in any committed file. The
+  port runs `gcloud secrets versions access latest --secret <name> --project <project> --quiet` as a child process with that
+  fixed argument vector, no shell and stdin closed, once per process (later ports and calls use an in-memory module cache, not
+  an attribute of the object). Its stdout is checked like a key file's contents (one key, the provider's prefix, a key's
+  characters); its stderr is discarded unread. A failure reports only the exit code or a fixed phrase ("gcloud timed out",
+  "gcloud could not be started"), never the child's output, the project or the secret name. The key is never on an argument
+  vector or in the environment. `argv()` records only `key_source: secret_manager`.
 - **Key exposure.** The key goes only into the Authorization header of the HTTPS request to the selected host. The opener has
   no proxy handler and no redirect handler (a 3xx is an error and is not followed) and uses the default verified TLS context.
   Every string the port returns is scrubbed of the key, of the test dummy and of anything shaped like a Meta or OpenRouter key
@@ -107,6 +115,9 @@ A `null` content or a `length` stop is an empty `result` (a parse failure in Cap
 from evalkit import muse_api
 runner = muse_api.MusePort(key_file, model=None, timeout=240.0, provider="meta",   # or "openrouter"
                            max_tokens=<stated per stage>, reasoning_effort=<stated per stage>)
+# or, with the key in Secret Manager (names passed at run time, for example from flags, never committed):
+runner = muse_api.MusePort(model=None, timeout=240.0, provider="openrouter", key_secret=(project, secret_name),
+                           gcloud=shutil.which("gcloud"), max_tokens=<stated per stage>, reasoning_effort=<stated per stage>)
 port = claude_cli.CappedPort(runner, budget, run_dir / "calls.jsonl", model_id=runner.model, argv_record=runner.argv())
 ```
 
@@ -124,7 +135,16 @@ Python 3.11 or later (the package uses `tomllib`), from the repository root, wit
 python3 -c 'import json, sys; from evalkit.muse_api import MusePort; r = MusePort(sys.argv[1], provider=sys.argv[2], max_tokens=256, reasoning_effort="low")("Reply with exactly {\"ok\": true}"); e = json.loads(r.stdout); print(r.rc, r.stderr, e["result"], e["model"], e["usage"], e["muse"])' <key file> meta
 ```
 
+With the OpenRouter key in Secret Manager:
+
+```sh
+python3 -c 'import json, shutil, sys; from evalkit.muse_api import MusePort; r = MusePort(provider="openrouter", key_secret=(sys.argv[1], sys.argv[2]), gcloud=shutil.which("gcloud"), max_tokens=256, reasoning_effort="low")("Reply with exactly {\"ok\": true}"); e = json.loads(r.stdout); print(r.rc, r.stderr, e["result"], e["model"], e["usage"], e["muse"])' <project> <secret name>
+```
+
 Expected: rc 0, an empty stderr, `{"ok": true}`, the model id, non-zero token counts. This call is not charged to a stage counter.
+Two things only the pilot settles: whether Meta's API echoes the requested model id exactly (if not, every call is
+`model_mismatch`; `accept_response_models` is the remedy once the reported id is known), and whether OpenRouter accepts the
+`meta` provider slug and the routing block (a persistent 503 there is a routing problem that reads as a throttle).
 
 ## Tests
 
@@ -133,7 +153,9 @@ answer, 429, 503, 402 and OpenRouter's in-flight and budget refusals, 5xx, malfo
 a wrong model, a null answer, a timeout, every 3xx (and that no second request arrives), foreign and plain-http base URLs, the key
 file checks, a key file of one provider refused for the other (also when the file is swapped after construction), server text
 that imitates a throttle, the throttle, limit and failure-streak paths through the real `CappedPort`, secrets the server echoes in
-any field, and 16 threads each getting their own answer. Breaking the host check, the redirect refusal or the scrubbing turns the
+any field, a key-like answer left intact, the Secret Manager source with a fake gcloud in a temporary directory (fixed argument
+vector, one fetch per process, a failing, hanging or wrong-provider fetch, the value in no exception, repr, argv, log or
+environment), and 16 threads each getting their own answer. Breaking the host check, the redirect refusal or the scrubbing turns the
 suite red.
 
 ## Limits

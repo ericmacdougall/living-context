@@ -21,9 +21,13 @@ One request per call, no retries (the runner owns retry, back-off, the call cap 
 system's default TLS verification. Thread-safe: no state is shared between calls (each call reads the key file and builds its own
 opener).
 
-The API key: read from `key_file` inside this process, at construction (to refuse a bad file before any work) and again at every
-call (it is never kept on the object). The file must be a regular file (not a symlink), owned by the running user, mode 0600 or
-narrower, holding one bare key or one `NAME=value` line whose value starts with the selected provider's key prefix. The key goes
+The API key comes from exactly one of two sources. `key_file`: read inside this process at construction (to refuse a bad file
+before any work) and again at every call (it is never kept on the object); the file must be a regular file (not a symlink),
+owned by the running user, mode 0600 or narrower, holding one bare key or one `NAME=value` line whose value starts with the
+selected provider's key prefix. `key_secret=(project, secret name)`, both given at run time and never committed: the gcloud CLI
+(`gcloud`, an absolute path) runs once per process as a child with a fixed argument vector and no shell (`secrets versions access
+latest`), its stdout is held in memory only (a module-level cache, not the object) and checked like a key file's contents, its
+stderr is discarded unread, and a failure reports only the exit code or a fixed phrase. The key goes
 only into the Authorization header of an HTTPS request to the selected provider's fixed host. It never appears in an exception,
 repr, return value, log line, journal field, environment variable, process argument or file; every string this module returns is
 scrubbed of it. The `_loopback_test_port` mode exists only for the unit tests' stub server on 127.0.0.1: it sends a fixed dummy
@@ -36,8 +40,11 @@ import json
 import os
 import re
 import socket
+import shutil
 import ssl
 import stat
+import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -60,7 +67,8 @@ _KEY_CHARS = re.compile(r"[A-Za-z0-9._~+/=-]{8,512}")
 _ASSIGN = re.compile(r"(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)")
 _MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:-]{0,127}")
 _IDENT = re.compile(r"[A-Za-z0-9_.:/-]{1,128}")
-_KEYISH = re.compile(r"(?i)bearer\s+\S+|LLM_[A-Za-z0-9._~+/=-]+|sk-or-[A-Za-z0-9._~+/=-]+")
+# key shapes, case-sensitive and anchored to the documented forms; applied to server-supplied identifiers, never to the answer
+_KEYISH = re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]+|\bLLM_[0-9]+_[A-Za-z0-9._~+/=-]+|\bsk-or-v1-[A-Za-z0-9]+")
 
 # The fixed phrases CappedPort reads (tests assert each matches the regex it must and not the other).
 MSG_THROTTLED = "muse api %s: rate limit or overloaded (throttled)"
@@ -106,6 +114,11 @@ class KeyFileError(MuseConfigError):
     """A refused key file. The message names the path and the reason, never the contents."""
 
 
+class KeySecretError(MuseConfigError):
+    """A refused or failed Secret Manager fetch. The message carries only an exit code or a fixed phrase: never the child's
+    output, the project id or the secret name."""
+
+
 # ---- the key file -----------------------------------------------------------------------------------------------------
 def _load_key(path: Path, prefix: str) -> Tuple[Optional[str], str]:
     """(key, "") or (None, reason). Returns instead of raising so that no frame of a raised exception holds the file's bytes."""
@@ -129,6 +142,11 @@ def _load_key(path: Path, prefix: str) -> Tuple[Optional[str], str]:
         data = os.read(fd, MAX_KEY_FILE_BYTES + 1)
     finally:
         os.close(fd)
+    return _parse_key(data, prefix)
+
+
+def _parse_key(data: bytes, prefix: str) -> Tuple[Optional[str], str]:
+    """One bare key or one NAME=value line, with the provider's prefix and a key's characters. (key, "") or (None, reason)."""
     try:
         text = data.decode("ascii")
     except UnicodeDecodeError:
@@ -162,12 +180,67 @@ def _load_key(path: Path, prefix: str) -> Tuple[Optional[str], str]:
     return key, ""
 
 
+# ---- the Secret Manager source -----------------------------------------------------------------------------------------
+_PROJECT_ID = re.compile(r"[a-z][a-z0-9-]{4,28}[a-z0-9]")
+_SECRET_NAME = re.compile(r"[A-Za-z0-9_-]{1,255}")
+_SECRET_CACHE: Dict[Tuple[str, str, str, str], str] = {}      # fetched once per process, held in memory only
+_SECRET_LOCK = threading.Lock()
+
+
+def gcloud_argv(gcloud: str, project: str, secret: str) -> List[str]:
+    """The fixed argument vector (no shell). It names the secret, never holds its value."""
+    return [gcloud, "secrets", "versions", "access", "latest", "--secret", secret, "--project", project, "--quiet"]
+
+
+def _fetch_secret(gcloud: str, project: str, secret: str, prefix: str, timeout: float) -> Tuple[Optional[str], str]:
+    """(key, "") or (None, reason). The child's stdout is held in memory only; its stderr is discarded unread; neither reaches
+    the reason, which carries only an exit code or a fixed phrase. Nothing is raised from a frame that holds the value."""
+    cache_key = (gcloud, project, secret, prefix)
+    with _SECRET_LOCK:
+        if cache_key in _SECRET_CACHE:
+            return _SECRET_CACHE[cache_key], ""
+        why = ""
+        out = b""
+        try:
+            r = subprocess.run(gcloud_argv(gcloud, project, secret), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, shell=False, timeout=timeout, check=False)
+            rc, out = r.returncode, r.stdout
+            del r
+        except subprocess.TimeoutExpired:
+            rc, why = None, "gcloud timed out"            # the exception holds partial output: it is dropped with the handler
+        except OSError:
+            rc, why = None, "gcloud could not be started"
+        if why:
+            return None, why
+        if rc != 0:
+            del out
+            return None, "gcloud exited with code %d" % rc
+        if len(out) > MAX_KEY_FILE_BYTES:
+            del out
+            return None, "the secret is larger than %d bytes" % MAX_KEY_FILE_BYTES
+        key, why = _parse_key(out, prefix)
+        del out
+        if why:
+            return None, "the secret value " + why
+        _SECRET_CACHE[cache_key] = key
+        return key, ""
+
+
+def _clear_secret_cache() -> None:
+    """For the unit tests only."""
+    with _SECRET_LOCK:
+        _SECRET_CACHE.clear()
+
+
 # ---- the port ---------------------------------------------------------------------------------------------------------
 class MusePort:
-    def __init__(self, key_file, model: Optional[str] = None, base_url: Optional[str] = None, timeout: float = 240.0, *,
-                 provider: str = "meta", max_tokens: Optional[int] = None, reasoning_effort: Optional[str] = None,
+    def __init__(self, key_file=None, model: Optional[str] = None, base_url: Optional[str] = None, timeout: float = 240.0, *,
+                 provider: str = "meta", key_secret: Optional[Tuple[str, str]] = None, gcloud: Optional[str] = None,
+                 secret_timeout: float = 60.0, max_tokens: Optional[int] = None, reasoning_effort: Optional[str] = None,
                  response_format: Optional[str] = None, accept_response_models: Tuple[str, ...] = (),
                  _loopback_test_port: Optional[int] = None):
+        if (key_file is None) == (key_secret is None):
+            raise MuseConfigError("give exactly one of key_file or key_secret")
         if provider not in PROVIDERS:
             raise MuseConfigError("provider must be one of %s" % sorted(PROVIDERS))
         self.provider = PROVIDERS[provider]
@@ -204,11 +277,41 @@ class MusePort:
                 raise MuseConfigError("accept_response_models holds an invalid model id")
         self.accepted_models = frozenset((self.model,) + tuple(p.response_aliases.get(self.model, ())) + tuple(accept_response_models))
         self._ssl = ssl.create_default_context()          # verified TLS; one context shared read-only by every call's opener
-        self._key_file = Path(key_file)
-        key, why = _load_key(self._key_file, p.key_prefix)
-        key = None                                          # checked here, read again at every call, never kept
-        if why:
-            raise KeyFileError("key file %s: %s" % (self._key_file, why))
+        self._key_file: Optional[Path] = None
+        self._secret: Optional[Tuple[str, str, str, float]] = None
+        if key_file is not None:
+            self._key_file = Path(key_file)
+            key, why = _load_key(self._key_file, p.key_prefix)
+            key = None                                      # checked here, read again at every call, never kept
+            if why:
+                raise KeyFileError("key file %s: %s" % (self._key_file, why))
+        else:
+            self._secret = self._check_secret_source(key_secret, gcloud, secret_timeout)
+            key, why = _fetch_secret(*self._secret[:3], p.key_prefix, self._secret[3])
+            key = None                                      # held in the module's in-memory cache only, never on the object
+            if why:
+                raise KeySecretError("key secret: %s" % why)
+
+    @staticmethod
+    def _check_secret_source(key_secret, gcloud, secret_timeout) -> Tuple[str, str, str, float]:
+        if not (isinstance(key_secret, (tuple, list)) and len(key_secret) == 2 and all(isinstance(x, str) for x in key_secret)):
+            raise KeySecretError("key_secret must be a (project id, secret name) pair")
+        project, secret = key_secret
+        if not _PROJECT_ID.fullmatch(project):
+            raise KeySecretError("key_secret: the project id is not a valid project id")
+        if not _SECRET_NAME.fullmatch(secret):
+            raise KeySecretError("key_secret: the secret name is not a valid secret name")
+        exe = gcloud if gcloud is not None else shutil.which("gcloud")
+        if not exe or not os.path.isabs(exe) or not os.path.isfile(exe) or not os.access(exe, os.X_OK):
+            raise KeySecretError("key_secret: the gcloud executable must be an absolute path to an executable file")
+        if not (isinstance(secret_timeout, (int, float)) and not isinstance(secret_timeout, bool) and 0 < secret_timeout <= 600):
+            raise KeySecretError("secret_timeout must be a number of seconds above 0 and at most 600")
+        return exe, project, secret, float(secret_timeout)
+
+    def _key(self) -> Tuple[Optional[str], str]:
+        if self._key_file is not None:
+            return _load_key(self._key_file, self.provider.key_prefix)
+        return _fetch_secret(*self._secret[:3], self.provider.key_prefix, self._secret[3])
 
     def _check_base_url(self, base_url: str) -> None:
         p = self.provider
@@ -249,7 +352,8 @@ class MusePort:
         r = self.request_body("")
         r.pop("messages")
         r.update(api=API_ARGV0, provider=self.provider.name, host=self.provider.host, endpoint=self.provider.base_path + "/chat/completions",
-                 accepted_response_models=sorted(self.accepted_models), timeout_s=self.timeout, loopback_test=self._loopback is not None)
+                 accepted_response_models=sorted(self.accepted_models), timeout_s=self.timeout, loopback_test=self._loopback is not None,
+                 key_source="file" if self._key_file is not None else "secret_manager")    # the kind only: no path, project or name
         return r
 
     def argv(self) -> List[str]:
@@ -275,7 +379,7 @@ class MusePort:
         key: Optional[str] = None
         req = None
         try:
-            key, why = _load_key(self._key_file, self.provider.key_prefix)
+            key, why = self._key()
             if why:
                 return self._finish(self._error_env("key_file_unavailable"), t0, key)
             send = LOOPBACK_DUMMY_KEY if self._loopback is not None else key
@@ -429,11 +533,23 @@ class MusePort:
 
     # ---- the RunOut, scrubbed and consistent with CappedPort's reading ----
     @staticmethod
-    def _scrub(s: str, key: Optional[str]) -> str:
+    def _scrub(s: str, key: Optional[str], shapes: bool = True) -> str:
+        """The exact file key and the test dummy always; key-shaped strings too unless `shapes` is off (the model's answer)."""
         for secret in (key, LOOPBACK_DUMMY_KEY):
             if secret:
                 s = s.replace(secret, REDACTED)
-        return _KEYISH.sub(REDACTED, s)
+        return _KEYISH.sub(REDACTED, s) if shapes else s
+
+    @classmethod
+    def _scrub_env(cls, v: Any, key: Optional[str], shapes: bool = True) -> Any:
+        """Scrub every string of the envelope before it is serialised (never the JSON text, which a pattern could break)."""
+        if isinstance(v, dict):
+            return {cls._scrub(str(k), key): cls._scrub_env(x, key, shapes and k != "result") for k, x in v.items()}
+        if isinstance(v, list):
+            return [cls._scrub_env(x, key, shapes) for x in v]
+        if isinstance(v, str):
+            return cls._scrub(v, key, shapes)
+        return v
 
     def _finish(self, env: Dict[str, Any], t0: float, key: Optional[str]) -> RunOut:
         latency = time.monotonic() - t0
@@ -447,7 +563,7 @@ class MusePort:
             stderr = MSG_ERROR % env["error"]
         else:
             stderr = ""
-        stdout = self._scrub(json.dumps(env, sort_keys=True), key)
+        stdout = json.dumps(self._scrub_env(env, key), sort_keys=True)
         plain_error = env["is_error"] and not env["throttled"] and not env["limited"]
         misread = lambda s: bool(THROTTLE.search(s) or LIMIT.search(s))
         if plain_error and misread(stdout):
@@ -456,10 +572,10 @@ class MusePort:
             for k in ("error_type", "error_code", "limit_source", "response_model"):
                 if env["muse"].get(k) is not None:
                     env["muse"][k] = "withheld"
-            stdout = self._scrub(json.dumps(env, sort_keys=True), key)
+            stdout = json.dumps(self._scrub_env(env, key), sort_keys=True)
             if misread(stdout):
                 env = self._env(error=env["error"], muse={"withheld": True})
                 env.pop("_rc")
                 env["duration_ms"] = None
-                stdout = self._scrub(json.dumps(env, sort_keys=True), key)
+                stdout = json.dumps(self._scrub_env(env, key), sort_keys=True)
         return RunOut(rc, stdout, self._scrub(stderr, key), latency)
