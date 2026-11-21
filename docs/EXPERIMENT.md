@@ -1382,3 +1382,83 @@ The rest of 10.3 (S6-H2 and the loop stages) is not restated here.
   their order. The stamped run is the stage's one stamped run. It reads the freeze and the release as registered, attaches to the
   prebuilt tenant and tree and builds nothing again; its ledger equals that of a run without the early build (tested, including an
   early build stopped halfway through its build and continued at another concurrency).
+
+### 14.6 DEVIATION (model): S3 restarts and S6-H1 runs on Muse Spark through OpenRouter (2026-11-20)
+
+- Registered: S2, S3 and S6-H1 call Claude Sonnet through the headless Claude Code CLI on the subscription (10.2, 10.3, 14.2,
+  14.3). S3 started as one stamped run on that model (14.4).
+- Amended: S3 restarts from scratch as a new stamped run, in a new run directory on a new tenant, and S6-H1 (the early build of
+  14.5 and the question run) runs on Meta's Muse Spark, requested as `meta/muse-spark-1.3-contributor` through OpenRouter, with
+  the provider pinned to Meta and no fallback (`--model-kind muse --provider openrouter`; the port also supports Meta's own API,
+  `--provider meta`). Reason: the run host's subscription allowance ran out after 4,621 S3 calls (LIMIT_REACHED; 32 questions
+  recorded), and the owner decided on 2026-11-20 to move the H1 runs to this model.
+- The Sonnet runs:
+  - The Sonnet S3 run is kept as a record (run directory, tenant, calls, journal and ledger untouched). It is not resumed and not
+    analysed, and it decides nothing.
+  - S2 (Sonnet) stays an exploratory development figure (14.3) and is not rerun. Its measured calls per recall feed the call
+    estimate only.
+- Model facts (SOURCE: openrouter.ai/docs and dev.meta.ai, read on 2026-11-20 by the port's owner, docs/MUSE-PORT.md; not
+  measured here):
+  - API: OpenAI-compatible chat completions; OpenRouter's endpoint for this model has Meta as its only provider.
+  - Limits: Meta's Contributor limits are 150 requests and 3,000,000 tokens per minute per model, shared by the whole team, so
+    requests per minute bind. About 42,000 calls need at least about 5 hours at 140 per minute. OpenRouter documents no limit of
+    its own for this model.
+  - Errors: 429 with Retry-After; 402 for billing or credits (OpenRouter's in-flight budget 402 clears by waiting); OpenRouter's
+    403 with a limit source for a key budget; 503 with Retry-After; 504 for a long request.
+  - Price (list): USD 0.10 per million input tokens and 0.20 per million output tokens; reasoning tokens are billed as output.
+  - Reasoning effort: the provider's default is "high"; "max" is not available on this model.
+  - Data use: in the Contributor mode the provider may use the inputs to train its models. Only the public benchmark
+    (LongMemEval-S) is sent; no private data.
+- Registered settings (main's ASSUMPTION of 2026-11-20, chosen from the pilot's cost and latency, without any accuracy data):
+  `--reasoning-effort medium --max-tokens 16384 --rpm 140`, the 140 split between S3 and the early build while both run. Both
+  model settings are part of the model's identity: a resume, an early-build rerun or a stamped run with another value is refused.
+- Pilot (MEASURED by main on the run host at commit 22ec07c, practice data only, no registered question, no stage counter; 72
+  real calls through OpenRouter at max tokens 16,384, 6 and 8 at once): every call ended with finish reason `stop` and valid JSON,
+  reported model `meta/muse-spark-1.3-contributor`, no throttle.
+
+  | effort | task | latency p50 | completion tokens p50 / max | reasoning tokens p50 |
+  |---|---|---|---|---|
+  | low | build_l1 | 10.0 s | 2,194 / 2,576 | 497 |
+  | low | route | 2.3 s | 328 / 814 | |
+  | medium | build_l1 | 15.4 s | 2,955 / 3,827 | 1,404 |
+  | medium | route | 3.1 s | 540 / 2,024 | |
+
+  The output limit of 16,384 is more than 4 times the largest completion seen (3,827, reasoning included).
+- Cost and credit: the estimated cost at the registered settings is about USD 30, against an API key labelled with a USD 25 budget.
+  A credit or budget refusal (402, or OpenRouter's 403 with a limit source) stops the stage at once (LIMIT_REACHED). The refused
+  call is journaled as refused and asked again on the resume after the credit is raised; it is not a result, and no question is
+  recorded from it.
+- Run control (`evalkit.model_kind`, docs/RUN-S6H1.md):
+  - Pacing: one pacer per run spaces request starts at `--rpm` per minute. The registered ceiling is 140, under the upstream 150.
+    Runs at the same time split it: S3 and the early build sum to at most 140.
+  - Retries: a 429, a 503 or OpenRouter's in-flight 402 backs off for at least its Retry-After and is asked again, up to
+    `--max-retries` times per call. Each retry is one charged call, inside the cap. A throttle is not a failure of the
+    five-failure streak.
+  - Stops: a billing or budget refusal stops the stage at once, never retried. So does a response that reports another model than
+    the one requested (or its pinned snapshot name).
+  - Failed calls: a 504, a timeout, any other error, and an answer cut short by the output limit (finish reason `length`) are failed
+    calls: never an answer, counted in the five-failure streak, and handled by the product's own fallback like any failed call.
+  - Records: every call row records the HTTP status, the prompt, completion, reasoning and cached token counts, the reported model,
+    the upstream provider, the finish reason and the cost. STAMP.json, PREBUILD.json and every ledger row record the model kind,
+    the provider, the requested model, the reasoning effort and the output limit; the stamp also records the port's fixed request
+    fields, `--rpm` and the request timeout. STATE.json records the reported models and upstream providers.
+  - Key: the API key is read by the port inside the run process, from a key file or a secret manager named at run time only. It
+    is in no file of the repository or of a run directory.
+  - Concurrency: the rules of 14.4 apply unchanged (adaptive, under `--concurrency`).
+- Fallbacks under load (review finding F7): with a real model, a timeout or a port error under load becomes a route fallback inside
+  a finished question, so a result could depend on the concurrency. Every ledger row records, per arm (A1 and SHUFFLED), the
+  timeouts, the port errors and the invalid answers of that question's recall, beside its fallbacks. The report states the
+  fallback rate per arm and lists every question with any timeout or port-error fallback.
+- What changes: the model under test for H1. The system prompt, the user messages and the response schemas are unchanged. The
+  CLI invocation is replaced by the API parameters recorded in every call row. The per-call figures of 14.2 are Sonnet's and are
+  not used for this model.
+- What it does not change: the caps (S3 17,252, S6-H1 35,574) and the approvals; the questions, the splits, the arms, the metrics,
+  the thresholds, the H1 rule and the statistics; and 14.5, whose early build now runs on this model and whose code freeze applies
+  to a commit that carries this wiring.
+- 14.4's "Sharing the account" no longer applies. S3 and the early build share the upstream requests-per-minute limit instead,
+  split with `--rpm`.
+- Not covered and not claimed:
+  - whether an H1 result on Muse Spark carries over to Sonnet;
+  - the freeze manifest's prompts digest (`s6h1_freeze.prompts_digest`), which still covers the CLI invocation and not the API
+    parameters; the manifest's `model` field names the model, and the stamp records the port's request fields;
+  - the memory gate of S6-H1 still counts one CLI process per concurrent call for this kind too (conservative).

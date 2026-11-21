@@ -123,6 +123,35 @@ python -m evalkit.run_s6h1 --prebuild --amendment-ref DEV-14.5 --dataset <datase
   builds nothing again, and copies PREBUILD.json into STAMP.json. A run directory with PREBUILD.json but no `tenant_state.json` is
   refused: a prebuilt tenant is never reset.
 
+## Model kind (EXPERIMENT 14.6)
+
+S3 (restarted) and S6-H1 run on Muse Spark: in every command above, and in S3's `evalkit.run_h1` command, replace
+`--binary <claude-binary> --model <model-id>` with
+
+```
+--model-kind muse --provider openrouter --model meta/muse-spark-1.3-contributor \
+  --reasoning-effort medium --max-tokens 16384 --rpm <R> \
+  ( --key-file <key-file> | --key-secret-project <project> --key-secret-name <secret> )
+```
+
+- Exactly one key source; it is given at run time only and recorded nowhere. A key file must be a regular file of the user running
+  the stage, mode 0600; only that is checked here, and the port reads it. A secret is fetched by the port inside the run process
+  (`gcloud` on the PATH). The port is built before anything is stamped: a key it cannot use refuses the start (exit 2), nothing
+  written.
+- `--reasoning-effort` and `--max-tokens` are required and registered (14.6: medium and 16,384). They are sent with every request
+  and are part of the model's identity: a resume, an early-build rerun or a stamped run with another value is refused.
+- `--rpm` (at most 140, default 140): request starts per minute for THIS run. Runs at the same time on the same upstream limit
+  split it (S3 and the early build: their `--rpm` sum to at most 140). `--api-timeout` (default 240 s) is per request.
+- A 429, a 503 or OpenRouter's in-flight 402 backs off for at least Retry-After (per call, `--max-retries`) and is not a failure
+  of the five-failure streak. A billing or budget refusal (402, OpenRouter's 403 with a limit source) or a reported model other than
+  `--model` stops the stage at once (LIMIT_REACHED, exit 76); the refused call is asked again on the resume. A 504, a timeout, any
+  other error, and an answer cut short by `--max-tokens` (finish reason `length`) are failed calls, never answers.
+- `calls.jsonl` records the HTTP status, the prompt, completion, reasoning and cached token counts, the reported model, the upstream
+  provider, the finish reason and the cost; STATE.json records `models_reported` and `providers_reported`; every `done.jsonl` row
+  records the model identity and, per arm, the recall's `port` timeouts, errors and invalid answers.
+- A run directory stays on the model it started with: a resume, or a stamped run over an early build, on another kind or setting
+  is refused.
+
 ## Watch, stop, resume
 
 As S2 (docs/RUN-S2.md): `<run-dir>.out`, `counter`, `calls.jsonl`, `done.jsonl`, `journal.jsonl`, `budget.json`, `STATE.json`. Stop:
