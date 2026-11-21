@@ -27,7 +27,7 @@ from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from . import arms, dataset as ds, stats
 from .parallel import run_ordered
 from .s2_ports import StageStopped
-from .s2_stage import CapReached, Ledger, Recorder, _scores, qref
+from .s2_stage import CapReached, Ledger, Recorder, _scores, port_counts, qref
 from .score import write_result
 
 STAGE = "S6-H1"
@@ -95,6 +95,8 @@ def run_questions(fs: ds.FreshSet, hashes: Mapping[str, str], direct: Optional[R
             "arms": {k: {"sessions": [ds.opaque_ref(s) for s in v.sessions], "failed": bool(v.failed), "offered": len(v.leaves)}
                      for k, v in o.items() if k in ARMS_S6},
             "sources": sorted(src.values()), "holder_calls": t.last.holder_calls, "fallbacks": t.last.fallbacks,
+            **({"shuffled_fallbacks": sh.last.fallbacks} if qid in shuf and sh is not None and sh.last is not None else {}),
+            **({"port": pc} if (pc := port_counts(A1=t, SHUFFLED=sh if qid in shuf else None)) else {}),
             "direct50": [[lid, sess(lid), float(score), int(world.session_tokens.get(world.leaf_session.get(lid, ""), 0))]
                          for lid, score in dlist],
             "tree50": [[lid, sess(lid)] for lid in tids]}

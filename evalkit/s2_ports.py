@@ -44,7 +44,7 @@ from living_context.model.port import CallContext, CallResult, PortRefused, Task
 from . import claude_cli
 from .claude_cli import AllowanceRefused, StageLimited, StagePaused
 
-__all__ = ["Journal", "JournalCorrupt", "read_resumable", "ResilientPort", "ScopedPort", "ScopeRequired", "StageStopped", "StagePaused", "StageLimited", "BudgetExceeded"]
+__all__ = ["Journal", "JournalCorrupt", "read_resumable", "Tally", "ResilientPort", "ScopedPort", "ScopeRequired", "StageStopped", "StagePaused", "StageLimited", "BudgetExceeded"]
 
 
 class StageStopped(Exception):
@@ -142,6 +142,34 @@ class ScopedPort:
 
     def stop_requested(self) -> bool:
         return self._port.stop_requested()
+
+
+INVALID_ANSWERS = ("parse", "schema")             # the model answered, but not in the task's schema
+
+
+class Tally:
+    """One recall's view of the port that counts its failed calls (each becomes the product's own fallback inside a finished
+    question): `timeouts`, `errors` (any other failed call: a process or API error, a call lost in flight) and `invalid` (an
+    answer outside the schema). The ledger records them per question and arm, so a result's dependence on concurrency through
+    timeouts and errors under load is measured, not assumed (review finding F7)."""
+    def __init__(self, port):
+        self._port = port
+        self.failed: Dict[str, int] = {}
+
+    def call(self, task: Task, inputs: Mapping[str, Any], **kw) -> CallResult:
+        res = self._port.call(task, inputs, **kw)
+        if not res.ok:
+            k = res.error or "error"
+            self.failed[k] = self.failed.get(k, 0) + 1
+        return res
+
+    def stop_requested(self) -> bool:
+        return self._port.stop_requested()
+
+    def counts(self) -> dict:
+        f = self.failed
+        return {"timeouts": f.get("timeout", 0), "invalid": sum(f.get(k, 0) for k in INVALID_ANSWERS),
+                "errors": sum(v for k, v in f.items() if k != "timeout" and k not in INVALID_ANSWERS)}
 
 
 class AdaptiveSlots:

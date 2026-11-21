@@ -55,13 +55,27 @@ class Ledger:
 
 
 class Recorder:
-    """Wraps a retriever and keeps its last output (ids only), so the source of each gold session can be attributed."""
-    def __init__(self, fn):
-        self.fn, self.last = fn, None
+    """Wraps a retriever and keeps its last output (ids only), so the source of each gold session can be attributed; `tally` is
+    the `s2_ports.Tally` its recall's calls went through (the question's own), when there is one."""
+    def __init__(self, fn, tally=None):
+        self.fn, self.last, self.tally = fn, None, tally
 
     def __call__(self, q):
         self.last = self.fn(q)
         return self.last
+
+
+def port_counts(**recs) -> dict:
+    """{arm: {timeouts, errors, invalid}} of the recalls that ran with their own tally (F7: how often a finished question's arm
+    fell back because a call timed out or failed)."""
+    return {arm: r.tally.counts() for arm, r in recs.items() if r is not None and getattr(r, "tally", None) is not None}
+
+
+def tallied(port, fn) -> "Recorder":
+    """A recorder over `fn(port')`, where port' counts the failed calls of this recall only."""
+    from .s2_ports import Tally
+    t = Tally(port)
+    return Recorder(fn(t), tally=t)
 
 
 def run_questions(dev: Sequence[ds.Question], hashes: Mapping[str, str], direct: Optional[Recorder], tree: Optional[Recorder],
@@ -94,7 +108,9 @@ def run_questions(dev: Sequence[ds.Question], hashes: Mapping[str, str], direct:
         return {"qref": ref, "gold_n": len(g), "gold": [ds.opaque_ref(x) for x in g],
                 "arms": {k: {"sessions": [ds.opaque_ref(s) for s in v.sessions], "failed": bool(v.failed)} for k, v in o.items()
                          if k in ARMS_H1 or (beta is not None and k == "A0+LEN")},
-                "sources": sorted(src.values()), "holder_calls": t.last.holder_calls, "fallbacks": t.last.fallbacks}
+                "sources": sorted(src.values()), "holder_calls": t.last.holder_calls, "fallbacks": t.last.fallbacks,
+                **({"shuffled_fallbacks": shf.last.fallbacks} if shf is not None and shf.last is not None else {}),
+                **({"port": pc} if (pc := port_counts(A1=t, SHUFFLED=shf)) else {})}
 
     def commit(_i, item, row) -> None:
         ledger.append(row)

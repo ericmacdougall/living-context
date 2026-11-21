@@ -353,7 +353,7 @@ class CappedPort:
             text = env.get("result") if isinstance(env, dict) else None
             out = self._judge(name, inputs, text, row)
             if ro.rc != 0 or (isinstance(env, dict) and env.get("is_error")):
-                row["error"] = "cli_error" if ro.rc != 0 else "is_error"
+                row["error"] = "timeout" if ro.rc == 124 else "cli_error" if ro.rc != 0 else "is_error"
             self._append(row)
             if ro.rc != 0 or not row["schema_ok"]:
                 return CallResult(False, error=row.get("error") or ("parse" if out is None else "schema"))
@@ -408,7 +408,7 @@ class CappedPort:
                 raise StageLimited("%d consecutive API failures, last at call %d" % (self._fail_streak, n))
             out = self._judge(name, inputs, rep.text, row)
             if failed:
-                row.update(error="api_error", api_error=rep.error or "no_answer")
+                row.update(error="timeout" if rep.error == "timeout" else "api_error", api_error=rep.error or "no_answer")
             self._append(row)
             if failed or not row["schema_ok"]:
                 return CallResult(False, error=row.get("error") or ("parse" if out is None else "schema"))

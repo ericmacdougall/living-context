@@ -2,13 +2,14 @@
 built S3 run with no question done may resume under a new commit only with a recorded amendment. In-memory tenant, fake CLI runner,
 synthetic fixture; no Elasticsearch, no model, no dataset."""
 import argparse
+import hashlib
 import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from evalkit import dataset as ds, fixture, run_h1, run_s2
+from evalkit import claude_cli as cc, dataset as ds, fixture, run_h1, run_s2
 from tests.unit import test_run_s6h1 as t6
 from tests.unit.test_parallel import SafeRunner, seeded_node_ids
 
@@ -47,6 +48,15 @@ class StopAfterQuestions(SafeRunner):
         if self.stop_file is not None and self.ledger.exists() and len(self.ledger.read_text().splitlines()) >= self.k:
             Path(self.stop_file).write_text("")
         return super().__call__(prompt)
+
+
+class SomeRoutesTimeOut(SafeRunner):
+    """About one route call in six times out (exit 124), chosen by the prompt, so the same calls fail at any concurrency."""
+    def __call__(self, prompt):
+        ro = super().__call__(prompt)
+        if "TASK route" in prompt and int(hashlib.sha256(prompt.encode()).hexdigest()[:4], 16) % 6 == 0:
+            return cc.RunOut(124, "", "", ro.latency_s)
+        return ro
 
 
 @mock.patch.dict(run_h1.REGISTERED_N, {"S3": 10})          # the synthetic S3 is 10 questions with SHUFFLED on 4
@@ -122,6 +132,20 @@ class S3Parallel(unittest.TestCase):
         self.assertEqual(shuffled(d), shuffled(ref))                  # the first 4 of the seeded order, before and after the stop
         self.assertEqual(len(shuffled(ref)), 4)
         self.assertEqual(self.outputs(d)[0], self.outputs(ref)[0])    # the ledger, byte for byte
+
+    def test_every_question_records_the_timeouts_and_port_errors_its_arms_fell_back_on(self):
+        d1, d4 = Path(tempfile.mkdtemp()), Path(tempfile.mkdtemp())
+        self.assertEqual(self.go(d1, SomeRoutesTimeOut()), 0)
+        self.assertEqual(self.go(d4, SomeRoutesTimeOut(), concurrency=4, concurrency_reason="test"), 0)
+        self.assertEqual(self.outputs(d4)[0], self.outputs(d1)[0])
+        led = [json.loads(l) for l in (d1 / "done.jsonl").read_text().splitlines()]
+        self.assertTrue(all(set(r["port"]) == ({"A1", "SHUFFLED"} if "SHUFFLED" in r["arms"] else {"A1"}) for r in led))
+        timeouts = sum(c["timeouts"] for r in led for c in r["port"].values())
+        calls = [json.loads(l) for l in (d1 / "calls.jsonl").read_text().splitlines()]
+        self.assertGreater(timeouts, 0)
+        self.assertEqual(timeouts, sum(c.get("error") == "timeout" for c in calls))   # every timed-out recall call, in its question
+        self.assertTrue(all(r["port"]["A1"]["errors"] == 0 for r in led))
+        self.assertTrue(all("shuffled_fallbacks" in r for r in led if "SHUFFLED" in r["arms"]))
 
     def test_the_amendment_does_not_open_an_unbuilt_or_started_run(self):
         d = Path(tempfile.mkdtemp())

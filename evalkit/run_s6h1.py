@@ -433,8 +433,9 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
         def retrievers(ref):
             # one question's own recorders over a port scoped to it; each recall stays one worker (deterministic call order)
             qp = port.scoped(ref)
-            return (s2_stage.Recorder(dfn), s2_stage.Recorder(arms.TreeRetriever(qp, view, TENANT, CLS, "px", consts, workers=1)),
-                    s2_stage.Recorder(arms.TreeRetriever(qp, pview, TENANT, CLS, "px", consts, workers=1)))
+            return (s2_stage.Recorder(dfn),
+                    s2_stage.tallied(qp, lambda p: arms.TreeRetriever(p, view, TENANT, CLS, "px", consts, workers=1)),
+                    s2_stage.tallied(qp, lambda p: arms.TreeRetriever(p, pview, TENANT, CLS, "px", consts, workers=1)))
         st.run_questions(fs, hashes, None, None, None, world, ledger, beta=vals["beta"], shuffled_qids=shuffled_qids,
                          stop=port.stop_requested, progress=lambda s: print(s, "counter", budget.count(), flush=True),
                          retrievers=retrievers, workers=n_par)

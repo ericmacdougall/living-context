@@ -138,8 +138,9 @@ def run(a, pick_questions, *, embedder=None, runner=None, loader=None, tenant_fa
         def retrievers(ref):
             # one question's own recorders; above one worker each over a port scoped to its question (each recall stays one worker)
             qp = port.scoped(ref) if n_par > 1 else port
-            return (s2_stage.Recorder(dfn), s2_stage.Recorder(arms.TreeRetriever(qp, view, a.tenant, CLS, "px", consts, workers=1)),
-                    s2_stage.Recorder(arms.TreeRetriever(qp, pview, a.tenant, CLS, "px", consts, workers=1)))
+            return (s2_stage.Recorder(dfn),
+                    s2_stage.tallied(qp, lambda p: arms.TreeRetriever(p, view, a.tenant, CLS, "px", consts, workers=1)),
+                    s2_stage.tallied(qp, lambda p: arms.TreeRetriever(p, pview, a.tenant, CLS, "px", consts, workers=1)))
         beta = a.beta
         if a.stage == "S3":
             # S3 fits the length-prior beta once, on the development questions' A0 lists (no model call), and freezes it in the run directory
