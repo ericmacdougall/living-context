@@ -1,0 +1,69 @@
+name: ci
+
+# Manual trigger only: CI runs locally (`make ci` or tools/ci_local.sh) because hosted Actions minutes are not used for this
+# repository. Run this workflow by hand from the Actions tab when a hosted check is wanted.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    # The unit suite, no network services: tests that need Elasticsearch, the real embedder (LC_E5_DIR) or a model are skipped
+    # with a stated reason by tests/conftest.py. Runtime dependencies come from the hashed lock; test tooling is pinned in
+    # requirements-test.txt.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install --require-hashes -r requirements.lock
+          pip install -r requirements-test.txt
+      - name: Unit tests with coverage
+        run: |
+          python -m pytest tests/unit -q -p no:cacheprovider --timeout=1800 \
+            --cov=living_context --cov=evalkit \
+            --cov-report=term --cov-report=xml:coverage.xml --cov-report=json:coverage.json
+      - name: Coverage summary
+        if: always()
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, os
+          if not os.path.exists("coverage.json"):
+              raise SystemExit("no coverage.json (the test step did not finish)")
+          files = json.load(open("coverage.json"))["files"]
+          print("### Unit-test coverage\n\n| package | statements | covered | % |\n|---|---:|---:|---:|")
+          for pkg in ("living_context", "evalkit"):
+              s = [f["summary"] for p, f in files.items() if p.startswith(pkg + "/")]
+              n, c = sum(x["num_statements"] for x in s), sum(x["covered_lines"] for x in s)
+              print(f"| {pkg} | {n} | {c} | {100 * c / n:.1f} |" if n else f"| {pkg} | 0 | 0 | n/a |")
+          zero = sorted(p for p, f in files.items() if f["summary"]["num_statements"] and f["summary"]["covered_lines"] == 0)
+          print(f"\n{len(zero)} module(s) at 0%: " + (", ".join(f"`{p}`" for p in zero) or "none"))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: |
+            coverage.xml
+            coverage.json
+          if-no-files-found: warn
+
+  # TODO(es-integration): a second, optional job that runs tests/security/*_es.py against the pinned Elasticsearch 9.5.6 image
+  # (docs/HOST.md: sha256:79b4f1de4c15e6eca824723086a51e5934406d614d410cc11be77748cafac537). It is not simple enough to add blind:
+  # those tests need a security-enabled cluster with a CA certificate and the elastic password in files
+  # (LC_TEST_ES_URL, LC_TEST_CA, LC_TEST_PW), and a service container cannot generate the certificates before it starts. The
+  # shape would be: `docker run` the digest-pinned image with xpack.security.http.ssl enabled and a certificate made by
+  # elasticsearch-certutil in a prior step, wait for /_cluster/health, export the three variables, then
+  # `python -m pytest tests/security -k _es`. Until that is built and run once on a real runner, the ES-backed tests run on the
+  # evaluation host only. Some tests there (test_revoke_flood_es, test_verifier_restore_es) also need Docker control of the node.

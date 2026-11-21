@@ -1223,3 +1223,254 @@ Nothing in these revisions was run except the dataset measurements marked
 MEASURED, the gate simulation of 7.3 (`evalkit/gate_power.py`) and the budget
 arithmetic of 10.3 (`evalkit/budget.py`), both plain Python with no model
 calls; their printed numbers are quoted as printed.
+
+## 14. Amendments
+
+Each amendment is committed alone, before the run it affects, and moves no hypothesis, arm definition, threshold, statistic or
+control of sections 1 to 8.
+
+### 14.1 DEVIATION (order only): S1 before S0 (2026-11-19)
+
+- Registered: S0 (both checkpoints) passes before S1 (section 10, order in 10.3).
+- Amended: stage S1 runs before S0 completes. Reason: the owner asked, in chat on 2026-11-19, for the first question (H1,
+  tree with agent routing against flat search) to be measurable in parallel with the security and plan-order build, and approved
+  the 25-call canary for it. S1 touches no tenant data and no security-relevant path; its question is whether each task kind
+  returns schema-valid output through the real model client and what each call costs.
+- Scope: stage S1 only, the canary of section 10, on the synthetic fixture (no dataset content), with the headless CLI on the
+  subscription and the Sonnet tier (X5, X7). Hard cap of 25 real model calls in total, enforced by the durable counter that is
+  charged before every call; call 26 is refused without starting a process. This amendment approves nothing after S1: S2, S3,
+  S6-H1 and every later stage still need the owner's approval of that stage and its cap, and the fresh set stays unreleased.
+- What it does not change: S0 must still pass in full before any stage that the registered order places after it relies on a
+  security claim; S1's results make no security claim.
+- Consequence for reading S1: its figures describe the client and the prompts on a fixture of synthetic notes, where token counts
+  per character differ from English text. Section 10.2 is replaced by measured figures only through the separate amendment that
+  follows the run, which states the prompt sizes beside each figure.
+
+### 14.2 Measured per-call figures from S1 (replaces the CLI column of 10.2; 2026-11-19)
+
+Run: stage S1 as amended in 14.1, on commit 924c9f6, the synthetic fixture (64 leaves of nonsense-word notes, four of them long),
+the headless CLI on the subscription, model tier Sonnet; the CLI reported one model id on every call (claude-sonnet-5-5) and one turn
+per call. 22 of the 25 permitted calls were made (the durable counter reads 22; 3 held in reserve and not used). No call was
+throttled, none failed, all 22 outputs were schema valid and all 22 passed the consumer-strict checks (entry count equals leaf
+count, labels among those presented, confidence 0 to 3, reasons and labels at most 12 words, pointers among those presented).
+
+Invocation (frozen, part of the registered client from here on): the CLI from an empty working directory with the prompt on stdin,
+`-p --model <id> --output-format json --no-session-persistence --tools "" --disable-slash-commands --strict-mcp-config` and the
+settings overlay `{"disableAllHooks":true}`, a minimal system prompt that asks for one JSON object, and the child environment
+switches that turn off instruction files, auto-memory and self-update. Not `--bare` (it does not read the subscription login).
+
+Fixed per-call overhead, measured: about 645 input tokens (a 158-character prompt came to 682 total input tokens and a 178-character
+prompt to 689). The 10.5k figure of 10.2 was measured on a default CLI session (default system prompt, tools, instruction files);
+with this invocation the CLI basis is the API basis plus about 645 tokens, not plus 10,500. The prompt is billed as cache creation by
+the CLI (all 22 calls: 2 uncached input tokens, the rest cache creation, no cache reads); the totals below add the three input fields.
+
+| Task kind | Calls | Prompt chars | Total input tokens (CLI) | Output tokens | Latency s (range) | Valid |
+|---|---|---|---|---|---|---|
+| route | 8 | 4,403 to 5,206 | 2,714 to 2,972 | 24 to 391 (median 24) | 2.05 to 4.33 (median 2.09) | 8 of 8 |
+| organise | 2 | 1,024 | 1,251 and 1,257 | 427 and 380 | 3.94 and 3.66 | 2 of 2 |
+| build_l1 (16 leaves, 3,800 characters) | 4 | 3,791 to 3,806 | 2,392 to 2,444 | 1,559 to 1,836 | 9.27 to 10.71 | 4 of 4 |
+| build_upper (4 summaries) | 1 | 3,605 | 2,090 | 176 | 3.00 | 1 of 1 |
+| type_edges (c0 and 5 items) | 1 | 2,475 | 1,842 | 115 | 2.54 | 1 of 1 |
+| judge_relevance | 1 | 1,870 | 1,558 | 18 | 2.03 | 1 of 1 |
+| query_variants | 1 | 158 | 682 | 69 | 2.37 | 1 of 1 |
+| synthetic_queries | 1 | 1,819 | 1,526 | 138 | 2.96 | 1 of 1 |
+| ask | 1 | 1,861 | 1,560 | 107 | 2.81 | 1 of 1 |
+| reader_answer | 1 | 1,821 | 1,540 | 78 | 2.49 | 1 of 1 |
+| answer_judge | 1 | 178 | 689 | 9 | 1.88 | 1 of 1 |
+
+What this does and does not replace. The fixed overhead (645 tokens against 10,500), the output tokens, the latency per kind and
+the validity of every kind are measured. The per-kind INPUT sizes are fixture-sized: the 16 leaves of a build_l1 prompt fit in 3,800
+characters of prompt including its instructions (10.1 assumes leaves of 1,100 tokens), nonsense words cost about 0.46 tokens per character
+where English costs less, and the route entries are short. So the registered API ranges of 10.2 stay as the estimate for real-data
+inputs and S2 measures them at real sizes; the measured totals above are lower bounds for kinds whose input scales with text
+(build_l1, build_upper, route, type_edges, judge_relevance, ask, reader_answer). Output tokens per build_l1 call (about 1,700, for 16
+entries and a summary) scale with the number of leaves, not their length. Latency measured on short prompts is a floor.
+
+Effect on 10.3 (`evalkit/budget_measured.py`, which runs `evalkit/budget.py` unchanged with the measured overhead; the calls per
+stage do not change, because S1 measures tokens and time, not how many calls a stage makes):
+
+| Stage | Calls | CLI input Mtok (registered API ranges plus 645 per call) | Fixture-sized lower bound, Mtok | Output Mtok | Hours at the measured mean latency per kind, concurrency 2 (a floor) |
+|---|---|---|---|---|---|
+| S2 | 2,391 to 5,454 | 14 to 46 (10.3 had 37 to 100) | 6 to 13 | 0.9 to 1.6 | 1.3 to 2.6 (10.3 had 3 to 7 at 9.36 s per call) |
+| S3 | 7,022 to 17,252 | 43 to 152 (112 to 322) | 16 to 41 | 2.8 to 5.2 | 3.8 to 8.3 (9 to 22) |
+| S6-H1 | 23,104 to 35,574 | 144 to 398 (371 to 749) | 58 to 89 | 11.0 to 16.9 | 13.8 to 21.2 (30 to 46) |
+| S2 + S3 + S6-H1 | 32,517 to 58,280 | 200 to 597 | 80 to 143 | 14.7 to 23.7 | 18.9 to 32.1 (42 to 76 for the path with S1) |
+
+The hours are a floor and not a promise: the measured latencies come from 22 sequential calls on short prompts, the subscription's
+sustained limits were not exercised (no call was throttled), and S2 measures calls per 5-hour window (section 10, S2 gate).
+The rest of 10.3 (S6-H2 and the loop stages) is not restated here.
+
+### 14.3 DEVIATION (order only): S2 and S3 before S0 completes (2026-11-19)
+
+- Registered: S0 (both checkpoints) passes before S1, and the stages follow in the order of 10.3. Amendment 14.1 moved S1 ahead of S0.
+- Amended: stages S2 and S3 also run before S0 completes, for the H1 arms only (the part of each stage's row that the first question
+  needs). Reason: the owner approved stages S2, S3 and S6-H1 in chat on 2026-11-19 after seeing their call ranges and caps (S2 5,454,
+  S3 17,252, S6-H1 35,574 calls; Sonnet through the headless CLI on the subscription), to measure H1 in parallel with the security
+  and plan-order build. The caps are hard and each stage still has its own start, so S6-H1 does not start with S2 and S3.
+- Scope: S2 and S3 as rows of section 10, H1 arms only. Not covered by the amended runs and not claimed: A2 and edge typing, the relevance
+  judge on three pools, C1 and C2, and the S2 holder-log check (RUN-S2). Their figures are exploratory development figures on the pilot
+  split (7.4) and decide nothing.
+- What it does not change: S0 must still pass in full before any stage that relies on a security claim; these stages make none. No
+  hypothesis, arm, threshold or statistic moves, and the held-out and fresh question sets stay unloaded.
+
+### 14.4 DEVIATION (run control only): S3's questions resume under a new commit at adaptive concurrency (2026-11-20)
+
+- Registered: a stage runs as one stamped run on the commit it started with; model calls run at concurrency 2 (10.3,
+  `evalkit/parallel.py` `REGISTERED_CONCURRENCY`); an allowance refusal stops the stage. S3 started on commit c34c5a2 and ran its
+  build one call at a time.
+- Amended: S3's question phase resumes on a later commit, the one named at the resume (`--commit`, recorded in STAMP.json under
+  `amendments` with `--amendment-ref DEV-14.4`, and in `starts.jsonl`), with up to 8 model calls at once. Reason: the owner asked
+  in chat on 2026-11-20 to "figure out how to make it not take more than 2 hours to answer the thesis", and that "running it faster,
+  not more shallow, is better than pretending insignificant data is an answer"; the owner chose the subscription only (no API key,
+  no spend). At one call at a time S3's 94 questions take about 6 hours.
+- State at the resume (read on the run host, nothing written): STATE `STOPPED` by the stop file; BUILT.json present (1,209 nodes,
+  3 levels, top 5, 18,120 leaves); no question in the ledger; counter 1,216 = 1,136 build_l1 (2 of them refused by the allowance and
+  asked again before this amendment) + 76 build_upper + 4 route.
+- What changes:
+  1. The commit. `run_h1` moves a charged run to a new commit only under a recorded amendment, only when BUILT.json exists and the
+     ledger is empty, so every recorded result comes from one commit per phase (build on c34c5a2, questions on the new commit).
+     The stamp keeps the earlier commits.
+  2. Concurrency. Up to 8 calls at once, adaptive: it starts at 2, halves on a throttle or an allowance refusal, and doubles after
+     a clean window of max(8, 2 x the limit) answered calls, never above 8 (`--concurrency 8 --concurrency-reason ...`). Every
+     call row and journal `pending` row records the concurrency at the time; STATE records `concurrency_changes`.
+  3. Allowance refusals. Under adaptive concurrency a refused call is backed off and asked again up to `--max-retries` times
+     before the stage stops (`LIMIT_REACHED`); each retry is one charged call, inside the cap.
+  4. Four calls charged twice. The 4 route calls of the first question were charged at one call at a time with journal keys
+     that name no question. The concurrent question loop keys every call by its question, so those 4 calls are asked again and
+     charged a second time (4 of the 17,252 cap). Their first answers stay in `calls.jsonl` and `journal.jsonl` and are not used.
+  5. `calls.jsonl` is in completion order, not question order; the ledger (`done.jsonl`) stays in the seeded question order.
+- What it does not change: the cap (17,252) and the approval, the model, the system prompt, the prompts and the CLI invocation,
+  the tree (no rebuild), the questions and their order, the arms, the metrics and every statistic. Each question's recall runs on
+  one worker over its own scoped journal, so with a deterministic model the ledger and results are the same at any concurrency
+  (`tests/unit/test_run_s3_parallel.py`: 1 and 4 workers, and a serial run stopped after its build and resumed under this
+  amendment at 4 workers, with seeded node ids). The real model answers two identical calls independently at any concurrency,
+  as before.
+- Sharing the account: S3's questions and the early S6-H1 build (14.5) run at the same time on one subscription; their ceilings
+  together stay under 16 calls at once (S3 at most 8).
+
+### 14.5 DEVIATION (order only): the S6-H1 whole pool is ingested and built before the S3 freeze, questions sealed (2026-11-20)
+
+- Registered: S6-H1 starts after S3 is COMPLETE, after the freeze (3.7) and after the owner's release of the fresh set (X1). Until
+  the release no stage below S6 touches the fresh set (3.2), and 14.3 kept the held-out and fresh question sets unloaded.
+- Amended: the part of S6-H1 that reads no question, the whole-pool ingest, clustering and tree build, may run before S3
+  completes, as an early build in the run directory that the stamped run will use (`evalkit.run_s6h1 --prebuild --amendment-ref
+  DEV-14.5`, docs/RUN-S6H1.md). Reason: the owner approved in chat on 2026-11-20 building the pool early, with the questions and
+  answers sealed until the freeze ("Yes, build pool early"), so that the build (about 5,250 calls) does not wait for S3.
+- What the early build reads, and what it exposes:
+  - It reads all 18,464 distinct session contents of the 500 questions. These include the haystack sessions and the gold sessions
+    of the 312 fresh questions, as unlabelled pool contents.
+  - The parser keeps only each record's haystack arrays and each turn's role and content (`evalkit.dataset.pool_contents`). It drops
+    the question, the answer, the gold session ids, the has_answer flags, the dates, the ids and the question type as it parses, so
+    no object holds them.
+  - The contents reach the model in build prompts before the freeze, as they would in the registered S6-H1 build after it. Nothing
+    tells which content is gold for which question.
+  - The fresh questions and their answers stay sealed until RELEASE.json. Tested in `tests/unit/test_s6h1_prebuild.py`: a full early
+    build opens the dataset once, through that parser, and no file it writes, no registry row and nothing it prints holds a
+    question, an answer, a question id, a session id or a has_answer flag.
+- Before the freeze, the operator reads counts only (STATE.json, tree.json, budget.json, the progress lines). The summaries the build
+  writes stay in the S6-H1 tenant and are not inspected. S3 retrieves only from its own tenant.
+- Code freeze at the early-build commit. This is main's ruling of 2026-11-20 ("freeze at the prebuild commit"), not the owner's.
+  - PREBUILD.json binds the commit, the full code digest (`s6h1_freeze.code_digest`), the cap, the approval, the A0 fields, the model,
+    the model kind, `--threads` and the pool's ordered content hashes.
+  - The memory proof is measured on that code, and the freeze must name that commit. The stamped run refuses any other value.
+  - Consequence for 3.7: S3 still freezes the values it measures, beta and the A0 field set, as data in the freeze manifest. Every
+    other value S6-H1 uses that is code (the prompts, the thresholds, the merge rule, the statistics, the tree constants) is fixed at
+    the early-build commit, before S3's results exist.
+  - A change to code after that commit, a power amendment that edits code included, voids the early build. The registry then refuses
+    a second build in another run directory until the owner decides on the calls already charged, which count against the S6-H1 cap.
+- What it does not change: the cap (35,574) and the approval; the prompts, the arms, the metrics, the H1 rule, the questions and
+  their order. The stamped run is the stage's one stamped run. It reads the freeze and the release as registered, attaches to the
+  prebuilt tenant and tree and builds nothing again; its ledger equals that of a run without the early build (tested, including an
+  early build stopped halfway through its build and continued at another concurrency).
+
+### 14.6 DEVIATION (model): S3 restarts and S6-H1 runs on Muse Spark through OpenRouter (2026-11-20)
+
+- Registered: S2, S3 and S6-H1 call Claude Sonnet through the headless Claude Code CLI on the subscription (10.2, 10.3, 14.2,
+  14.3). S3 started as one stamped run on that model (14.4).
+- Amended: S3 restarts from scratch as a new stamped run, in a new run directory on a new tenant, and S6-H1 (the early build of
+  14.5 and the question run) runs on Meta's Muse Spark, requested as `meta/muse-spark-1.3-contributor` through OpenRouter, with
+  the provider pinned to Meta and no fallback (`--model-kind muse --provider openrouter`; the port also supports Meta's own API,
+  `--provider meta`). Reason: the run host's subscription allowance ran out after 4,621 S3 calls (LIMIT_REACHED; 32 questions
+  recorded), and the owner decided on 2026-11-20 to move the H1 runs to this model.
+- The Sonnet runs:
+  - The Sonnet S3 run is kept as a record (run directory, tenant, calls, journal and ledger untouched). It is not resumed and not
+    analysed, and it decides nothing.
+  - S2 (Sonnet) stays an exploratory development figure (14.3) and is not rerun. Its measured calls per recall feed the call
+    estimate only.
+- Model facts (SOURCE: openrouter.ai/docs and dev.meta.ai, read on 2026-11-20 by the port's owner, docs/MUSE-PORT.md; not
+  measured here):
+  - API: OpenAI-compatible chat completions; OpenRouter's endpoint for this model has Meta as its only provider.
+  - Limits: Meta's Contributor limits are 150 requests and 3,000,000 tokens per minute per model, shared by the whole team, so
+    requests per minute bind. About 42,000 calls need at least about 5 hours at 140 per minute. OpenRouter documents no limit of
+    its own for this model.
+  - Errors: 429 with Retry-After; 402 for billing or credits (OpenRouter's in-flight budget 402 clears by waiting); OpenRouter's
+    403 with a limit source for a key budget; 503 with Retry-After; 504 for a long request.
+  - Price (list): USD 0.10 per million input tokens and 0.20 per million output tokens; reasoning tokens are billed as output.
+  - Reasoning effort: the provider's default is "high"; "max" is not available on this model.
+  - Data use: in the Contributor mode the provider may use the inputs to train its models. Only the public benchmark
+    (LongMemEval-S) is sent; no private data.
+- Registered settings (main's ASSUMPTION of 2026-11-20, chosen from the pilot's cost and latency, without any accuracy data):
+  `--reasoning-effort medium --max-tokens 16384 --rpm 140`, the 140 split between S3 and the early build while both run. Both
+  model settings are part of the model's identity: a resume, an early-build rerun or a stamped run with another value is refused.
+- Pilot (MEASURED by main on the run host at commit 22ec07c, practice data only, no registered question, no stage counter; 72
+  real calls through OpenRouter at max tokens 16,384, 6 and 8 at once): every call ended with finish reason `stop` and valid JSON,
+  reported model `meta/muse-spark-1.3-contributor`, no throttle.
+
+  | effort | task | latency p50 | completion tokens p50 / max | reasoning tokens p50 |
+  |---|---|---|---|---|
+  | low | build_l1 | 10.0 s | 2,194 / 2,576 | 497 |
+  | low | route | 2.3 s | 328 / 814 | |
+  | medium | build_l1 | 15.4 s | 2,955 / 3,827 | 1,404 |
+  | medium | route | 3.1 s | 540 / 2,024 | |
+
+  The output limit of 16,384 is more than 4 times the largest completion seen (3,827, reasoning included).
+- Cost and credit: the estimated cost at the registered settings is about USD 30, against an API key labelled with a USD 25 budget.
+  A credit or budget refusal (402, or OpenRouter's 403 with a limit source) stops the stage at once (LIMIT_REACHED). The refused
+  call is journaled as refused and asked again on the resume after the credit is raised; it is not a result, and no question is
+  recorded from it.
+- Run control (`evalkit.model_kind`, docs/RUN-S6H1.md):
+  - Pacing: one pacer per run spaces request starts at `--rpm` per minute. The registered ceiling is 140, under the upstream 150.
+    Runs at the same time split it: S3 and the early build sum to at most 140.
+  - Retries: a 429, a 503 or OpenRouter's in-flight 402 backs off for at least its Retry-After and is asked again, up to
+    `--max-retries` times per call. Only the exponential back-off is capped (600 s); Retry-After is a minimum and is waited in
+    full. A Retry-After above 3,600 s (ASSUMPTION: the longest wait a run sits through) stops the stage resumably at once, with no
+    retry spent (PAUSED_THROTTLE, exit 75; STATE.json records the requested wait and when to resume). Each retry is one charged
+    call, inside the cap. A throttle is not a failure of the five-failure streak. Retry-After is read in seconds or as an HTTP
+    date. While a call backs off, no new call is charged (calls already charged finish): the back-off is in force from the moment
+    it is decided, and a worker already past its pacer waits it out and takes a new pacer turn (review F3 of goodqa#16562).
+  - Stops: a billing or budget refusal stops the stage at once, never retried. So does a response that reports another model than
+    the one requested (or its pinned snapshot name), and so does the stop file. "At once" means no further call is charged or sent:
+    a worker waiting in the pacer, in a back-off or at the charge is stopped before its charge (review F1).
+  - Failed calls: a 504, a timeout, any other error, and an answer cut short by the output limit (finish reason `length`) are failed
+    calls: never an answer, counted in the five-failure streak, and handled by the product's own fallback like any failed call.
+  - Records: every call row records the HTTP status, the prompt, completion, reasoning and cached token counts, the reported model,
+    the upstream provider, the finish reason and the cost. STAMP.json, PREBUILD.json and every ledger row record the model kind,
+    the provider, the requested model, the reasoning effort and the output limit; the stamp also records the port's fixed request
+    fields, `--rpm` and the request timeout. STATE.json records the reported models and upstream providers.
+  - Key: the API key is read by the port inside the run process, from a key file or a secret manager named at run time only. It
+    is in no file of the repository or of a run directory.
+  - Concurrency: the rules of 14.4 apply (adaptive, under `--concurrency`). Every journal key names its question or build group
+    at every worker count (review F2), so a resume with another `--concurrency` replays every answered call and charges nothing
+    twice; a journal with keys that name neither (an older commit at one worker) is refused, with no migration.
+  - The S3 run (disclosure): S3 started at commit afd0155, before the fixes of review F1 and F2 and of the Retry-After cap. On
+    that commit, at a stop, a worker already waiting in the pacer could still charge and send one call (at most one per worker);
+    such a call is recorded and counted in the cap like any other. A Retry-After above 600 s is waited 600 s per retry. Main's
+    operating rule: the run is resumed only with the same arguments, so its worker count never crosses between one
+    and several (the case of review F2). The S6-H1 early build and the stamped run start from a commit with the fixes.
+- Fallbacks under load (review finding F7): with a real model, a timeout or a port error under load becomes a route fallback inside
+  a finished question, so a result could depend on the concurrency. Every ledger row records, per arm (A1 and SHUFFLED), the
+  timeouts, the port errors and the invalid answers of that question's recall, beside its fallbacks. The report states the
+  fallback rate per arm and lists every question with any timeout or port-error fallback.
+- What changes: the model under test for H1. The system prompt, the user messages and the response schemas are unchanged. The
+  CLI invocation is replaced by the API parameters recorded in every call row. The per-call figures of 14.2 are Sonnet's and are
+  not used for this model.
+- What it does not change: the caps (S3 17,252, S6-H1 35,574) and the approvals; the questions, the splits, the arms, the metrics,
+  the thresholds, the H1 rule and the statistics; and 14.5, whose early build now runs on this model and whose code freeze applies
+  to a commit that carries this wiring.
+- 14.4's "Sharing the account" no longer applies. S3 and the early build share the upstream requests-per-minute limit instead,
+  split with `--rpm`.
+- Not covered and not claimed:
+  - whether an H1 result on Muse Spark carries over to Sonnet;
+  - the freeze manifest's prompts digest (`s6h1_freeze.prompts_digest`), which still covers the CLI invocation and not the API
+    parameters; the manifest's `model` field names the model, and the stamp records the port's request fields;
+  - the memory gate of S6-H1 still counts one CLI process per concurrent call for this kind too (conservative).
