@@ -9,6 +9,10 @@
 * Pool-grant removal, detach, reattach and single-token revoke are journalled and fenced like a revoke (2.5): the in-memory change
   under the exclusive side of the send fence is the denial; the journal append and fsync follow; the authz copy is best effort.
   On start the directory is built from the authz copy and THEN the journal is applied on top, so a removed grant stays removed.
+  Every write of a pool or grant record is a compare-and-set against the record it read (`_authz_put`), so a write built before a
+  change can never land after the change's own write (review round 8); a removal writes a record with no operations, never a delete;
+  the journal keeps a removal until a write of the grant made after it has landed (never on what a read shows), and pool counters
+  are reserved in the journal per process (`reserve_counters`), so the counter order of a grant and its removal holds across restarts.
 * Every pool-related refusal is the one `unavailable` answer (2.7). A caller who is not entitled to see a pool gets the same
   answer for a pool that does not exist.
 * Seeing a pool (pool_list, pool_describe) is the one live visibility check `pool_authz.sees` at the call (a scoped token: some scope
@@ -19,6 +23,7 @@
 from __future__ import annotations
 
 import datetime
+import threading
 from typing import Any, Callable, Mapping, Optional
 
 from ..policy import ClassLattice, Principal, Role
@@ -27,7 +32,7 @@ from .class_reader import ClassReader, ReaderRefused
 from .pool_authz import VIEW, carry, view
 from .indices import POOL_KINDS, TENANT_CLS, physical_name, pool_index
 from .provision import PURGE_SETTINGS, SLOWLOG_OFF, mapping_for
-from .reads import IncompleteRead, delete_doc, put_doc_landed
+from .reads import IncompleteRead, put_doc, put_doc_landed, read_doc
 from .revocation import RevocationService, Refused as TenantClosed
 from .sessions import Record, Sessions
 
@@ -35,6 +40,9 @@ UNAVAILABLE = pl.UNAVAILABLE
 REFUSED = {"ok": False, "error": "refused"}
 POOL_OPS = frozenset({"pool_create", "pool_list", "pool_describe", "pool_detach", "pool_reattach", "pool_grant", "pool_ungrant",
                       "token_revoke", "pool_delete"})
+COUNTER = "pool_counter"   # the epoch-journal record of a counter reservation (`PoolService.reserve_counters`)
+COUNTER_BLOCK = 2 ** 32    # counters one process may take; the next start begins a block above the last ceiling
+CAS_TRIES = 20             # lost compare-and-sets in a row before an authz write is refused (concurrent writes of one record)
 
 
 def _now() -> str:
@@ -69,6 +77,8 @@ class PoolService:
         self._del_pending: dict[str, tuple[str, float]] = {}
         self._b['single'] = broken_single_admin_delete
         self._unconfirmed: dict[tuple, dict] = {}   # pool-grant removals whose authz write has not landed (kept by compaction)
+        self._ulock = threading.Lock()              # `_unconfirmed` and `_ceiling`: the call threads, start-up and compaction
+        self._ceiling = 0                           # the highest counter ceiling the journal holds (`reserve_counters`)
         revocation.extra_replay = self.apply_record
         revocation.extra_snapshot = self.snapshot_records
 
@@ -77,62 +87,112 @@ class PoolService:
         t = r.get("t")
         if t == "pool_grant_rm":
             self.dir.remove_grant(self.tenant, r["principal"], r["pool"], r.get("ops"), counter=int(r["counter"]))
-            self._unconfirmed[(r["principal"], r["pool"], int(r["counter"]))] = dict(r)
+            with self._ulock:
+                self._unconfirmed[(r["principal"], r["pool"], int(r["counter"]))] = dict(r)
         elif t == "pool_state":
             if self.dir.get(self.tenant, r["pool"]) is not None:
                 self.dir.set_state(self.tenant, r["pool"], r["state"], counter=int(r["counter"]))
         elif t == "token_revoke":
             self.sessions.restore_token_revoke(r["hash"], float(r["exp"]))
+        elif t == COUNTER:
+            with self._ulock:
+                self._ceiling = max(self._ceiling, int(r["ceiling"]))
+            self.dir.observe_counter(self.tenant, int(r["ceiling"]))   # every counter an earlier process took is below its ceiling
 
     def snapshot_records(self) -> list:
-        out = [dict(r) for r in self._unconfirmed.values()]
+        with self._ulock:
+            out = [dict(r) for r in self._unconfirmed.values()]
+            out += [{"t": COUNTER, "ceiling": self._ceiling}] if self._ceiling else []
         out += [{"t": "pool_state", "pool": p.id, "state": p.state, "counter": p.state_counter}
                 for p in self.dir.pools_of(self.tenant) if p.state != pl.ACTIVE]
         out += [{"t": "token_revoke", "hash": h, "exp": e} for h, e in self.sessions.revoked_snapshot()]
         return out
 
-    def confirm_against_authz(self, persisted: Mapping[tuple, frozenset], *, complete: bool) -> None:
-        """After start-up: a removal whose grant is absent from the authz copy has landed, so compaction may drop its record. Only from a
-        COMPLETE read: an absent grant in a partial read proves nothing, so nothing is confirmed."""
+    def reserve_counters(self) -> None:
+        """At start-up, after the journal opened and replayed, before any change: reserve this process's block of the tenant's counters
+        in the journal (a `pool_counter` record with its ceiling, fsynced; compaction keeps the latest) and start above every counter an
+        earlier process could have taken. The ordering of a pool grant's removal against a grant (`PoolDirectory.remove_grant`) then
+        holds across restarts without a wall clock (review round 7, C4): a grant whose write was still in flight when its process
+        stopped carries a counter below the next process's removals. A start with no ceiling in the journal (the first, or one written
+        before this record) skips a whole block above what it observed. Refused (`revocation.Refused`) when the record is not durable."""
+        with self._ulock:
+            floor = max(self.dir.counter(self.tenant), self._ceiling) + COUNTER_BLOCK
+        ceiling = floor + COUNTER_BLOCK
+
+        def apply():
+            self.dir.observe_counter(self.tenant, floor)
+            self.dir.limit_counter(self.tenant, ceiling)
+            with self._ulock:
+                self._ceiling = ceiling
+        _, rc = self.rev.journalled(apply, lambda _: {"t": COUNTER, "ceiling": ceiling})
+        if rc["durable_at"] is None:
+            raise TenantClosed("the counter reservation is not durable")
+
+    def confirm_against_authz(self, *, complete: bool) -> None:
+        """After start-up (`reserve_counters` first): each pool-grant removal still unconfirmed is written again, the grant as memory now
+        holds it (`_persist_grant`), and is confirmed only when that write lands. A read never confirms a removal (review round 8): a
+        grant write of an earlier process may still be in flight, and only a landed write is past it (a compare-and-set it cannot pass
+        any more); a grant absent from the copy, or held without the removed operations, proves nothing. Nothing is written or confirmed
+        after an INCOMPLETE read (a partial or refused record), which is no account of what memory was rebuilt from."""
         if not complete:
             return
-        for k, r in list(self._unconfirmed.items()):
-            have = persisted.get((r["principal"], r["pool"]), frozenset())
-            if not (have & frozenset(r.get("ops") or have)):
-                del self._unconfirmed[k]
+        with self._ulock:
+            rows = sorted({(k[0], k[1]) for k in self._unconfirmed})
+        for principal, pool in rows:
+            self._rewrite(principal, pool)
+
+    def _rewrite(self, principal: str, pool: str) -> None:
+        """The start-up write of one grant. A failure is not an answer to anyone and confirms nothing: only `_persist_grant`, after its
+        write landed, drops a removal's record, so a failed write leaves the removal journalled for the next start; the other grants
+        are still written (tests/unit/test_write_failures.py, ALLOWED)."""
+        try:
+            self._persist_grant(principal, pool)
+        except Exception:
+            pass
 
     # ---- persistence (best effort; never blocks a call) -----------------------------------------------------------------------
-    def _authz_put(self, doc_id: str, doc: dict) -> None:
-        """Only a well-formed acknowledgement that exactly this record landed (`reads.doc_written` through the authz alias: `_index`,
-        `_id`, `result` created or updated, the sequence fields and a successful primary) counts as written. Any other answer, an empty or
-        foreign 200 and any 409 included, raises: a partial grant removal then stays unconfirmed and compaction keeps its journal record
-        (review round 6, F18)."""
+    def _authz_put(self, doc_id: str, build: Callable[[], tuple[dict, Any]]) -> Any:
+        """Write the record `doc_id` as memory holds it, ordered against every other write of it by a compare-and-set (review round 8):
+        read the stored record (`reads.read_doc`), THEN take the record from memory (`build()`: the body and a mark), then write it
+        conditioned on what was read (`if_seq_no` and `if_primary_term`, or `op_type=create` for an absent record). A write that was
+        built before a change and lands after it is refused by the index: the later change's own write moved the record on (and a removal
+        writes a record too, `ops: []`, never a delete, so the record is never absent again). The typed version conflict of a lost race is
+        retried (`CAS_TRIES`); only a well-formed acknowledgement about exactly this record counts as written (`reads.doc_written`), and
+        any other answer raises (review round 6, F18). Returns the mark of the body that landed."""
+        idx = f"lc-{self.tenant}-authz"
         try:
-            put_doc_landed(self._authz(), f"lc-{self.tenant}-authz", doc_id, doc, "refresh=true", alias=True)
+            for _ in range(CAS_TRIES):
+                cur = read_doc(self._authz(), idx, doc_id, alias=True)
+                body, mark = build()
+                cas = ("op_type=create",) if cur is None else (f"if_seq_no={cur['_seq_no']}", f"if_primary_term={cur['_primary_term']}")
+                if put_doc(self._authz(), idx, doc_id, body, "refresh=true", *cas, alias=True):
+                    return mark
         except IncompleteRead as e:
             raise RuntimeError("authz write refused") from e
-
-    def _authz_delete(self, doc_id: str) -> None:
-        """Only a confirmed delete or a verified absence of exactly this record (through the authz alias) lets the caller confirm a grant
-        removal; any other answer raises and the removal stays unconfirmed, so compaction keeps its journal record (review round 5)."""
-        try:
-            delete_doc(self._authz(), f"lc-{self.tenant}-authz", doc_id, "refresh=true", alias=True)
-        except IncompleteRead as e:
-            raise RuntimeError("authz delete refused") from e
+        raise RuntimeError("authz write not landed (lost compare-and-set)")
 
     def _persist_pool(self, p: pl.Pool) -> None:
-        self._authz_put(f"pp:{p.id}", _base(self.tenant, TENANT_CLS, "pool", [], pool=p.id, pool_cls=p.cls, pool_kind=p.kind,
-                                            label=p.label, card=p.card, private=p.private, state=p.state, counter=p.state_counter))
+        """The pool record as memory holds it when written (a pool no longer in memory is not written: its delete removes the record)."""
+        def build():
+            q = self.dir.get(self.tenant, p.id)
+            if q is None:
+                raise pl.PoolError("pool not in memory")
+            return _base(self.tenant, TENANT_CLS, "pool", [], pool=q.id, pool_cls=q.cls, pool_kind=q.kind, label=q.label, card=q.card,
+                         private=q.private, state=q.state, counter=q.state_counter), None
+        self._authz_put(f"pp:{p.id}", build)
 
     def _persist_grant(self, principal: str, pool: str) -> None:
-        ops = self.dir.live_ops(self.tenant, principal, pool)
-        gid = f"pg:{principal}:{pool}"
-        if not ops:
-            self._authz_delete(gid)
-            return
-        row = [r for r in self.dir.grant_rows(self.tenant) if r[0] == principal and r[1] == pool][0]
-        self._authz_put(gid, _base(self.tenant, TENANT_CLS, "pgrant", [principal], principal=principal, pool=pool,
-                                   ops=sorted(ops), counter=row[3]))
+        """The grant record as memory holds it when written; no operations left is a record with `ops: []` (a removal is a write, never a
+        delete). A landed write confirms every removal of this grant made up to its mark (the counter when its body was taken): its body
+        holds them, and every write built before it can no longer land."""
+        def build():
+            ops, counter, mark = self.dir.grant_state(self.tenant, principal, pool)
+            return _base(self.tenant, TENANT_CLS, "pgrant", [principal], principal=principal, pool=pool, ops=sorted(ops),
+                         counter=counter), mark
+        mark = self._authz_put(f"pg:{principal}:{pool}", build)
+        with self._ulock:
+            for k in [k for k in self._unconfirmed if k[0] == principal and k[1] == pool and k[2] <= mark]:
+                del self._unconfirmed[k]
 
     # ---- authorization of the people operations ------------------------------------------------------------------------------
     def _is_admin(self, p: Principal) -> bool:
@@ -261,14 +321,13 @@ class PoolService:
 
         def record(c):
             r = {"t": "pool_grant_rm", "principal": target, "pool": pool_id, "ops": opset, "counter": c}
-            self._unconfirmed[(target, pool_id, c)] = r
+            with self._ulock:
+                self._unconfirmed[(target, pool_id, c)] = r
             return r
 
-        def persist(c):
-            self._persist_grant(target, pool_id)
-            self._unconfirmed.pop((target, pool_id, c), None)   # the authz copy no longer holds the grant: the record is not needed
-
-        _, rc = self.rev.journalled(lambda: self.dir.remove_grant(self.tenant, target, pool_id, opset), record, persist=persist)
+        # the persist confirms the removal when its write lands (`_persist_grant`); a failed one leaves it to the next start
+        _, rc = self.rev.journalled(lambda: self.dir.remove_grant(self.tenant, target, pool_id, opset), record,
+                                    persist=lambda c: self._persist_grant(target, pool_id))
         return {"ok": True, "denied": True, "durable": rc["durable_at"] is not None}
 
     def token_revoke(self, p: Principal, rec: Record, token_id: Any) -> dict:

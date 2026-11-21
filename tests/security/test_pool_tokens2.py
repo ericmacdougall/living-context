@@ -7,7 +7,7 @@ from living_context.config import Constants
 from living_context.gateway.sessions import TokenError
 from living_context.policy import pools as pl
 from tests.security.test_pool_tokens import Base, T, TB, UNAV, World, q
-from tests.unit.fake_es import unconfirmed_deletes, unconfirmed_puts
+from tests.unit.fake_es import unconfirmed_puts
 
 
 class Tokens(Base):
@@ -334,25 +334,33 @@ class Revocation(Base):
         self.assertIsNone(w.auth(tok, {a: q("query")}))
 
 
-    def test_a_grant_removal_stays_unconfirmed_until_its_authz_delete_is_confirmed(self):
+    def test_a_grant_removal_stays_unconfirmed_until_its_authz_write_is_confirmed(self):
         # Round 5: at f16ea94 any 404 or 200 to the record's delete confirmed the removal, so compaction dropped its journal record and a
-        # restart rebuilt the grant from the authz copy, which still held it. Only a confirmed delete (or a verified absence) of exactly
-        # this record, through the authz alias, confirms it now.
-        for name in unconfirmed_deletes(f"lc-{T}-authz", "pg:x", strict=False):
+        # restart rebuilt the grant from the authz copy, which still held it. Round 8: a removal is a write of the record with no
+        # operations (never a delete), conditioned on the record it read; only a well-formed acknowledgement about exactly this record,
+        # through the authz alias, confirms it. Any other answer to the write, or to the read it is conditioned on, leaves the removal
+        # unconfirmed (at the call and at the next start's write), and the journal keeps it.
+        gid0 = "pg:x"
+        cases = {f"PUT {n}": ("PUT", n) for n in unconfirmed_puts(f"lc-{T}-authz", gid0)}
+        cases.update({"GET 200 with an empty body": ("GET", (200, {})), "GET 404 with an empty body": ("GET", (404, {})),
+                      "GET 503": ("GET", (503, {}))})
+        for name, (method, answer) in cases.items():
             with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
                 w = World(tmp).start()
                 a = w.pool("alpha")
                 gid = f"pg:pt-user-alice:{a}"
-                w.authz.doc_answers[("DELETE", gid)] = unconfirmed_deletes(f"lc-{T}-authz", gid, strict=False)[name]
                 tok = w.mint("alice", {a: q("query")})
+                w.authz.doc_answers[(method, gid)] = unconfirmed_puts(f"lc-{T}-authz", gid)[answer] if method == "PUT" else answer
                 r = w.admin("pool_ungrant", who="user-alice", pool=a)
                 self.assertEqual((r["ok"], r["denied"], r["durable"]), (True, True, True))
                 self.assertIsNone(w.auth(tok, {a: q("query")}))
-                self.assertIn(gid, w.authz.docs)                      # the answer was no delete: the authz copy still holds the grant
+                self.assertEqual(w.authz.docs[gid]["ops"], ["query", "save"])   # the answer was no write: the copy still holds the grant
+                self.assertEqual(len(w.svc._unconfirmed), 1)
                 w.rev.compact()
                 w.restart()
                 self.assertEqual(w.dir.live_ops(T, "pt-user-alice", a), frozenset())   # the journal kept the removal
                 self.assertIsNone(w.auth(tok, {a: q("query")}))
+                self.assertEqual(len(w.svc._unconfirmed), 1)                         # the start-up write got the same answer
                 w.rev.clean_stop()
 
     def test_a_partial_grant_removal_stays_unconfirmed_until_its_authz_put_is_confirmed(self):

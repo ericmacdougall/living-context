@@ -370,14 +370,16 @@ class Registration(unittest.TestCase):
     def test_every_authz_start_up_and_erasure_search_is_a_complete_read(self):
         """C1 (pools delta review), F12: the authz, start-up and pool-erasure paths read through `reads.scan` (a PIT, the `_shard_doc`
         cursor, `complete_hits` on every page) and build no search path of their own. The package-wide enumeration of every request
-        call site is tests/unit/test_read_paths.py; this test pins the three start-up and pool-erasure modules to the scan."""
+        call site is tests/unit/test_read_paths.py; this test pins the three start-up and pool-erasure modules to the scan (the start-up
+        modules through `reads.restore_scan`, which judges each hit and reads through `scan`; review round 8, F3)."""
         for rel in ("gateway/pool_boot.py", "gateway/boot.py", "erasure/pool_scope.py"):
             tree = parse(rel)
             for n in ast.walk(tree):
                 if isinstance(n, ast.Constant) and isinstance(n.value, str):
                     self.assertNotIn("_search", n.value, rel + ": a search path built outside reads")
-            self.assertTrue(any(isinstance(c, ast.Call) and call_name(c) == "scan" for c in ast.walk(tree)), rel)
+            self.assertTrue(any(isinstance(c, ast.Call) and call_name(c) in ("scan", "restore_scan") for c in ast.walk(tree)), rel)
         reads = parse("gateway/reads.py")
+        self.assertIn("scan", {call_name(c) for c in ast.walk(symbol(reads, "restore_scan")) if isinstance(c, ast.Call)})
         checked = ast.unparse(symbol(reads, "complete_search")) + ast.unparse(symbol(reads, "_shards_complete"))
         for check in ("timed_out", "terminated_early", "failed", "successful", "total"):
             self.assertIn(check, checked)

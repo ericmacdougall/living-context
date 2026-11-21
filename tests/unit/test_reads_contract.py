@@ -62,6 +62,8 @@ HELPER_CASES = {
     "put_doc_landed": (lambda c: reads.put_doc_landed(c, IX, DID, {}, alias=True), [doc_answer("PUT", IX, DID, True)]),
     "delete_doc": (lambda c: reads.delete_doc(c, IX, DID, alias=True), [doc_answer("DELETE", IX, DID, True)]),
     "mget_docs": (lambda c: reads.mget_docs(c, [(IX, DID)], alias=True), [(200, {"docs": [{"_index": IX, "_id": DID, "found": False}]})]),
+    "restore_scan": (lambda c: reads.restore_scan(c, IX, "tena", {"pgrant": reads.record_id("pg", "principal", "pool")}),
+                     [(200, {"id": "pit1", "_shards": SHARDS_ONE}), (200, SEARCH), (200, {"succeeded": True, "num_freed": 1})]),
 }
 
 
@@ -274,6 +276,57 @@ class FieldShapes(unittest.TestCase):
             with self.subTest(what):
                 with self.assertRaises(reads.IncompleteRead):
                     reads.mget_items(200, {"docs": [d]}, [(IX, DID)], True)
+
+
+
+# ---- records that become authority (review round 8, F3) ----------------------------------------------------------------------------
+# Every function of reads.py whose first parameter is `hit` judges a record before start-up builds authority from it. Each must refuse
+# the record with any ONE identity field off (index, id, tenant, kind, the fields its id is made of) and accept the record itself.
+REC_IDS = {"grant": reads.record_id("gr", "principal"), "pgrant": reads.record_id("pg", "principal", "pool")}
+GOOD_HIT = {"_index": PHYS, "_id": "pg:pt-a:p1", "_source": {"tenant": "tena", "kind": "pgrant", "principal": "pt-a", "pool": "p1"},
+            "sort": [3]}
+HIT_OFF = [(("_index",), (OTHER, OTHER + "-p0a0b0c0d", IX + "-pnothex00", IX + "x", "", 7, None)),
+           (("_id",), ("pg:pt-a:p2", "pg:pt-b:p1", "gr:pt-a", "pg:pt-a", "", 7, None)),
+           (("_source",), ("x", [], None)),
+           (("_source", "tenant"), ("tenb", "", 7, None)),
+           (("_source", "kind"), ("grant", "token", "", None, ["pgrant"])),
+           (("_source", "principal"), ("pt-b", "pt-a:p1", "", 7, None, ["pt-a"])),
+           (("_source", "pool"), ("p2", "p1:x", "", 7, None))]
+RESTORER_CASES = {"restored": lambda hit: reads.restored(hit, IX, "tena", REC_IDS)}
+
+
+class Restored(unittest.TestCase):
+    def test_every_restorer_of_reads_py_is_covered_here(self):
+        tree = ast.parse(READS.read_text())
+        found = {n.name for n in tree.body if isinstance(n, ast.FunctionDef) and n.args.args and n.args.args[0].arg == "hit"}
+        self.assertEqual(found, set(RESTORER_CASES))
+
+    def test_control_the_record_itself_is_restored_under_the_alias_and_the_physical_name(self):
+        for name, judge in RESTORER_CASES.items():
+            for index in (PHYS, IX):
+                with self.subTest(name, index=index):
+                    self.assertEqual(judge(dict(copy.deepcopy(GOOD_HIT), _index=index)), GOOD_HIT["_source"])
+
+    def test_one_identity_field_off_is_refused(self):
+        for name, judge in RESTORER_CASES.items():
+            for what, hit in one_field_off(GOOD_HIT, HIT_OFF):
+                with self.subTest(name, field=what):
+                    with self.assertRaises(reads.IncompleteRead):
+                        judge(hit)
+
+    def test_a_scan_with_one_record_off_restores_the_rest_and_is_not_complete(self):
+        good2 = copy.deepcopy(GOOD_HIT)
+        good2["_id"], good2["_source"]["pool"] = "pg:pt-a:p2", "p2"
+        for what, bad in list(one_field_off(GOOD_HIT, HIT_OFF))[::3]:
+            with self.subTest(field=what):
+                page = dict(SEARCH, hits={"hits": [copy.deepcopy(GOOD_HIT), bad, good2]})
+                c = Client([(200, {"id": "pit1", "_shards": SHARDS_ONE}), (200, page), (200, {"succeeded": True, "num_freed": 1})])
+                out, complete = reads.restore_scan(c, IX, "tena", REC_IDS)
+                self.assertEqual(out, [GOOD_HIT["_source"], good2["_source"]])
+                self.assertFalse(complete)
+        page = dict(SEARCH, hits={"hits": [copy.deepcopy(GOOD_HIT), good2]})   # the control
+        c = Client([(200, {"id": "pit1", "_shards": SHARDS_ONE}), (200, page), (200, {"succeeded": True, "num_freed": 1})])
+        self.assertEqual(reads.restore_scan(c, IX, "tena", REC_IDS), ([GOOD_HIT["_source"], good2["_source"]], True))
 
 
 if __name__ == "__main__":

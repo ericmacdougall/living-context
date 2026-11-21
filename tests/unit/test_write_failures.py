@@ -55,6 +55,10 @@ ALLOWED = {
     ("gateway/pool_boot.py", "load"): (
         2, "start-up delete of an expired token's document (the inner handler, and the record-parse handler around it): counted only "
            "when it landed; the token is not restored either way, and the next start retries the delete"),
+    ("gateway/pool_admin.py", "PoolService._rewrite"): (
+        1, "the start-up rewrite of a removed pool grant (`confirm_against_authz`; review round 8): nobody is answered, and nothing is "
+           "confirmed by it: only `_persist_grant`, after its write landed, drops a removal's journal record, so a failed write leaves "
+           "the removal journalled and replayed at the next start; one grant's failure does not stop the others' rewrites"),
 }
 
 # functions that take something away: none may hold a site, whatever ALLOWED says

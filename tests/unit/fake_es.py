@@ -149,12 +149,42 @@ class FakeEs:
 
 
 class FakeAuthz:
-    """The tenant's authz index as a dict: PUT, DELETE and a `terms kind` search. `down` makes every call fail (a blocked index).
-    Document answers name the physical index behind the alias (`behind`), as Elasticsearch does; `doc_answers[(method, id)]` gives the
-    exact (status, body) of that document request instead, without touching the record (a malformed answer)."""
+    """The tenant's authz index as a dict, with what the authz paths rely on (the shapes tests/security/test_pools_rescue_es.py pins):
+
+    * PUT, GET and DELETE of one document, answered about the physical index behind the alias (`behind`), with the document's own
+      sequence number (one counter for the index, primary term 1). A PUT may be conditional, as on the cluster: `op_type=create` lands
+      only on an absent document, `if_seq_no` and `if_primary_term` only on the document at exactly that sequence number; otherwise the
+      typed 409 (`conflict`) and nothing is written. A DELETE leaves nothing behind (a deleted document is absent again).
+    * a `terms kind` search in a point in time (insertion order stands for `_shard_doc`); every hit names the physical index.
+
+    `down` makes every call fail (a blocked index). `doc_answers[(method, id)]` gives the exact (status, body) of that document request
+    instead, without touching the record (a malformed answer). `hold` (a set of ids, or True for every id) answers a PUT with 503 and
+    keeps it: `land_late()` applies it later, its conditions checked then (a write that timed out at the client and still reached the
+    index); `late_refused` counts the late writes the index refused. `rewrite_hits(hits)`, when set, replaces the hits of every search
+    page (a foreign or malformed hit)."""
 
     def __init__(self):
         self.docs, self.down, self.doc_answers = {}, False, {}
+        self.seqs, self.seq = {}, 0
+        self.hold, self.late, self.late_refused = set(), [], 0
+        self.rewrite_hits = None
+
+    def land_late(self):
+        late, self.late = self.late, []
+        for path, did, phys, body in late:
+            if self._put(path, did, phys, body)[0] == 409:
+                self.late_refused += 1
+
+    def _put(self, path, did, phys, body):
+        qs = dict(x.split("=", 1) for x in path.partition("?")[2].split("&") if "=" in x)
+        have = did in self.docs
+        if (qs.get("op_type") == "create" and have) or ("if_seq_no" in qs and (
+                not have or str(self.seqs.get(did, 0)) != qs["if_seq_no"] or qs.get("if_primary_term") != "1")):
+            return conflict(phys)
+        self.seq += 1
+        self.docs[did], self.seqs[did] = body, self.seq
+        return (200 if have else 201), {"_index": phys, "_id": did, "_version": self.seq, "result": "updated" if have else "created",
+                                        "_shards": SHARDS_ONE, "_seq_no": self.seq, "_primary_term": 1}
 
     def request(self, method, path, body=None, **kw):
         if self.down:
@@ -163,7 +193,7 @@ class FakeAuthz:
         if p.endswith("/_pit"):   # a point in time: the snapshot is the record ids in insertion order (one shard)
             self.pits = getattr(self, "pits", {})
             pid = f"pit{len(self.pits)}"
-            self.pits[pid] = list(self.docs)
+            self.pits[pid] = (list(self.docs), behind(p[1:-len("/_pit")]))
             return 200, {"id": pid, "_shards": {"total": 1, "successful": 1, "skipped": 0, "failed": 0}}
         if p == "/_pit" and method == "DELETE":
             return 200, {"succeeded": getattr(self, "pits", {}).pop(body["id"], None) is not None, "num_freed": 1}
@@ -172,21 +202,34 @@ class FakeAuthz:
             return self.doc_answers[(method, did)]
         phys = behind(p.split("/_doc/")[0].lstrip("/")) if did is not None else None
         if method == "PUT":
-            created = did not in self.docs
-            self.docs[did] = body
-            return doc_answer("PUT", phys, did, True, created=created)
+            if self.hold is True or did in self.hold:
+                self.late.append((path, did, phys, body))
+                return 503, {}
+            return self._put(path, did, phys, body)
+        if method == "GET":
+            if did not in self.docs:
+                return 404, {"_index": phys, "_id": did, "found": False}
+            return 200, {"_index": phys, "_id": did, "_version": self.seqs.get(did, 0) + 1, "_seq_no": self.seqs.get(did, 0), "_primary_term": 1,
+                         "found": True, "_source": self.docs[did]}
         if method == "DELETE":
-            return doc_answer("DELETE", phys, did, self.docs.pop(did, None) is not None)
+            found = self.docs.pop(did, None) is not None
+            self.seqs.pop(did, None)
+            self.seq += 1
+            return (200 if found else 404), {"_index": phys, "_id": did, "_version": self.seq, "result": "deleted" if found else "not_found",
+                                             "_shards": SHARDS_ONE, "_seq_no": self.seq, "_primary_term": 1}
         q = body["query"]
         kinds = q["terms"]["kind"] if "terms" in q else [q["term"]["kind"]]
-        ids = self.pits[body["pit"]["id"]] if "pit" in body else list(self.docs)
+        ids, phys = self.pits[body["pit"]["id"]] if "pit" in body else (list(self.docs), None)
         keys = [i for i in ids if i in self.docs and self.docs[i].get("kind") in kinds]   # insertion order stands for `_shard_doc`
         start = (int(body["search_after"][0]) + 1) if body.get("search_after") else 0
         size = int(body.get("size", 10))
         self.searches = getattr(self, "searches", 0) + 1
         page = list(enumerate(keys))[start:start + size]
+        hits = [{"_index": phys, "_id": i, "_source": self.docs[i], "sort": [n]} for n, i in page]
+        if self.rewrite_hits is not None:
+            hits = self.rewrite_hits(hits)
         return 200, {"timed_out": False, "_shards": {"total": 1, "successful": 1, "skipped": 0, "failed": 0},   # a complete answer, as ES gives
-                     "hits": {"hits": [{"_id": i, "_source": self.docs[i], "sort": [n]} for n, i in page]}}
+                     "hits": {"hits": hits}}
 
 
 class ShardedFake(FakeEs):

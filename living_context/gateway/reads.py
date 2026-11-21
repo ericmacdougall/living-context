@@ -23,7 +23,10 @@ answer is never bound to a name, so no code path can read it unchecked. The requ
 * index administration: `acknowledged`, `index_created`, `setting_value`, `deleted_docs`;
 * aliases and points in time: `alias_answer`, `pit_answer`;
 * API keys: `api_keys_active`, `api_keys_invalidated`, `api_key_created` (a key that is not in the answer is never reported as handled;
-  `keyowner.invalidate` reads the active keys back).
+  `keyowner.invalidate` reads the active keys back);
+* a record that start-up turns into authority (a grant, a pool, a pool grant, a token, a taint): `restored`, one hit or document at a
+  time, after the answer itself passed its validator; `restore_scan` reads a whole kind that way. tests/unit/test_restore_paths.py
+  fails a module that builds authority from a `_source` it read itself.
 
 A multi-page traversal goes through `scan`: a point in time (PIT) and the `_shard_doc` sort give every document of one consistent
 snapshot a unique position, so `search_after` neither skips nor repeats one (review F12); each page passes `complete_hits`, a page that
@@ -314,6 +317,49 @@ def mget_docs(client: Any, wanted: Sequence[tuple], *, alias: bool = False) -> l
     if not wanted:
         return []
     return mget_items(*client.request("POST", "/_mget", {"docs": [{"_index": i, "_id": d} for i, d in wanted]}), wanted, alias)
+
+
+# ---- records that become authority ---------------------------------------------------------------------------------------------
+def record_id(prefix: str, *fields: str):
+    """The id rule of a record kind: `prefix:<field>:<field>...`, each field a non-empty string without ':' (principal tokens are hex,
+    pool ids 16 lowercase alphanumerics, token hashes hex), so one id names exactly one record. A source whose fields do not make an
+    id has none (`IncompleteRead`)."""
+    def id_of(source: dict) -> str:
+        vals = [source.get(f) for f in fields]
+        if not all(isinstance(v, str) and v and ":" not in v for v in vals):
+            raise IncompleteRead("record without the fields of its id")
+        return ":".join((prefix, *vals))
+    return id_of
+
+
+def restored(hit: Any, index: str, tenant: str, ids: Any) -> dict:
+    """The `_source` of a search hit or a fetched document that start-up (or a reload) turns into authority or into a confirmation (a
+    grant, a pool, a pool grant, a token, a taint), when the hit is exactly a record of the kind asked, of this tenant (review round 8,
+    F3): `_index` is `index` or its physical index (`same_index`, alias form), `_source` is an object, its `tenant` is `tenant`, its
+    `kind` is one of `ids` (kind to id rule, `record_id`), and `_id` is the id that rule gives for the source. Anything else raises: a
+    hit of another tenant's index or naming another tenant, a record under another record's id, a kind the read did not ask for."""
+    if not isinstance(hit, dict) or not same_index(index, hit.get("_index"), alias=True):
+        raise IncompleteRead("record not from the index asked")
+    s = hit.get("_source")
+    if not isinstance(s, dict) or s.get("tenant") != tenant or not isinstance(s.get("kind"), str) or s["kind"] not in ids:
+        raise IncompleteRead("record not of this tenant or of a kind asked")
+    if hit.get("_id") != ids[s["kind"]](s):
+        raise IncompleteRead("record under another id")
+    return s
+
+
+def restore_scan(client: Any, index: str, tenant: str, ids: Any, *, page: int = 500) -> tuple[list, bool]:
+    """Every record of the kinds `ids` in `index`, read in one snapshot (`scan`: a failed or partial page raises), each judged by
+    `restored`. Returns (the sources of the records that are exactly what they claim, complete): a hit that is not is never restored,
+    and `complete` is then False, so nothing may be confirmed from this read (no removal or reduction is taken as landed, no retention
+    record dropped)."""
+    out, complete = [], True
+    for h in scan(client, index, {"query": {"terms": {"kind": sorted(ids)}}}, page=page):
+        try:
+            out.append(restored(h, index, tenant, ids))
+        except IncompleteRead:
+            complete = False
+    return out, complete
 
 
 # ---- index administration ---------------------------------------------------------------------------------------------------------

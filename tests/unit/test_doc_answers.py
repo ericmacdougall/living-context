@@ -126,7 +126,8 @@ class BootExpiredTokens(unittest.TestCase):
 
     def setUp(self):
         self.fa = FakeAuthz()
-        self.fa.docs[self.DID] = {"kind": "token", "hash": "h1", "rec_json": json.dumps({"exp": 10.0})}
+        self.fa.docs[self.DID] = {"tenant": T, "kind": "token", "hash": "h1", "lin_subjects": ["pt-a"],
+                                  "rec_json": json.dumps({"tenant": T, "principal": "pt-a", "exp": 10.0})}
 
     def load(self):
         return pool_boot.load(lambda: self.fa, T, pl.PoolDirectory(), None, None, now=100.0)["expired_deleted"]

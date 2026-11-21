@@ -347,11 +347,12 @@ class Boot(Base):
         self.assertEqual(self.admin.request("GET", f"/lc-{T}-authz/_count?q=kind:token")[1]["count"], 1)
 
     def test_m7_a_partial_read_confirms_no_removal(self):
+        # round 8: after a complete read the removal is written again and confirmed when that write lands (never on what a read shows)
         a = self.pool("alpha")
         self.svc._unconfirmed[("pt-user-alice", a, 1)] = {"t": "grant_removed", "principal": "pt-user-alice", "pool": a, "ops": ["query"], "counter": 1}
-        self.svc.confirm_against_authz({}, complete=False)
+        self.svc.confirm_against_authz(complete=False)
         self.assertEqual(len(self.svc._unconfirmed), 1)
-        self.svc.confirm_against_authz({}, complete=True)
+        self.svc.confirm_against_authz(complete=True)
         self.assertEqual(len(self.svc._unconfirmed), 0)
 
 

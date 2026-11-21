@@ -110,13 +110,18 @@ class SessionStates:
 import datetime
 import hashlib
 
-from .reads import IncompleteRead, put_doc, read_doc
+from .reads import IncompleteRead, put_doc, read_doc, restored
 
 PERSIST_TRIES = 20   # lost compare-and-sets in a row before a raise is refused (a handful of parallel raises at most, module doc)
 
 
 def _doc_id(key: tuple) -> str:
     return "cv:" + hashlib.sha256("\x00".join(key).encode()).hexdigest()[:40]
+
+
+def _record(doc: dict, idx: str, did: str, tenant: str) -> dict:
+    """The stored session record of a document read by its id (`reads.restored`: this index, this id, this tenant, kind `session`)."""
+    return restored(doc, idx, tenant, {"session": lambda s: did})
 
 
 def _taint_of(source: dict, tenant: str, key: tuple) -> Taint:
@@ -142,7 +147,7 @@ def es_persist(client: Callable[[], object], tenant: str) -> Callable[[tuple, Ca
         try:
             for _ in range(PERSIST_TRIES):
                 cur = read_doc(client(), idx, did, alias=True)
-                t = merge(None if cur is None else _taint_of(cur["_source"], tenant, key))
+                t = merge(None if cur is None else _taint_of(_record(cur, idx, did, tenant), tenant, key))
                 body = {"tenant": tenant, "cls": "tenantwide", "kind": "session", "lin_leaves": [], "lin_leaf_ids": [], "lin_nodes": [],
                         "lin_subjects": [key[1]], "lin_queries": [], "derivation": "taint", "erasure_rewrite": 0, "schema_v": 1,
                         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "taint_cls": t.cls or "",
@@ -162,8 +167,9 @@ def es_load(client: Callable[[], object], tenant: str) -> Callable[[tuple], Opti
     or a 200 that is not this record found, would otherwise read as the floor and lower the taint after a restart (review round 5)."""
     def load(key: tuple) -> Optional[Taint]:
         try:
-            r = read_doc(client(), f"lc-{tenant}-ctl", _doc_id(key), alias=True)
-            return None if r is None else _taint_of(r["_source"], tenant, key)
+            idx, did = f"lc-{tenant}-ctl", _doc_id(key)
+            r = read_doc(client(), idx, did, alias=True)
+            return None if r is None else _taint_of(_record(r, idx, did, tenant), tenant, key)
         except IncompleteRead as e:
             raise StateError("taint unreadable") from e
     return load

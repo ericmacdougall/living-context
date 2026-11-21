@@ -112,12 +112,14 @@ class GrantStore:
         self._journals[tenant] = journal
         journal.register_records((REDUCE,), lambda r: self.apply_record(tenant, r), lambda: self.snapshot_records(tenant))
 
-    def restore(self, p: Principal, rev: int = 0) -> None:
-        """A grant read back at start-up (revision `rev` of the copy): memory only, no persist; narrowed to an unconfirmed reduction."""
+    def restore(self, p: Principal, rev: int = 0, *, evidence: bool = True) -> None:
+        """A grant read back at start-up (revision `rev` of the copy): memory only, no persist; narrowed to an unconfirmed reduction.
+        `evidence=False`: the read it came from was not complete (a record was refused, `boot.read_grants`), so it is no evidence of
+        what the copy holds: it confirms no reduction, now or when the journal replays later."""
         k = (p.tenant, p.token)
         with self._lock:
             self._g[k] = p
-            if rev >= self._copy_rev.get(k, 0):
+            if evidence and rev >= self._copy_rev.get(k, 0):
                 self._copy_rev[k], self._copy[k] = rev, p
             self._rev[k] = max(self._rev.get(k, 0), rev)
             self._settle(k)

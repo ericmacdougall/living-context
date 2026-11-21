@@ -30,7 +30,7 @@ from .admin import GrantStore
 from .handler import EsGate
 from .journal import TombstoneJournal
 from .keyowner import invalidate_all
-from .reads import IncompleteRead, put_doc_landed, scan
+from .reads import IncompleteRead, put_doc_landed, record_id, restore_scan
 from .revocation import OPEN, RevocationService
 from .sessions import EpochTable
 
@@ -58,18 +58,28 @@ def grant_persister(gate: EsGate, tenant: str) -> Callable[..., None]:
     return persist
 
 
+GRANT_IDS = {"grant": record_id("gr", "principal")}   # the id rule of a grant record (`grant_persister`)
+
+
 def load_grants(gate: EsGate, tenant: str, *, page: int = 1000) -> list[Principal]:
-    """Every grant of the tenant's authz index (`load_grant_revs`, without the revisions)."""
-    return [p for p, _ in load_grant_revs(gate, tenant, page=page)]
+    """Every grant of the tenant's authz index (`read_grants`, without the revisions)."""
+    return [p for p, _ in read_grants(gate, tenant, page=page)[0]]
 
 
 def load_grant_revs(gate: EsGate, tenant: str, *, page: int = 1000) -> list[tuple[Principal, int]]:
+    """Every grant of the tenant's authz index with its revision (`read_grants`, without `complete`)."""
+    return read_grants(gate, tenant, page=page)[0]
+
+
+def read_grants(gate: EsGate, tenant: str, *, page: int = 1000) -> tuple[list[tuple[Principal, int]], bool]:
     """Every grant record of the tenant's authz index with its revision (0 for a record written before revisions), in one snapshot
-    paged until exhausted (`reads.scan`). A failed or partial page is an error (`reads.complete_hits`; the caller starts with no
-    grants, which fails closed: nobody can mint a session until a grant is made again)."""
+    paged until exhausted, and whether the read is COMPLETE. A failed or partial page is an error (`reads.scan`; the caller starts with
+    no grants, which fails closed: nobody can mint a session until a grant is made again). A hit that is not exactly a grant record of
+    this tenant (`reads.restored`: index, id `gr:<principal>`, tenant, kind; review round 8, F3), or one that does not parse, is not
+    restored and makes the read incomplete: no reduction may be confirmed from it."""
+    sources, complete = restore_scan(gate.client(tenant, "authz"), f"lc-{tenant}-authz", tenant, GRANT_IDS, page=page)
     out = []
-    for h in scan(gate.client(tenant, "authz"), f"lc-{tenant}-authz", {"query": {"term": {"kind": "grant"}}}, page=page):
-        s = h["_source"]
+    for s in sources:
         try:
             rev = s.get("rev", 0)
             if type(rev) is not int or rev < 0:
@@ -77,8 +87,8 @@ def load_grant_revs(gate: EsGate, tenant: str, *, page: int = 1000) -> list[tupl
             out.append((Principal(tenant, s["principal"], frozenset(Role(x) for x in s["roles"]), frozenset(s.get("read", [])),
                                   frozenset(s.get("write", [])), s.get("own_class") or None), rev))
         except (KeyError, ValueError, TypeError):
-            continue   # a record that does not parse is no grant
-    return out
+            complete = False   # a record that does not parse is no grant, and the read is not complete
+    return out, complete
 
 
 @dataclass
@@ -91,6 +101,7 @@ class TenantRuntime:
     grants: GrantStore
     loaded_grants: int = 0
     grant_load_error: str = ""   # why the grants could not be read back (an empty store fails closed)
+    grants_incomplete: bool = False   # a record was refused: the grants read are restored, but nothing is confirmed from the read
     guard_records: int = 0
 
 
@@ -112,10 +123,14 @@ def start_tenant(tenant: str, *, gate: EsGate, epochs: EpochTable, epoch_dir: Pa
     if not broken_skip_load:
         rt.guard_records = guard.load_journal(tomb.records())
         try:
-            for p, r in load_grant_revs(gate, tenant):
-                grants.restore(p, r)
+            found, complete = read_grants(gate, tenant)
+            for p, r in found:   # an incomplete read restores the grants it holds, but is no evidence of what the copy holds
+                grants.restore(p, r, evidence=complete)
                 rt.loaded_grants += 1
-            grants.loaded(tenant)   # the read was complete (a failed or partial one raised before any restore)
+            if complete:
+                grants.loaded(tenant)   # every grant the copy holds was restored (a failed or partial read raised before any restore)
+            else:
+                rt.grants_incomplete = True   # a record that is not exactly a grant of this tenant was refused (review round 8, F3)
         except Exception as e:   # nothing readable: no grants, nobody can mint a session until they are made again (fail closed)
             rt.grant_load_error = f"{type(e).__name__}: {e}"
     return rt
