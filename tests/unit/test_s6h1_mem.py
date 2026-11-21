@@ -28,6 +28,15 @@ class SmallScale(unittest.TestCase):
         self.assertEqual(self.rep["level1_groups"], shape["l1_calls"])
         self.assertEqual(self.rep["cluster_n"][0], 600)
 
+    def test_the_report_records_the_clusterer_workers_it_ran_with(self):
+        self.assertEqual(self.rep["cluster_workers"], 1)
+        from living_context.structure import cluster
+        orig = cluster.balanced_groups
+        with mock.patch.object(cluster, "balanced_groups", side_effect=lambda v, f, **kw: orig(v, f, **kw)) as spy:
+            rep = mem.measure(300, 384, 200, cluster_workers=3)
+        self.assertEqual(rep["cluster_workers"], 3)
+        self.assertEqual({c.kwargs.get("workers") for c in spy.call_args_list}, {3})
+
     def test_the_runner_accepts_the_report_only_when_it_covers_the_expected_pool(self):
         p = Path(tempfile.mkdtemp()) / "proof.json"
         p.write_text(json.dumps(self.rep))

@@ -27,8 +27,10 @@ below holds; nothing here is started without them. Placeholders: `<run-dir>`, `<
 2. The code commit `<C>` is pushed and synced to the run host once.
 3. Memory proof on the run host, at `<C>`, in a memory-capped scope, only when no other paid stage runs there and the host has about
    13 GB available (about 11 GB peak expected at 85,000 leaves; the measurement has not been made yet):
-   `python -I -m evalkit.s6h1_mem --leaves 85000 --json <host-dir>/mem-proof.json`. The runner refuses a proof measured on other code,
-   one below 78,700 leaves, a host without the proven peak plus 2 GB free, and, after ingest, a pool with more leaves than were proven.
+   `python -I -m evalkit.s6h1_mem --leaves 85000 --cluster-workers <W> --json <host-dir>/mem-proof.json`. The runner refuses a proof
+   measured on other code, one below 78,700 leaves, one whose clusterer ran with fewer workers than the run's `--cluster-workers`, a host
+   without the proven peak plus one CLI process (256 MB) per `--concurrency` plus 2 GB free, and, after ingest, a pool with more leaves
+   than were proven.
 4. Amendments the registration requires before S6 (EXPERIMENT 3.2, 7.2): the H1 power amendment from S3's measured discordance and
    cluster count, and the exposure audit; any question it adds to DEV-EXPOSED is passed to the freeze (`--dev-exposed-extra`).
 5. Freeze: `python -I -m evalkit.s6h1_freeze --s3-run-dir <s3-run-dir> --commit <C> --model <model-id>` writes
@@ -57,6 +59,12 @@ python -m evalkit.run_s6h1 --dataset <dataset> --es-url <es-url> --es-ca <es-ca>
   and the budget at the exact leaf count. A refusal before that leaves the stamp unspent; an ingested tenant is attached, not re-ingested.
 - A fresh start deletes the `s6h1` tenant's own indices and its own registry row only; other tenants on the same Elasticsearch are kept.
 - `--model` and `--a0-fields` must be the frozen ones; `--commit` must be the manifest's code commit.
+- `--concurrency N` (registered 2; above 2 needs `--concurrency-reason`, recorded in the stamp and in `starts.jsonl`): model calls at
+  once. Questions and build groups run on N workers; the ledger, the tree and the results are the same at any N (tested at 1 and 4 with
+  seeded node ids). The budget multiplies the throttle and refusal allowances by N.
+- `--cluster-workers W` (default 1): clusterer threads. The groups are byte-identical at any W (MEASURED on the run host, synthetic
+  384-d vectors: 20,000 leaves 172 s at W=1, 21 s at W=16; 40,000 leaves 692 s at W=1, 78 s at W=16, the same groups SHA-256;
+  78,700 leaves 297 s and 3.6 GB at W=16). Each worker holds one 16 MB block buffer, so the memory proof must use at least W.
 
 ## Watch, stop, resume
 
@@ -72,9 +80,9 @@ fields. The journal is scoped per question, so a resume replays only the in-flig
 row schema, per-question rows, opaque references), `h1_decision.json` (the word, (a), (b), (c), the SHUFFLED control, BCa, the 299
 sensitivity, DEV-EXPOSED, abstention and per-type strata, top-10 gold by source), `summaries.json`.
 
-## Wall time (floor, serial)
+## Wall time (floor, serial: `--concurrency 1 --cluster-workers 1`)
 
-Ingest about 5 h (S2: 1,344 s for 5,988 leaves), clustering of 78,700 leaves (measured by step 3), build about 5,250 calls at 17.4 s
+Ingest about 5 h (S2: 1,344 s for 5,988 leaves), clustering of 78,700 leaves (about 33 to 45 min at W=1, est.; 5 min at W=16, measured on synthetic vectors), build about 5,250 calls at 17.4 s
 (about 25 h), recalls 362 at about 67 calls and 2.2 s per call (about 15 h): roughly two days.
 
 ## Not covered

@@ -19,6 +19,7 @@ exit 2 with STATE `REFUSED` for a refusal after the start (memory or budget)."""
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import sys
@@ -137,6 +138,9 @@ def check_prereqs(a, *, embed=None, manifest_path: Path = fz.MANIFEST, root: Pat
     except (OSError, ValueError) as e:
         why.append(str(e))
     else:
+        cw, proven_cw = int(getattr(a, "cluster_workers", 1) or 1), int(mp.get("cluster_workers", 1) or 1)
+        if cw > proven_cw:                  # each clusterer worker holds its own block buffer: the proof must cover the count used
+            why.append("the memory proof ran the clusterer with %d workers, fewer than --cluster-workers %d" % (proven_cw, cw))
         free = mem_available()
         need = float(mp["peak_rss_mb"]) + n_par * CLI_CHILD_MB + MEM_MARGIN_MB
         if free is not None and free < need:
@@ -186,6 +190,7 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
     from living_context.config import Constants
     from living_context.model.budget import Budget, BudgetExceeded
     from living_context.model.port import PortRefused
+    from living_context.structure import cluster
     from living_context.structure.build import BuildFailed
     from . import arms, claude_cli, s2_stage
     from .eval_tenant import CLS
@@ -236,6 +241,7 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
         return write_state(run_dir, "REFUSED", leaves=n_leaves, error="%d leaves exceed the %d whose build memory was proven; prove the "
                            "larger size with evalkit.s6h1_mem first" % (n_leaves, proven_max_leaves))
     n_par = int(getattr(a, "concurrency", par.REGISTERED_CONCURRENCY) or 1)
+    cluster_workers = int(getattr(a, "cluster_workers", 1) or 1)
     est = bud.estimate(n_leaves, bud.measured_rates(a.rates_from), concurrency=n_par)
     (run_dir / "budget.json").write_text(json.dumps(est, indent=1, sort_keys=True))
     print("call estimate at %d leaves: expected %d, top %d, cap %d" % (n_leaves, est["expected"], est["top"], a.approved_cap), flush=True)
@@ -260,14 +266,15 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
     port = ResilientPort(inner, budget, journal, run_dir / "STOP", max_retries=a.max_retries, base_delay_s=a.base_delay,
                          concurrency=n_par)
     with open(run_dir / "starts.jsonl", "a") as f:      # every start or resume, with its concurrency (outputs do not depend on it)
-        f.write(json.dumps({"at": time.time(), "commit": a.commit, "concurrency": n_par,
+        f.write(json.dumps({"at": time.time(), "commit": a.commit, "concurrency": n_par, "cluster_workers": cluster_workers,
                             "concurrency_reason": getattr(a, "concurrency_reason", "") or ""}, sort_keys=True) + "\n")
     ledger = s2_stage.Ledger(run_dir / "done.jsonl")
     shuffled_qids = st.shuffled_subset(fs, vals["thresholds"]["shuffled_n"])
     state, extra = "COMPLETE", {}
     try:
         if not resumed_built:
-            tree = et.build_and_publish(port, pmap=par.ordered_map(n_par), port_for=lambda k: port.scoped("build|" + k))
+            tree = et.build_and_publish(port, pmap=par.ordered_map(n_par), port_for=lambda k: port.scoped("build|" + k),
+                                        grouper=functools.partial(cluster.balanced_groups, workers=cluster_workers))
             (run_dir / "tree.json").write_text(json.dumps({"nodes": len(tree.nodes), "levels": tree.levels, "top": len(tree.top),
                                                             "build_calls": tree.calls, "leaves": n_leaves}, indent=1))
             built.write_text(json.dumps({"at": time.time()}))
@@ -336,6 +343,8 @@ def parser() -> argparse.ArgumentParser:
                     help="model calls at once (registered %d; questions and build groups run concurrently, outputs do not depend on it)"
                     % par.REGISTERED_CONCURRENCY)
     ap.add_argument("--concurrency-reason", default="", help="required above the registered value; recorded in the stamp")
+    ap.add_argument("--cluster-workers", type=int, default=1,
+                    help="clusterer threads (the groups do not depend on it); the memory proof must have used at least as many")
     return ap
 
 

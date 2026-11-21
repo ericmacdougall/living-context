@@ -20,7 +20,7 @@ from living_context.model.cache import DictStore
 from living_context.model.port import ModelPort
 from living_context.model.stub import StubBackend
 from living_context.policy import ClassLattice
-from living_context.structure import build
+from living_context.structure import build, cluster
 from tests.security.test_run_s2_es import Runner
 from tests.unit import test_run_s6h1 as t6
 
@@ -404,7 +404,11 @@ class Stage(unittest.TestCase):
     def test_one_worker_and_four_workers_give_byte_identical_outputs(self):
         rc1, *_, run1 = self.go(1)
         r4 = SafeRunner()
-        rc4, *_, run4 = self.go(4, runner=r4)
+        real = cluster.balanced_groups
+        with mock.patch.object(cluster, "balanced_groups", side_effect=lambda v, f, **kw: real(v, f, **kw)) as spy:
+            rc4, *_, run4 = self.go(4, runner=r4, cluster_workers=3)
+        self.assertEqual({c.kwargs.get("workers") for c in spy.call_args_list}, {3})     # every level clustered on three threads
+        self.assertEqual(json.loads((run4 / "starts.jsonl").read_text().splitlines()[-1])["cluster_workers"], 3)
         self.assertEqual((rc1, rc4), (0, 0))
         o1, o4 = self.outputs(run1), self.outputs(run4)
         self.assertGreater(r4.max_inflight, 1)                     # the four-worker run really overlapped calls

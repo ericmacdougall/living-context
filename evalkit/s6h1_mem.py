@@ -67,7 +67,7 @@ def synthetic_leaves(n: int, dim: int, chars: int, seed: int = 16096, topics: in
     return out
 
 
-def measure(n: int, dim: int = 384, chars: int = LEAF_CHARS) -> dict:
+def measure(n: int, dim: int = 384, chars: int = LEAF_CHARS, cluster_workers: int = 1) -> dict:
     from living_context.config import Constants
     from living_context.model.budget import Budget
     from living_context.model.cache import DictStore
@@ -76,7 +76,7 @@ def measure(n: int, dim: int = 384, chars: int = LEAF_CHARS) -> dict:
     from living_context.policy import ClassLattice
     from living_context.structure import build, cluster
 
-    rep = {"leaves": n, "dim": dim, "leaf_chars": chars, "rss_start_mb": current_mb()}
+    rep = {"leaves": n, "dim": dim, "leaf_chars": chars, "cluster_workers": cluster_workers, "rss_start_mb": current_mb()}
     t0 = time.time()
     leaves = synthetic_leaves(n, dim, chars)
     rep["make_s"], rep["rss_after_leaves_mb"] = time.time() - t0, current_mb()
@@ -86,7 +86,7 @@ def measure(n: int, dim: int = 384, chars: int = LEAF_CHARS) -> dict:
 
     def timed(vectors, f_target):
         t = time.time()
-        g = real(vectors, f_target)
+        g = real(vectors, f_target, workers=cluster_workers)
         timing.setdefault("cluster_s", []).append(round(time.time() - t, 1))
         timing.setdefault("cluster_n", []).append(len(vectors))
         return g
@@ -110,8 +110,9 @@ def main(argv=None) -> int:
     ap.add_argument("--dim", type=int, default=384)
     ap.add_argument("--chars", type=int, default=LEAF_CHARS)
     ap.add_argument("--json", default="")
+    ap.add_argument("--cluster-workers", type=int, default=1, help="clusterer threads, as the run will use them")
     a = ap.parse_args(argv)
-    rep = measure(a.leaves, a.dim, a.chars)
+    rep = measure(a.leaves, a.dim, a.chars, a.cluster_workers)
     print(json.dumps(rep, sort_keys=True), flush=True)
     if a.json:
         Path(a.json).write_text(json.dumps(rep, indent=1, sort_keys=True))

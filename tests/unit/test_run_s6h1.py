@@ -42,9 +42,11 @@ def setup_dirs():
     return base, s3, man, run
 
 
-def proof(path, leaves=10 ** 6, peak=9000.0, code=None, dim=384):
-    Path(path).write_text(json.dumps({"tool": "evalkit.s6h1_mem", "leaves": leaves, "peak_rss_mb": peak, "dim": dim,
-                                      "code_sha256": code or fz.code_digest()}))
+def proof(path, leaves=10 ** 6, peak=9000.0, code=None, dim=384, cluster_workers=None):
+    rep = {"tool": "evalkit.s6h1_mem", "leaves": leaves, "peak_rss_mb": peak, "dim": dim, "code_sha256": code or fz.code_digest()}
+    if cluster_workers is not None:
+        rep["cluster_workers"] = cluster_workers
+    Path(path).write_text(json.dumps(rep))
     return path
 
 
@@ -53,7 +55,7 @@ def args(base, s3, run, **kw):
              stamp_registry=str(base / "stamps.jsonl"), embed_dir="", binary="fake", model=MODEL, rates_from=[str(logs())],
              model_kind="claude", approved_cap=35574, approval_ref=APPROVAL, release_ref=REF, commit=COMMIT, a0_fields="strong",
              resume=False, threads=1, max_retries=2, base_delay=0.0, mem_proof=str(base / "mem.json"), concurrency=1,
-             concurrency_reason="")
+             concurrency_reason="", cluster_workers=1)
     a.update(kw)
     return argparse.Namespace(**a)
 
@@ -146,6 +148,13 @@ class Guards(unittest.TestCase):
         # each concurrent CLI process needs its own memory on top of the proven build peak
         self.has("4 CLI processes", free=9000.0 + rs.CLI_CHILD_MB + rs.MEM_MARGIN_MB, concurrency=4, concurrency_reason="probe")
         self.assertEqual(self.why(free=9000.0 + 4 * rs.CLI_CHILD_MB + rs.MEM_MARGIN_MB, concurrency=4, concurrency_reason="probe"), [])
+
+    def test_more_clusterer_workers_than_the_memory_proof_used_are_refused(self):
+        self.has("clusterer with 1 workers, fewer than --cluster-workers 4", cluster_workers=4)    # a proof without the field: one
+        proof(self.base / "m5.json", cluster_workers=16)
+        self.assertEqual(self.why(mem_proof=str(self.base / "m5.json"), cluster_workers=16), [])
+        self.assertEqual(self.why(mem_proof=str(self.base / "m5.json"), cluster_workers=8), [])
+        self.has("with 16 workers, fewer than --cluster-workers 17", mem_proof=str(self.base / "m5.json"), cluster_workers=17)
 
     def test_concurrency_above_the_registered_value_needs_a_recorded_reason(self):
         self.has("above the registered 2", free=64000.0, concurrency=4)
