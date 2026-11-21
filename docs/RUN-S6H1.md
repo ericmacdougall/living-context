@@ -143,9 +143,12 @@ S3 (restarted) and S6-H1 run on Muse Spark: in every command above, and in S3's 
 - `--rpm` (at most 140, default 140): request starts per minute for THIS run. Runs at the same time on the same upstream limit
   split it (S3 and the early build: their `--rpm` sum to at most 140). `--api-timeout` (default 240 s) is per request.
 - A 429, a 503 or OpenRouter's in-flight 402 backs off for at least Retry-After (per call, `--max-retries`) and is not a failure
-  of the five-failure streak. A billing or budget refusal (402, OpenRouter's 403 with a limit source) or a reported model other than
-  `--model` stops the stage at once (LIMIT_REACHED, exit 76); the refused call is asked again on the resume. A 504, a timeout, any
-  other error, and an answer cut short by `--max-tokens` (finish reason `length`) are failed calls, never answers.
+  of the five-failure streak. Only the exponential back-off is capped; a Retry-After above 3,600 s stops the stage resumably
+  (exit 75, STATE `PAUSED_THROTTLE` with the reason and `retry_after_s`): resume after the time STATE names. A stop file ends a
+  back-off or a pacer wait at once, before any further charge. A billing or budget refusal (402, OpenRouter's 403 with a limit
+  source) or a reported model other than `--model` stops the stage at once (LIMIT_REACHED, exit 76): no further call is charged
+  or sent, and the refused call is asked again on the resume. A 504, a timeout, any other error, and an answer cut short by
+  `--max-tokens` (finish reason `length`) are failed calls, never answers.
 - `calls.jsonl` records the HTTP status, the prompt, completion, reasoning and cached token counts, the reported model, the upstream
   provider, the finish reason and the cost; STATE.json records `models_reported` and `providers_reported`; every `done.jsonl` row
   records the model identity and, per arm, the recall's `port` timeouts, errors and invalid answers.
@@ -156,7 +159,8 @@ S3 (restarted) and S6-H1 run on Muse Spark: in every command above, and in S3's 
 
 As S2 (docs/RUN-S2.md): `<run-dir>.out`, `counter`, `calls.jsonl`, `done.jsonl`, `journal.jsonl`, `budget.json`, `STATE.json`. Stop:
 `touch <run-dir>/STOP`. Resume: remove STOP, repeat the start command with `--resume` and the same commit, cap, references, model and
-fields. The journal is scoped per question, so a resume replays only the in-flight question's own calls. Exit codes: 0 complete,
+fields. The journal is scoped per question and per build group at every `--concurrency`, so a resume replays every answered call
+even with another `--concurrency`; a journal with unscoped keys (an older commit at one worker) is refused. Exit codes: 0 complete,
 2 refused (before the start, or after ingest for memory or budget, with STATE `REFUSED` and no call charged), 3 stopped, 4 cap reached,
 5 a build call failed, 75 throttled, 76 allowance limit.
 

@@ -1432,10 +1432,13 @@ The rest of 10.3 (S6-H2 and the loop stages) is not restated here.
   - Pacing: one pacer per run spaces request starts at `--rpm` per minute. The registered ceiling is 140, under the upstream 150.
     Runs at the same time split it: S3 and the early build sum to at most 140.
   - Retries: a 429, a 503 or OpenRouter's in-flight 402 backs off for at least its Retry-After and is asked again, up to
-    `--max-retries` times per call. Each retry is one charged call, inside the cap. A throttle is not a failure of the
-    five-failure streak.
+    `--max-retries` times per call. Only the exponential back-off is capped (600 s); Retry-After is a minimum and is waited in
+    full. A Retry-After above 3,600 s (ASSUMPTION: the longest wait a run sits through) stops the stage resumably at once, with no
+    retry spent (PAUSED_THROTTLE, exit 75; STATE.json records the requested wait and when to resume). Each retry is one charged
+    call, inside the cap. A throttle is not a failure of the five-failure streak.
   - Stops: a billing or budget refusal stops the stage at once, never retried. So does a response that reports another model than
-    the one requested (or its pinned snapshot name).
+    the one requested (or its pinned snapshot name), and so does the stop file. "At once" means no further call is charged or sent:
+    a worker waiting in the pacer, in a back-off or at the charge is stopped before its charge (review F1).
   - Failed calls: a 504, a timeout, any other error, and an answer cut short by the output limit (finish reason `length`) are failed
     calls: never an answer, counted in the five-failure streak, and handled by the product's own fallback like any failed call.
   - Records: every call row records the HTTP status, the prompt, completion, reasoning and cached token counts, the reported model,
@@ -1444,7 +1447,14 @@ The rest of 10.3 (S6-H2 and the loop stages) is not restated here.
     fields, `--rpm` and the request timeout. STATE.json records the reported models and upstream providers.
   - Key: the API key is read by the port inside the run process, from a key file or a secret manager named at run time only. It
     is in no file of the repository or of a run directory.
-  - Concurrency: the rules of 14.4 apply unchanged (adaptive, under `--concurrency`).
+  - Concurrency: the rules of 14.4 apply (adaptive, under `--concurrency`). Every journal key names its question or build group
+    at every worker count (review F2), so a resume with another `--concurrency` replays every answered call and charges nothing
+    twice; a journal with keys that name neither (an older commit at one worker) is refused, with no migration.
+  - The S3 run (disclosure): S3 started at commit afd0155, before the fixes of review F1 and F2 and of the Retry-After cap. On
+    that commit, at a stop, a worker already waiting in the pacer could still charge and send one call (at most one per worker);
+    such a call is recorded and counted in the cap like any other. A Retry-After above 600 s is waited 600 s per retry. Main's
+    operating rule (2026-11-21): the run is resumed only with the same arguments, so its worker count never crosses between one
+    and several (the case of review F2). The S6-H1 early build and the stamped run start from a commit with the fixes.
 - Fallbacks under load (review finding F7): with a real model, a timeout or a port error under load becomes a route fallback inside
   a finished question, so a result could depend on the concurrency. Every ledger row records, per arm (A1 and SHUFFLED), the
   timeouts, the port errors and the invalid answers of that question's recall, beside its fallbacks. The report states the
