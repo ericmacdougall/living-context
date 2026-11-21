@@ -25,7 +25,9 @@ class RescueReadsES(Base):
     def setUp(self):
         super().setUp()
         for i, idx in enumerate(self.IDX):
-            st, r = self.admin.request("PUT", f"/{idx}", {"settings": {"number_of_shards": 1, "number_of_replicas": 0}})
+            st, r = self.admin.request("PUT", f"/{idx}", {   # keyword strings, as the product mappings have them (term queries)
+                "settings": {"number_of_shards": 1, "number_of_replicas": 0},
+                "mappings": {"dynamic_templates": [{"strings": {"match_mapping_type": "string", "mapping": {"type": "keyword"}}}]}})
             self.assertEqual(st, 200, r)
             self.addCleanup(self.admin.request, "DELETE", f"/{idx}")
             st, r = self.admin.request("PUT", f"/{idx}/_doc/q{i}?refresh=true", {

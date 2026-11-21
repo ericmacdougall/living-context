@@ -186,6 +186,14 @@ class SendFencePools(unittest.TestCase):
         got = ln.answer()
         self.assertTrue(got.get("ok") is True and got.get("denied") is True, got)
 
+    def test_a_response_past_its_send_deadline_ends_the_connection_and_is_counted(self):
+        self.server.send_deadline_s = 0   # the deadline has passed before the first hand-off
+        ln = self.line()
+        ln.send(self.tok, **self.fetch())
+        got, closed = ln.read(timeout=5)
+        self.assertEqual((got, closed), (b"", True), "a response past its deadline must end the connection, never leave a partial line")
+        self.assertEqual((self.server.expired, self.server.aborted), (1, 0))
+
     # ---- inside the fence: the removal is ordered after the paused write, and the next chunk aborts -----------------------------
     def in_fence(self):
         """Pause the FIRST hand-off of a fetch between its check and its write (under the shared side), start an ungrant of its pool,
