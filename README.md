@@ -95,8 +95,8 @@ more gold sessions, n = 59) gives A0 0.441, A0+LEN 0.458, A1 0.475, tree-only
   tree alone as the best arm; on this larger pilot with a different model it is
   the worst. Model, n, pool and tree depth all changed, and the 30 questions are
   a subset of the 94, so the difference is not attributed.
-- **Cost.** About 35 model calls (A1 alone averages 31.7 route calls, plus up to
-  7.9 organise calls) and about $0.019 per tree recall, at a $0.10 / $0.20 per
+- **Cost.** About 35 model calls averaged over A1 and the shuffled control (an
+  A1 recall makes 37 to 40: 31.7 route calls on average, plus organise calls) and about $0.019 per tree recall, at a $0.10 / $0.20 per
   million token tier, and about five minutes of serial model time per recall
   (the parallel mode was not timed), against about 45 ms and zero model calls
   for flat search.

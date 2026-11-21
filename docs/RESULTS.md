@@ -17,7 +17,7 @@ are means.
 | A0+LEN | A0's top 50 re-ranked by RRF score plus beta times ln(session tokens); beta chosen from a seven-value grid on these same 94 questions (in-sample). A weak control: it changes recall on 1 of 94. |
 | A1 | Tree recall fused with the direct flat list by reciprocal-rank fusion (RRF). |
 | A1-tree-only | The tree list alone. |
-| SHUFFLED-SUMMARIES | Tree with summaries shuffled across nodes (negative control; should be near chance). |
+| SHUFFLED-SUMMARIES | Tree whose child descriptors (title, gist, entities, facts; leaves included) are rotated by half a level. A weak negative control: zero recall is near certain by construction. |
 
 Storage: Elasticsearch 9.5.6 (pinned image); embedder
 intfloat/multilingual-e5-small @614241f (480-token windows, mean-pooled).
@@ -94,7 +94,7 @@ tree-only 0.322.
 |---|---|
 | Total model spend | $4.47 for 6,291 calls (0 throttled, 3 unparseable build outputs, 1 connection error) |
 | One-time tree build (18,120 leaves) | 1,212 calls, $1.70; build_l1 median latency 14.1 s, p90 17.4 s |
-| Recall | 5,079 calls for 144 tree recalls (94 A1 + 50 SHUFFLED): about 35 calls and about $0.019 per recall, averaged with the SHUFFLED control; about 85.9k input and 53.1k output tokens per recall; A1 alone averages 31.7 route calls (plus up to 7.9 organise calls). The dollar figure reflects a $0.10 / $0.20 per million token tier |
+| Recall | 5,079 calls for 144 tree recalls (94 A1 + 50 SHUFFLED): about 35 calls averaged over A1 and the SHUFFLED control (an A1 recall makes 37 to 40) and about $0.019 per recall; about 85.9k input and 53.1k output tokens per recall; A1 alone averages 31.7 route calls (the ledger does not split organise calls by arm). The dollar figure reflects a $0.10 / $0.20 per million token tier |
 | Route call latency | median 8.3 s (p90 15.2 s) |
 | Organise call latency | 6.0 s (p90 11.7 s) |
 | A0 flat search | about 45 ms per query (94 queries in 4.2 s), zero model calls |
@@ -125,6 +125,9 @@ recorded in the run directory.
 A1 - A0 recall@10 = +0.094, 95% clustered bootstrap CI [-0.033, +0.224]. The
 interval crosses zero. Cost: route median 1.9 s, build 17.4 s; about 67 calls per
 recall; 4.39 h for build plus 60 recalls.
+
+All-gold@10 here is over all 30 questions; on the registered set (two or more
+gold sessions, n = 16) it is A0 0.562, A1 0.625, tree-only 0.500.
 
 ## Partial S3 on Sonnet (abandoned)
 
