@@ -194,8 +194,13 @@ class PoolService:
     def _persist_grant(self, principal: str, pool: str) -> None:
         """The grant record as memory holds it when written; no operations left is a record with `ops: []` (a removal is a write, never a
         delete). A landed write confirms every removal of this grant made up to its mark (the counter when its body was taken): its body
-        holds them, and every write built before it can no longer land."""
+        holds them, and every write built before it can no longer land. Nothing is written for a pool that is gone or being deleted: its
+        erasure removes every record of the pool, and a write after that would create one that nothing deletes (a removal made then stays
+        journalled until the next start drops it, `confirm_against_authz`)."""
         def build():
+            q = self.dir.get(self.tenant, pool)
+            if q is None or q.state == pl.DELETING:
+                raise pl.PoolError("pool gone or being deleted")
             ops, counter, mark = self.dir.grant_state(self.tenant, principal, pool)
             return _base(self.tenant, TENANT_CLS, "pgrant", [principal], principal=principal, pool=pool, ops=sorted(ops),
                          counter=counter), mark

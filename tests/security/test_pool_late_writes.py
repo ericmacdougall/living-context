@@ -223,6 +223,33 @@ class ErasedPool(unittest.TestCase):
                 self.assertEqual(w.svc._unconfirmed, {})
             w.rev.clean_stop()
 
+    def test_a_removal_made_while_the_pool_is_being_erased_writes_no_record(self):
+        # another administrator removes alice's grant while the erasure runs (the pool is `deleting`, still in memory): the eraser has
+        # already deleted the pool's records, so the removal's write would create one that nothing deletes any more
+        with tempfile.TemporaryDirectory() as tmp:
+            holder = {}
+
+            def eraser(cls, pool):
+                fa = holder["w"].authz
+                for d in [d for d in fa.docs if d == f"pp:{pool}" or (d.startswith("pg:") and d.endswith(":" + pool))]:
+                    del fa.docs[d]
+                    fa.seqs.pop(d, None)
+                holder["ungrant"] = holder["w"].admin("pool_ungrant", who="user-alice", pool=pool)   # during the erasure
+                return SimpleNamespace(docs_deleted=0, indices_dropped=[])
+            w = holder["w"] = World(tmp, svc_kw={"eraser": eraser}).start()
+            a = w.pool("alpha")
+            admins = [Principal(T, f"pt-user-{n}", frozenset({Role.TENANT_ADMIN}), frozenset({"base"}), frozenset({"base"}))
+                      for n in ("admin", "admin2")]
+            w.svc.delete(admins[0], a)
+            self.assertTrue(w.svc.delete(admins[1], a)["deleted"])
+            self.assertTrue(holder["ungrant"]["denied"])                 # the removal itself took effect
+            self.assertFalse([d for d in w.authz.docs if d.endswith(a)], "a record of the erased pool was written during the erasure")
+            w.rev.compact()
+            w.restart()
+            self.assertFalse([d for d in w.authz.docs if d.endswith(a)])
+            self.assertEqual(w.svc._unconfirmed, {})
+            w.rev.clean_stop()
+
 
 class Reservation(unittest.TestCase):
     def test_counters_are_reserved_in_the_journal_and_each_start_begins_above_the_last_ceiling(self):
