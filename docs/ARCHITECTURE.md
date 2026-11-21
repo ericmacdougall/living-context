@@ -56,13 +56,14 @@ flowchart TD
     subgraph READ["Read side: recall for a prompt"]
         direction TB
         Q["Prompt"]
-        R["Parallel route fan-out<br/>each index holder (an LLM call) picks<br/>children that may be relevant"]
+        R["Route fan-out (parallel by design; serial in the pilot)<br/>each index holder (an LLM call) picks<br/>children that may be relevant"]
         O["Organise<br/>assemble pointers with sizes, no content"]
         T["Tree list"]
         F["Flat hybrid list<br/>BM25 + dense, no model calls"]
         X["RRF fusion"]
         P["Pointer set returned to the agent"]
-        Q --> R --> O --> T --> X
+        Q --> R --> T --> X
+        R --> O
         Q --> F --> X
         X --> P
     end
@@ -133,8 +134,8 @@ child that is itself a node becomes a new holder call as soon as its parent
 answers, bounded by a holder budget. A holder is one stateless model call over a
 bounded number of child entries. Outputs are validated against the presented
 labels, and a failed call falls back to embedding routing and is flagged. The
-parent merges pointers and sums sizes in code, and an "organise" step assembles
-the pointer set. What leaves is a pointer contract (ids, sizes, paths), not
+parent merges pointers and sums sizes in code, and an "organise" step groups
+the pointers into an outline for the reader. What leaves is a pointer contract (ids, sizes, paths), not
 content. A reader of several access classes gets one digest per class, merged by
 reciprocal rank. Organise output shapes the outline only; it does not change the
 ranked list. The embedding fallback uses the stub embedder. Modules:

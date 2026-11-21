@@ -34,10 +34,9 @@ text version of the diagram is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   session on the pilot data).
 - **Summary tree.** Level-1 summaries cover groups of 16 leaves; upper levels
   are built recursively over those.
-- **Recall.** Index holders are asked in parallel which children may be
-  relevant; calls within a tree level are designed to run concurrently (the
-  pilot ran them serially within a recall). Parents return pointers
-  and sizes. The tree list is fused with a direct flat hybrid list by
+- **Recall.** Index holders are asked which children may be relevant. Calls
+  within a tree level are designed to run concurrently; the pilot ran them
+  serially within a recall. Parents return pointers and sizes. The tree list is fused with a direct flat hybrid list by
   reciprocal-rank fusion (RRF).
 - **Storage.** Elasticsearch 9.5.6 (pinned image); embedder
   intfloat/multilingual-e5-small @614241f.
