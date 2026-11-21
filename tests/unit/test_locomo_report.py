@@ -50,7 +50,8 @@ def write_run(d: Path, *, failed_tree=()):
     (d / "calls.jsonl").write_text("".join(json.dumps({"task": t, "strict_ok": True, "latency_s": 2.0, "input_tokens": 10, "output_tokens": 5}) + "\n"
                                            for t in ("route", "route", "build_l1")))
     (d / "STATE.json").write_text(json.dumps({"state": "COMPLETE", "counter": 3, "cap": 9000, "models_reported": ["m"]}))
-    (d / "BUILT_0.json").write_text(json.dumps({"build_calls": 1, "seconds": 3.0}))
+    (d / "BUILT_0.json").write_text(json.dumps({"build_calls": 1, "seconds": 3.0, "nodes": 3}))
+    (d / "BUILT_1.json").write_text(json.dumps({"build_calls": 1, "seconds": 3.0, "nodes": 4}))      # conv 1 has 4 nodes: its rows (3 holder calls) opened fewer
 
 
 class T(unittest.TestCase):
@@ -92,6 +93,11 @@ class T(unittest.TestCase):
         self.assertEqual(res["batches"]["B1"]["a0_recall_time_equals_a0_all"], {"same": 4, "of": 4})
         self.assertEqual(res["completion"]["b1_completed"], 4)
         self.assertEqual(res["completion"]["shuffled_completed"], 1)
+
+    def test_routing_line_counts_recalls_that_opened_every_node(self):
+        res, run = self.run_report()
+        self.assertEqual(res["batches"]["B1"]["routing"], {"holder_calls_equal_node_count": 2, "of": 4})     # only the two conv-0 rows
+        self.assertIn("Routing: in 2 of 4 recalls", rep.render(res, run))
 
     def test_a_failed_recall_scores_zero_and_is_counted_not_dropped(self):
         res, _ = self.run_report(failed_tree=("c0#1",))
