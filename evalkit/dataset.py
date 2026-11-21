@@ -86,6 +86,59 @@ def load_questions(path: str, *, expect_sha256: Optional[str] = DATASET_SHA256) 
         return [parse_record(r) for r in json.load(fh)]
 
 
+# ---- the pool contents alone, sealed at parse time (EXPERIMENT 14.5) ----------------------------------------------------------
+POOL_KEYS = ("haystack_session_ids", "haystack_sessions") + WHITELIST_TURN
+
+
+def _pool_pairs(pairs):
+    """json object hook: keep only the haystack arrays of a record and role/content of a turn; every other key (the question, the
+    answer, the gold session ids, has_answer, dates, ids, the question type) is dropped as it is parsed."""
+    return {k: v for k, v in pairs if k in POOL_KEYS}
+
+
+def pool_contents(path: str, *, expect_sha256: Optional[str] = DATASET_SHA256) -> List[Tuple[str, Tuple[Tuple[str, str], ...]]]:
+    """(content hash, turns) of every haystack session of every record, first copy of each content, in dataset order: the same list
+    as `run_s6h1.whole_pool(load_questions(path))`, with the same refusals (sha256, haystack arrays of two lengths, one session id
+    with two contents) and the same first-copy rule for an id repeated inside one haystack. No `Question` is built and no question,
+    answer or gold field is held in any object: they are dropped by the parser (`_pool_pairs`)."""
+    if expect_sha256 is not None and file_sha256(path) != expect_sha256:
+        raise DatasetError("dataset sha256 differs from the registered one")
+    with open(path, "r", encoding="utf-8") as fh:
+        recs = json.load(fh, object_pairs_hook=_pool_pairs)
+    per_record = []
+    for rec in recs:
+        sids, sess = rec["haystack_session_ids"], rec["haystack_sessions"]
+        if len(sids) != len(sess):
+            raise DatasetError("haystack arrays differ in length")
+        seen, out = set(), []
+        for sid, turns in zip(sids, sess):
+            if sid in seen:     # as parse_record: a session id repeated inside one haystack keeps its first copy
+                continue
+            seen.add(sid)
+            out.append((sid, tuple((str(t["role"]), str(t["content"])) for t in turns)))
+        per_record.append(out)
+    ids: Dict[str, str] = {}
+    for out in per_record:  # as session_hashes: over every record before any content is taken
+        for sid, turns in out:
+            h = turns_hash(turns)
+            if sid in ids and ids[sid] != h:
+                raise DatasetError("session id has two different contents")
+            ids[sid] = h
+    pool, taken = [], set()
+    for out in per_record:
+        for sid, turns in out:
+            h = ids[sid]
+            if h not in taken:
+                taken.add(h)
+                pool.append((h, turns))
+    return pool
+
+
+def pool_sha256(pool: Sequence[Tuple[str, object]]) -> str:
+    """sha256 of the ordered content hashes of a pool (binds a prebuilt tenant to the pool a stamped run recomputes)."""
+    return hashlib.sha256("\n".join(h for h, _ in pool).encode()).hexdigest()
+
+
 # ---- content identity -------------------------------------------------------------------------------------------
 def turns_hash(turns: Sequence[Tuple[str, str]]) -> str:
     return hashlib.sha256(json.dumps([[r, t] for r, t in turns], ensure_ascii=False).encode("utf-8")).hexdigest()

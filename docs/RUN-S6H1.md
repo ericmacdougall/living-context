@@ -87,6 +87,40 @@ python -m evalkit.run_s6h1 --dataset <dataset> --es-url <es-url> --es-ca <es-ca>
   (LIMIT_REACHED); at a fixed concurrency it stops at once. Every call row and journal `pending` row records the concurrency at the
   time; STATE records `limited`, `concurrency_now` and `concurrency_changes`. Outputs do not depend on the concurrency.
 
+## Early build (EXPERIMENT 14.5)
+
+The whole-pool ingest and the tree build can run before S3 completes, the freeze and the release, in the run directory the stamped
+run will use:
+
+```
+python -m evalkit.run_s6h1 --prebuild --amendment-ref DEV-14.5 --dataset <dataset> --es-url <es-url> --es-ca <es-ca> \
+  --es-pw-file <es-pw-file> --embed-dir <model-dir> --binary <claude-binary> --model <model-id> --run-dir <run-dir> \
+  --rates-from <s2-run-dir> <s3-run-dir> --stamp-registry <host-dir>/stamped-stages.jsonl --mem-proof <host-dir>/mem-proof.json \
+  --commit <C> --approved-cap 35574 --approval-ref "<the owner's approval of S6-H1>" --a0-fields <S3's A0 fields> \
+  [--threads 1 --embed-workers 24 --ingest-writers 8 --reuse-from-tenant <S3's tenant> --cluster-workers 16 \
+   --concurrency 7 --concurrency-reason "..."] > <run-dir>.prebuild.out 2>&1 &
+```
+
+- It reads the pool contents only (`dataset.pool_contents`: the haystack arrays and each turn's role and content; every other field,
+  the question, the answer and the gold ids included, is dropped by the parser). No release, freeze manifest or fresh set is read;
+  `--release-ref` and `--s3-run-dir` are not needed.
+- The same gates as the stamped start apply (cap, approval, real embedder and model, stop file, concurrency, memory proof and the
+  budget), plus: no STAMP.json in the run directory, no S6-H1 run or early build of another run directory in the registry.
+- It writes PREBUILD.json (commit, full code digest, cap, approval and amendment references, A0 fields, model, `--threads`, the
+  pool's content count and ordered-hash digest, leaves) and an `S6-H1-prebuild` registry row, charges the build to the run's
+  counter and cap, and ends with STATE `PREBUILT` (exit 0). A rerun continues through the journal (stop: `touch <run-dir>/STOP`;
+  the concurrency may change between reruns); every other recorded value must be the same.
+- The CODE IS FROZEN at `<C>` from here on: the memory proof is measured on it, the freeze must name it, and the stamped run refuses
+  another commit, code digest, A0 fields, model, `--threads`, cap or approval than PREBUILD.json's, and a whole pool whose ordered
+  content hashes differ. A change anywhere in `living_context/` or `evalkit/` after `<C>` voids the early build: the stamped run
+  refuses it, and the registry refuses an early build or a stamped run in another run directory, so a second build needs the
+  owner's decision on the calls already charged (they count against the cap) and a recorded amendment.
+- Sync the code with `git archive <C>` only, never a copy of a working tree (an untracked file under `evalkit/` would enter the code
+  digest), and write the memory proof (Preconditions, step 3) on that code before the early build.
+- The stamped run (Start, below; same run directory, after the freeze and RELEASE.json) attaches to the prebuilt tenant and tree,
+  builds nothing again, and copies PREBUILD.json into STAMP.json. A run directory with PREBUILD.json but no `tenant_state.json` is
+  refused: a prebuilt tenant is never reset.
+
 ## Watch, stop, resume
 
 As S2 (docs/RUN-S2.md): `<run-dir>.out`, `counter`, `calls.jsonl`, `done.jsonl`, `journal.jsonl`, `budget.json`, `STATE.json`. Stop:

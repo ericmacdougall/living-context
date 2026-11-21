@@ -30,6 +30,8 @@ from typing import Callable, List, Optional
 from . import dataset as ds, parallel as par, s6h1_budget as bud, s6h1_freeze as fz, s6h1_stage as st
 
 STAGE = "S6-H1"
+PREBUILD_STAGE = "S6-H1-prebuild"   # EXPERIMENT 14.5: the whole-pool tenant and tree built before the freeze, questions sealed
+PREBUILD_FILE = "PREBUILD.json"
 TENANT = "s6h1"
 REGISTERED_POOL = 18_464            # distinct session contents of all 500 questions (EXPERIMENT 3.3, MEASURED)
 EXPECTED_LEAVES = 78_700            # 18,464 x 4.262 leaves per session (S3's dev static pool; counts only)
@@ -37,8 +39,9 @@ MEM_MARGIN_MB = 2_048               # free memory beyond the proven peak that th
 CLI_CHILD_MB = 256                  # one headless CLI process (MEASURED: 238 MB peak RSS each, 4 at once on the run host)
 E5_WORKER_MB = 1_024                # one up-front embedding process (MEASURED: 761 to 800 MB RSS each, 3 at once, 6 threads)
 RC = {"COMPLETE": 0, "STOPPED": 3, "CAP_REACHED": 4, "BUILD_FAILED": 5, "PAUSED_THROTTLE": 75, "LIMIT_REACHED": 76, "ERROR": 1,
-      "REFUSED": 2}
+      "REFUSED": 2, "PREBUILT": 0}
 STAMP_KEYS = ("commit", "cap", "approval_ref", "release_ref", "freeze_sha256", "a0_fields", "model")
+PREBUILD_KEYS = ("commit", "code_sha256", "cap", "approval_ref", "amendment_ref", "a0_fields", "model", "threads")
 
 
 def _registry_rows(path) -> List[dict]:
@@ -79,15 +82,20 @@ def mem_proof(path, root: Path = fz.ROOT) -> dict:
 
 def check_prereqs(a, *, embed=None, manifest_path: Path = fz.MANIFEST, root: Path = fz.ROOT,
                   mem_available: Callable[[], Optional[float]] = mem_available_mb) -> List[str]:
-    """Reasons the stage must not start; empty when every guard passed. Reads no dataset content."""
+    """Reasons the stage must not start; empty when every guard passed. Reads no dataset content. With `--prebuild` (EXPERIMENT 14.5)
+    the release and the freeze are not needed, because no question is read: see `_prebuild_prereqs`."""
     from living_context.embed import e5
     why: List[str] = []
     if getattr(a, "stage", STAGE) != STAGE:
         why.append("this runner runs stage %s only" % STAGE)
     if not (a.approved_cap and 0 < a.approved_cap <= bud.APPROVED_CAP):
         why.append("--approved-cap must be the owner's S6-H1 cap, at most %d" % bud.APPROVED_CAP)
-    for k, name in (("approval_ref", "the owner's approval of S6-H1"), ("release_ref", "the owner's release of the fresh set"),
-                    ("commit", "the commit under test"), ("stamp_registry", "the host's stamp registry file")):
+    prebuild = bool(getattr(a, "prebuild", False))
+    refs = (("approval_ref", "the owner's approval of S6-H1"), ("commit", "the commit under test"),
+            ("stamp_registry", "the host's stamp registry file"))
+    refs += ((("amendment_ref", "the recorded amendment of the early build"),) if prebuild else
+             (("release_ref", "the owner's release of the fresh set"), ("s3_run_dir", "S3's run directory")))
+    for k, name in refs:
         if not str(getattr(a, k, "") or "").strip():
             why.append("%s is required (--%s)" % (name, k.replace("_", "-")))
     if a.model_kind != "claude":
@@ -96,9 +104,58 @@ def check_prereqs(a, *, embed=None, manifest_path: Path = fz.MANIFEST, root: Pat
         e5.require_real(embed, stage=STAGE)
     except e5.PinError:
         why.append("the pinned real embedder (multilingual-e5-small) is required")
+    rd = Path(a.run_dir)
+    if prebuild:
+        why += _prebuild_prereqs(a, rd, root)
+    else:
+        why += _stamped_prereqs(a, rd, manifest_path, root)
+    return why + _shared_prereqs(a, rd, root, mem_available)
+
+
+def _registry(a) -> List[dict]:
+    return [r for r in _registry_rows(a.stamp_registry) if r.get("stage") in (STAGE, PREBUILD_STAGE)] \
+        if str(getattr(a, "stamp_registry", "") or "").strip() else []
+
+
+def prebuild_record(run_dir) -> Optional[dict]:
+    p = Path(run_dir) / PREBUILD_FILE
+    return json.loads(p.read_text()) if p.exists() else None
+
+
+def _prebuild_now(a, root: Path) -> dict:
+    return {"commit": a.commit, "code_sha256": fz.code_digest(root), "cap": a.approved_cap, "approval_ref": a.approval_ref,
+            "amendment_ref": getattr(a, "amendment_ref", ""), "a0_fields": a.a0_fields, "model": a.model, "threads": a.threads}
+
+
+def _prebuild_prereqs(a, rd: Path, root: Path) -> List[str]:
+    """The early build (EXPERIMENT 14.5): before any stamped S6-H1 run, in one run directory only; a rerun continues it (journal
+    replay) only with the same commit, code, cap, references, fields, model and thread count. No release, freeze or question."""
+    why: List[str] = []
+    if (rd / "STAMP.json").exists():
+        why.append("a stamped S6-H1 run exists in the run directory: the early build is only before it")
+    here = os.path.realpath(a.run_dir)
+    rows = _registry(a)
+    if any(r.get("run_dir") != here for r in rows):
+        why.append("the stamp registry holds an S6-H1 run or early build in another run directory: refused")
+    if any(r.get("stage") == STAGE for r in rows):
+        why.append("the stamp registry holds a stamped S6-H1 run: the early build is only before it")
+    old = prebuild_record(rd)
+    if old is not None:
+        now = _prebuild_now(a, root)
+        for k in PREBUILD_KEYS:
+            if old.get(k) != now[k]:
+                why.append("the early build must continue with the same %s as %s" % (k, PREBUILD_FILE))
+    elif any(r.get("stage") == PREBUILD_STAGE for r in rows):
+        why.append("the stamp registry has an early build row for this run directory but no %s" % PREBUILD_FILE)
+    elif (rd / "BUILT.json").exists() or (rd / "counter").exists():     # an ingested tenant refused before any call is attached
+        why.append("the run directory holds a built tree or charged calls without %s" % PREBUILD_FILE)
+    return why
+
+
+def _stamped_prereqs(a, rd: Path, manifest_path: Path, root: Path) -> List[str]:
+    why: List[str] = []
     why += fz.check(commit=a.commit, s3_dir=a.s3_run_dir, model=a.model, a0_fields=a.a0_fields, path=manifest_path, root=root)
     fsha = fz.manifest_sha256(manifest_path) if Path(manifest_path).exists() else ""
-    rd = Path(a.run_dir)
     try:
         rec = ds.read_release(rd)
     except ds.Unreleased as e:
@@ -122,13 +179,27 @@ def check_prereqs(a, *, embed=None, manifest_path: Path = fz.MANIFEST, root: Pat
         why.append("--resume needs the stamp of an earlier start in the run directory")
     if str(getattr(a, "stamp_registry", "") or "").strip():
         here = os.path.realpath(a.run_dir)
-        rows = [r for r in _registry_rows(a.stamp_registry) if r.get("stage") == STAGE]
-        if any(r.get("run_dir") != here for r in rows):
-            why.append("the stamp registry holds a stamped S6-H1 run in another run directory: a second stamped run is refused")
+        both = _registry(a)
+        rows = [r for r in both if r.get("stage") == STAGE]
+        if any(r.get("run_dir") != here for r in both):
+            why.append("the stamp registry holds a stamped S6-H1 run or early build in another run directory: a second run is refused")
         if rows and not a.resume:
             why.append("the stamp registry already holds this run directory's S6-H1 run (start once; --resume continues)")
         if a.resume and stamp.exists() and not rows:
             why.append("the stamp registry has no row for this run; refusing to resume an unregistered run")
+    pre = prebuild_record(rd)
+    if pre is not None:                 # the early build (14.5) must be the code, fields and model under test
+        now = _prebuild_now(a, root)
+        for k in ("commit", "code_sha256", "a0_fields", "model", "threads", "cap", "approval_ref"):
+            if pre.get(k) != now[k]:
+                why.append("the early build's %s (%s) is not this run's: the prebuilt tree is not the one under test" % (k, PREBUILD_FILE))
+    elif (rd / "BUILT.json").exists() and not stamp.exists():
+        why.append("the run directory holds a built tree with neither a stamp nor %s" % PREBUILD_FILE)
+    return why
+
+
+def _shared_prereqs(a, rd: Path, root: Path, mem_available) -> List[str]:
+    why: List[str] = []
     if (rd / "STOP").exists():
         why.append("a stop file is present in the run directory; remove it to start or resume")
     n_par = getattr(a, "concurrency", par.REGISTERED_CONCURRENCY)
@@ -177,6 +248,10 @@ def _default_tenant(a, embedder, attach: bool):
                       registry_doc_only=True)      # the Elasticsearch is shared with S2/S3 tenants: never delete their registry rows
 
 
+class _Prebuilt(Exception):
+    """The early build ends after the tree is published (EXPERIMENT 14.5)."""
+
+
 def whole_pool(qs) -> List[tuple]:
     """(content hash, turns) of every haystack session of every question, first copy of each content, in dataset order."""
     hashes = ds.session_hashes(qs)
@@ -192,9 +267,14 @@ def whole_pool(qs) -> List[tuple]:
 
 def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, tenant_factory: Optional[Callable] = None,
         registered_pool: int = REGISTERED_POOL, registered_fresh=None, manifest_path: Path = fz.MANIFEST, root: Path = fz.ROOT,
-        embed_factory: Optional[Callable] = None) -> int:
+        embed_factory: Optional[Callable] = None, pool_loader: Optional[Callable] = None) -> int:
     """The body of S6-H1; `check_prereqs` must have passed. Tests pass a synthetic loader, an in-memory tenant, a fake runner and a
-    picklable embedder factory for the up-front embedding processes."""
+    picklable embedder factory for the up-front embedding processes.
+
+    With `--prebuild` (EXPERIMENT 14.5) the same body runs up to the built tree and stops in state PREBUILT: the pool comes from
+    `dataset.pool_contents` (no question, answer or gold is parsed into any object), no release or freeze is read, PREBUILD.json and
+    an `S6-H1-prebuild` registry row take the place of the stamp, and no question is asked. The stamped run later attaches to that
+    tenant and tree only when its recomputed whole pool has the same ordered content hashes."""
     from living_context.config import Constants
     from living_context.model.budget import Budget, BudgetExceeded
     from living_context.model.port import PortRefused
@@ -206,25 +286,37 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
 
     run_dir = Path(a.run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
-    man = fz.load(manifest_path)
-    fsha = fz.manifest_sha256(manifest_path)
-    vals = man["values"]
+    prebuild = bool(getattr(a, "prebuild", False))
     proven_max_leaves = int(mem_proof(a.mem_proof, root)["leaves"])
     stamp = run_dir / "STAMP.json"
+    pre = prebuild_record(run_dir)
     # nothing is stamped until every no-call gate has passed (data counts, pool count, memory, budget): a refusal leaves the run
     # directory and the host's stamp registry unspent, so a corrected start is still the stage's one stamped run
-    try:
-        qs = loader(a) if loader else ds.load_questions(a.dataset)
-        fs = ds.fresh_questions(qs, stage=STAGE, run_dir=run_dir, release_ref=a.release_ref, freeze_sha256=fsha,
-                                registered=registered_fresh if registered_fresh is not None else vals["registered_fresh"],
-                                extra_dev_exposed=vals.get("dev_exposed_extra", ()))
-    except ds.DatasetError as e:          # Unreleased is a DatasetError
-        return write_state(run_dir, "REFUSED", error="%s: %s" % (type(e).__name__, e))
-    hashes = ds.session_hashes(qs)
-    clusters = ds.content_clusters(qs, hashes)
-    pool = whole_pool(qs)
+    if prebuild:                          # the pool contents only: the questions, answers and gold stay sealed (EXPERIMENT 14.5)
+        man = vals = fsha = fs = hashes = clusters = None
+        try:
+            pool = pool_loader(a) if pool_loader else ds.pool_contents(a.dataset)
+        except ds.DatasetError as e:
+            return write_state(run_dir, "REFUSED", error="%s: %s" % (type(e).__name__, e))
+    else:
+        man = fz.load(manifest_path)
+        fsha = fz.manifest_sha256(manifest_path)
+        vals = man["values"]
+        try:
+            qs = loader(a) if loader else ds.load_questions(a.dataset)
+            fs = ds.fresh_questions(qs, stage=STAGE, run_dir=run_dir, release_ref=a.release_ref, freeze_sha256=fsha,
+                                    registered=registered_fresh if registered_fresh is not None else vals["registered_fresh"],
+                                    extra_dev_exposed=vals.get("dev_exposed_extra", ()))
+        except ds.DatasetError as e:          # Unreleased is a DatasetError
+            return write_state(run_dir, "REFUSED", error="%s: %s" % (type(e).__name__, e))
+        hashes = ds.session_hashes(qs)
+        clusters = ds.content_clusters(qs, hashes)
+        pool = whole_pool(qs)
     if len(pool) != registered_pool:
         return write_state(run_dir, "REFUSED", error="the whole pool has %d contents, registered %d" % (len(pool), registered_pool))
+    pool_sha = ds.pool_sha256(pool)
+    if pre is not None and pre.get("pool_sha256") != pool_sha:
+        return write_state(run_dir, "REFUSED", error="the whole pool differs from the one the early build ingested (%s)" % PREBUILD_FILE)
 
     consts = Constants()
     ingest_writers, embed_workers = int(getattr(a, "ingest_writers", 1) or 1), int(getattr(a, "embed_workers", 1) or 1)
@@ -232,6 +324,9 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
     built = run_dir / "BUILT.json"
     resumed_built = built.exists()
     ingested = (run_dir / "tenant_state.json").exists()
+    if (pre is not None or resumed_built) and not ingested:     # a fresh start resets the tenant: never over a prebuilt one
+        return write_state(run_dir, "REFUSED", error="the run directory has %s but no tenant_state.json; refusing to reset the tenant"
+                           % (PREBUILD_FILE if pre is not None else "BUILT.json"))
     make = tenant_factory or (lambda attach: _default_tenant(a, embedder, attach))
     et = make(resumed_built or ingested)
     if resumed_built or ingested:
@@ -279,12 +374,20 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
     if why:
         et.close()
         return write_state(run_dir, "REFUSED", leaves=n_leaves, error=why[0])
-    if not stamp.exists():
+    if prebuild and pre is None:
+        pre = dict(_prebuild_now(a, root), stage=PREBUILD_STAGE, pool_contents=len(pool), pool_sha256=pool_sha, leaves=n_leaves,
+                   embed_workers=embed_workers, ingest_writers=ingest_writers, mem_proof_sha256=fz._sha(Path(a.mem_proof)),
+                   started=time.time())
+        (run_dir / PREBUILD_FILE).write_text(json.dumps(pre, sort_keys=True))
+        with open(a.stamp_registry, "a") as f:
+            f.write(json.dumps({"stage": PREBUILD_STAGE, "run_dir": os.path.realpath(a.run_dir), "commit": a.commit,
+                                "code_sha256": pre["code_sha256"], "at": time.time()}, sort_keys=True) + "\n")
+    if not prebuild and not stamp.exists():
         stamp.write_text(json.dumps({"stage": STAGE, "commit": a.commit, "cap": a.approved_cap, "approval_ref": a.approval_ref,
                                      "release_ref": a.release_ref, "freeze_sha256": fsha, "a0_fields": a.a0_fields, "model": a.model,
                                      "beta": vals["beta"], "mem_proof_sha256": fz._sha(Path(a.mem_proof)), "leaves": n_leaves,
                                      "concurrency": n_par, "concurrency_reason": getattr(a, "concurrency_reason", "") or "",
-                                     "started": time.time()}, sort_keys=True))
+                                     "prebuild": pre, "started": time.time()}, sort_keys=True))
         with open(a.stamp_registry, "a") as f:
             f.write(json.dumps({"stage": STAGE, "run_dir": os.path.realpath(a.run_dir), "commit": a.commit, "freeze_sha256": fsha,
                                 "at": time.time()}, sort_keys=True) + "\n")
@@ -297,12 +400,13 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
     port = ResilientPort(inner, budget, journal, run_dir / "STOP", max_retries=a.max_retries, base_delay_s=a.base_delay,
                          concurrency=n_par, adaptive=adaptive, start_concurrency=min(n_par, 2) if adaptive else None)
     with open(run_dir / "starts.jsonl", "a") as f:      # every start or resume, with its concurrency (outputs do not depend on it)
-        f.write(json.dumps({"at": time.time(), "commit": a.commit, "concurrency": n_par, "cluster_workers": cluster_workers,
+        f.write(json.dumps({"at": time.time(), "commit": a.commit, "mode": "prebuild" if prebuild else "stamped",
+                            "concurrency": n_par, "cluster_workers": cluster_workers,
                             "ingest_writers": ingest_writers, "embed_workers": embed_workers, **ingest_info, "adaptive": adaptive,
                             "concurrency_reason": getattr(a, "concurrency_reason", "") or ""}, sort_keys=True) + "\n")
-    ledger = s2_stage.Ledger(run_dir / "done.jsonl")
-    shuffled_qids = st.shuffled_subset(fs, vals["thresholds"]["shuffled_n"])
-    state, extra = "COMPLETE", {}
+    ledger = None if prebuild else s2_stage.Ledger(run_dir / "done.jsonl")
+    shuffled_qids = None if prebuild else st.shuffled_subset(fs, vals["thresholds"]["shuffled_n"])
+    state, extra = ("PREBUILT" if prebuild else "COMPLETE"), {}
     try:
         if not resumed_built:
             tree = et.build_and_publish(port, pmap=par.ordered_map(n_par), port_for=lambda k: port.scoped("build|" + k),
@@ -311,6 +415,8 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
                                                             "build_calls": tree.calls, "leaves": n_leaves}, indent=1))
             built.write_text(json.dumps({"at": time.time()}))
             print("tree: %d nodes, %d levels, top %d, build calls %d" % (len(tree.nodes), tree.levels, len(tree.top), tree.calls), flush=True)
+        if prebuild:
+            raise _Prebuilt()
         view, world = et.view(), et.world
         pview, dfn = arms.PermutedView(view), et.direct()
 
@@ -322,6 +428,8 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
         st.run_questions(fs, hashes, None, None, None, world, ledger, beta=vals["beta"], shuffled_qids=shuffled_qids,
                          stop=port.stop_requested, progress=lambda s: print(s, "counter", budget.count(), flush=True),
                          retrievers=retrievers, workers=n_par)
+    except _Prebuilt:
+        pass
     except StageStopped:
         state = "STOPPED"
     except (BudgetExceeded, s2_stage.CapReached):
@@ -336,8 +444,9 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
         write_state(run_dir, "ERROR", error=type(e).__name__, counter=budget.count())
         et.close()
         raise
-    extra.update(counter=budget.count(), cap=a.approved_cap, questions_done=len(ledger.rows), questions=len(fs.questions),
-                 leaves=n_leaves, replayed=port.replayed, fresh=port.fresh, lost_in_flight=port.lost, throttled=port.throttled,
+    if not prebuild:
+        extra.update(questions_done=len(ledger.rows), questions=len(fs.questions))
+    extra.update(counter=budget.count(), cap=a.approved_cap, leaves=n_leaves, replayed=port.replayed, fresh=port.fresh, lost_in_flight=port.lost, throttled=port.throttled,
                  limited=port.limited, concurrency_now=port.slots.limit, concurrency_changes=port.slots.changes)
     if state == "COMPLETE":
         dec = st.decide(ledger, fs, clusters, shuffled_qids=shuffled_qids, shuffled_min=vals["thresholds"]["shuffled_min_point"])
@@ -357,15 +466,20 @@ def run(a, *, embedder=None, runner=None, loader: Optional[Callable] = None, ten
 def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Stage S6-H1 (confirmatory H1). See docs/RUN-S6H1.md.")
     ap.add_argument("--stage", default=STAGE)
-    for k in ("--dataset", "--es-url", "--es-ca", "--es-pw-file", "--run-dir", "--s3-run-dir", "--stamp-registry", "--embed-dir",
+    for k in ("--dataset", "--es-url", "--es-ca", "--es-pw-file", "--run-dir", "--stamp-registry", "--embed-dir",
               "--binary", "--model"):
         ap.add_argument(k, required=True)
+    ap.add_argument("--s3-run-dir", default="", help="S3's run directory (required for the stamped run)")
     ap.add_argument("--rates-from", nargs="+", required=True, help="run directories of S2 and S3 (measured calls per recall)")
     ap.add_argument("--mem-proof", required=True, help="the JSON report of evalkit.s6h1_mem on this code at the expected pool size")
     ap.add_argument("--model-kind", choices=["claude"], default="claude")
     ap.add_argument("--approved-cap", type=int, required=True)
     ap.add_argument("--approval-ref", required=True)
-    ap.add_argument("--release-ref", required=True)
+    ap.add_argument("--release-ref", default="", help="the owner's release of the fresh set (required for the stamped run)")
+    ap.add_argument("--prebuild", action="store_true",
+                    help="EXPERIMENT 14.5: ingest the whole pool and build the tree before the freeze, then stop (state PREBUILT); "
+                         "reads the pool contents only, never a question, answer or gold; needs --amendment-ref")
+    ap.add_argument("--amendment-ref", default="", help="the recorded amendment of the early build (with --prebuild)")
     ap.add_argument("--commit", required=True)
     ap.add_argument("--a0-fields", default="strong", choices=["strong", "text"])
     ap.add_argument("--resume", action="store_true")
