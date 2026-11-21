@@ -8,6 +8,10 @@ Round 4 (review F11 remainder): `reads.aliases` took any HTTP 200 dict, so `(200
 discovery lookup, or to the confirmation lookups after the drop, must refuse: only a 404 `index_not_found_exception` that names the exact
 name asked is absence, and a 200 must name indices that are, or carry, that name. The same rule holds for the leaf scan's missing index
 (`reads.scan(missing_ok=True)`): an unnamed 404 there would leave the pool's leaf keys out of the crypto-erasure.
+
+Round 5 (the same class on the document deletes): `PoolEraser._del` took ANY 404 as "already deleted" and any 200 as deleted. A delete
+of a closure document, or of the pool's own records, is done only on HTTP 200 `deleted` or a verified absence about exactly the index
+(the hit's concrete `_index`) and id asked; every other answer refuses, the pool stays findable, and a retry with a sane answer completes.
 """
 import contextlib
 import unittest
@@ -15,7 +19,7 @@ import unittest
 from living_context.erasure.pool_scope import PoolEraseError, PoolEraser
 from living_context.gateway import reads
 from living_context.gateway.indices import physical_name, pool_index
-from tests.unit.fake_es import ShardedFake
+from tests.unit.fake_es import ShardedFake, doc_answer, unconfirmed_deletes
 
 T, P = "tena", "pzzzzzzzzzzzzzzz"
 ALIAS = pool_index(T, "base", P, "leaf")
@@ -167,6 +171,58 @@ class MalformedAnswers(Fixture):
         for pattern in ("lc-*", "a,b", "-lc-x", "_all", ""):
             with self.subTest(pattern), self.assertRaises(ValueError):
                 reads.aliases(self.es, pattern)
+
+
+SRC, CTL, AUTHZ = f"lc-{T}-src", f"lc-{T}-base-ctl", f"lc-{T}-authz"
+
+
+class DeleteAnswers(Fixture):
+    def assert_findable(self):   # what a retry needs: the pool's own records, so a restarted gateway finds the pool in `deleting`
+        self.assertIn(f"pm:{P}", self.es.docs[CTL])
+
+    def test_a_closure_delete_answer_that_confirms_nothing_refuses_and_a_retry_completes(self):
+        for name, answer in unconfirmed_deletes(SRC, "s1").items():
+            with self.subTest(name):
+                self.setUp()
+                self.es.doc_answers[("DELETE", SRC, "s1")] = answer
+                with self.assertRaises(PoolEraseError):
+                    self.eraser().delete("base", P)
+                self.assertIn("s1", self.es.docs[SRC])           # the document the answer did not confirm is still there ...
+                self.assertEqual(self.dropped, [])               # ... and the delete stopped before the drop and the pool's records
+                self.assertIn(PHYS, self.es.docs)
+                self.assertIn(f"pp:{P}", self.es.docs[AUTHZ])
+                self.assert_findable()
+                del self.es.doc_answers[("DELETE", SRC, "s1")]
+                rc = self.eraser().delete("base", P)              # the retry, with a well-formed answer, completes
+                self.assertNotIn("s1", self.es.docs[SRC])
+                self.assertEqual(rc.indices_dropped, [PHYS])
+                self.assertNotIn(f"pm:{P}", self.es.docs[CTL])
+
+    def test_a_pool_record_delete_answer_that_confirms_nothing_keeps_the_pool_findable(self):
+        for name, answer in unconfirmed_deletes(CTL, f"pm:{P}").items():
+            with self.subTest(name):
+                self.setUp()
+                self.es.doc_answers[("DELETE", CTL, f"pm:{P}")] = answer
+                with self.assertRaises(PoolEraseError):
+                    self.eraser().delete("base", P)
+                self.assert_findable()
+                del self.es.doc_answers[("DELETE", CTL, f"pm:{P}")]
+                self.eraser().delete("base", P)
+                self.assertNotIn(f"pm:{P}", self.es.docs[CTL])
+
+    def test_a_verified_absence_is_done_and_is_not_counted(self):
+        for name, answer in (("404 not_found about the document", doc_answer("DELETE", SRC, "s1", False)),
+                             ("404 index_not_found naming the index", ShardedFake._missing(SRC))):
+            with self.subTest(name):
+                self.setUp()
+                self.es.doc_answers[("DELETE", SRC, "s1")] = answer   # a concurrent delete got there first
+                rc = self.eraser().delete("base", P)
+                self.assertEqual((rc.docs_deleted, rc.indices_dropped), (2, [PHYS]))   # pp: and pm: deleted here; s1 not counted
+
+    def test_the_nominal_delete_counts_every_document_it_deleted(self):
+        rc = self.eraser().delete("base", P)
+        self.assertEqual(rc.docs_deleted, 3)
+        self.assertEqual({n: sorted(d) for n, d in self.es.docs.items()}, {AUTHZ: [], CTL: [], SRC: []})
 
 
 if __name__ == "__main__":

@@ -3,6 +3,56 @@ aggregation). It evaluates only term, terms, range, exists and bool; anything el
 query fails loudly instead of being silently ignored. Not a model of Elasticsearch: the real behaviour is in the `_es` tests."""
 import re
 
+from living_context.gateway.indices import physical_name
+
+SHARDS_ONE = {"total": 1, "successful": 1, "failed": 0}
+
+
+def doc_answer(method, index, did, found, source=None, *, created=False):
+    """The answer Elasticsearch 9 gives a single-document request (the shapes tests/security/test_pools_rescue_es.py pins on the
+    cluster): every answer names the concrete `_index` and the `_id`; a delete says `deleted` or `not_found`; a read says `found`."""
+    if method == "DELETE":
+        return (200 if found else 404), {"_index": index, "_id": did, "_version": 2, "result": "deleted" if found else "not_found",
+                                         "_shards": SHARDS_ONE, "_seq_no": 3, "_primary_term": 1}
+    if method == "GET":
+        return (200, {"_index": index, "_id": did, "_version": 1, "_seq_no": 1, "_primary_term": 1, "found": True,
+                      "_source": dict(source)}) if found else (404, {"_index": index, "_id": did, "found": False})
+    return (201 if created else 200), {"_index": index, "_id": did, "_version": 1, "result": "created" if created else "updated",
+                                       "_shards": SHARDS_ONE, "_seq_no": 1, "_primary_term": 1}
+
+
+def behind(alias):
+    """The physical index the fakes answer for a request through an alias (`indices.physical_name` with a fixed suffix); a name that is
+    already physical answers as itself."""
+    return alias if re.search(r"-p[0-9a-f]{8}$", alias) else physical_name(alias, b"\xd0\xc5\x70\x4e")
+
+
+def unconfirmed_deletes(index, did, *, strict=True):
+    """Answers to `DELETE /<index>/_doc/<did>` that confirm nothing (review round 5). At f16ea94 every 404 read as "already deleted"
+    and every 200 as deleted, so each of these certified a document's removal while it was still there. `strict`: the request named a
+    concrete index (an erasure, by the hit's `_index`), so even the physical form of the name is another index."""
+    other = index.rsplit("-", 1)[0] + "-other"
+    out = {
+        "404 with an empty body": (404, {}),
+        "404 not_found for another _id": (404, {"_index": index, "_id": did + "x", "result": "not_found"}),
+        "404 not_found for another index": (404, {"_index": other, "_id": did, "result": "not_found"}),
+        "404 not_found without _index": (404, {"_id": did, "result": "not_found"}),
+        "404 index_not_found naming another index": (404, {"error": {"type": "index_not_found_exception", "index": other,
+                                                                     "resource.id": other}, "status": 404}),
+        "404 that says deleted": (404, {"_index": index, "_id": did, "result": "deleted"}),
+        "404 with a list body": (404, []),
+        "200 with an empty body": (200, {}),
+        "200 that says not_found": (200, {"_index": index, "_id": did, "result": "not_found"}),
+        "200 that says noop": (200, {"_index": index, "_id": did, "result": "noop"}),
+        "200 deleted for another _id": (200, {"_index": index, "_id": did + "x", "result": "deleted"}),
+        "200 deleted for another index": (200, {"_index": other, "_id": did, "result": "deleted"}),
+    }
+    if strict:
+        sib = physical_name(index, b"\x0a\x0b\x0c\x0d")
+        out["404 not_found for the physical form of the name"] = (404, {"_index": sib, "_id": did, "result": "not_found"})
+        out["200 deleted for the physical form of the name"] = (200, {"_index": sib, "_id": did, "result": "deleted"})
+    return out
+
 
 class FakeEs:
     def __init__(self):
@@ -69,10 +119,12 @@ class FakeEs:
 
 
 class FakeAuthz:
-    """The tenant's authz index as a dict: PUT, DELETE and a `terms kind` search. `down` makes every call fail (a blocked index)."""
+    """The tenant's authz index as a dict: PUT, DELETE and a `terms kind` search. `down` makes every call fail (a blocked index).
+    Document answers name the physical index behind the alias (`behind`), as Elasticsearch does; `doc_answers[(method, id)]` gives the
+    exact (status, body) of that document request instead, without touching the record (a malformed answer)."""
 
     def __init__(self):
-        self.docs, self.down = {}, False
+        self.docs, self.down, self.doc_answers = {}, False, {}
 
     def request(self, method, path, body=None, **kw):
         if self.down:
@@ -86,11 +138,15 @@ class FakeAuthz:
         if p == "/_pit" and method == "DELETE":
             return 200, {"succeeded": getattr(self, "pits", {}).pop(body["id"], None) is not None, "num_freed": 1}
         did = path.split("/_doc/")[1].split("?")[0] if "/_doc/" in path else None
+        if did is not None and (method, did) in self.doc_answers:
+            return self.doc_answers[(method, did)]
+        phys = behind(p.split("/_doc/")[0].lstrip("/")) if did is not None else None
         if method == "PUT":
+            created = did not in self.docs
             self.docs[did] = body
-            return 200, {}
+            return doc_answer("PUT", phys, did, True, created=created)
         if method == "DELETE":
-            return (200, {}) if self.docs.pop(did, None) is not None else (404, {})
+            return doc_answer("DELETE", phys, did, self.docs.pop(did, None) is not None)
         q = body["query"]
         kinds = q["terms"]["kind"] if "terms" in q else [q["term"]["kind"]]
         ids = self.pits[body["pit"]["id"]] if "pit" in body else list(self.docs)
@@ -113,14 +169,15 @@ class ShardedFake(FakeEs):
 
     `partial` makes the next N search answers HTTP 200 with a failed shard; `alias_status` answers `GET /<name>/_alias` with that
     error status; `alias_answers[name]` and `pit_answers[name]` give the exact (status, body) of `GET /<name>/_alias` and
-    `POST /<name>/_pit` (a malformed answer). A missing name answers the 404 Elasticsearch gives, naming it (`index`, `resource.id`;
+    `POST /<name>/_pit` (a malformed answer); `doc_answers[(method, name, id)]` gives the exact (status, body) of that document request
+    without touching the document. A document request answers with the concrete index (`doc_answer`). A missing name answers the 404 Elasticsearch gives, naming it (`index`, `resource.id`;
     the shape tests/security/test_pools_rescue_es.py checks on the cluster). Not a model of Elasticsearch beyond these cursors: the
     real behaviour is in the `_es` tests."""
 
     def __init__(self):
         super().__init__()
         self.aliases, self.pits, self.partial, self.alias_status, self.closed_pits = {}, {}, 0, None, []
-        self.alias_answers, self.pit_answers = {}, {}
+        self.alias_answers, self.pit_answers, self.doc_answers = {}, {}, {}
 
     def _indices(self, pattern):
         import fnmatch
@@ -155,13 +212,18 @@ class ShardedFake(FakeEs):
                 hit[target] = {"aliases": {a: {} for a in sorted(self.aliases.get(target, ()))}}
             return (200, hit) if hit else self._missing(target)
         if op.startswith("_doc/"):
-            phys = self._indices(target)
             did = m.group(3)
+            if (method, target, did) in self.doc_answers:
+                return self.doc_answers[(method, target, did)]
+            phys = self._indices(target)
+            if not phys:
+                return self._missing(target)
             for n in phys:
-                if did in self.docs[n] and method == "DELETE":
-                    del self.docs[n][did]
-                    return 200, {"result": "deleted"}
-            return 404, {"result": "not_found"}
+                if did in self.docs[n]:
+                    if method == "DELETE":
+                        del self.docs[n][did]
+                    return doc_answer(method, n, did, True, self.docs[n].get(did))
+            return doc_answer(method, phys[0], did, False)
         phys = self._indices(target)
         if op == "_refresh":
             return 200, {"_shards": self._shards(len(phys))}
@@ -201,10 +263,12 @@ class ShardedFake(FakeEs):
 class DocStore:
     """Documents by (index, id) with the write semantics the writer relies on: `op_type=create` answers 409 when the id exists,
     `if_seq_no`/`if_primary_term` is a compare-and-set (409 on a mismatch), GET answers `_seq_no`/`_primary_term`, refresh is a no-op.
-    `fail` maps a (method, index-substring) to a status answered once per entry in its list (an injected HTTP error)."""
+    `fail` maps a (method, index-substring) to a status answered once per entry in its list (an injected HTTP error). Document answers
+    name the physical index behind the alias the request named (`behind`), as Elasticsearch does. `doc_answers[(method, index, id)]` is a
+    list of exact (status, body) answers given once each, in order, before the document request is served normally."""
 
     def __init__(self):
-        self.docs, self.seq, self.fail, self.sent = {}, 0, {}, []
+        self.docs, self.seq, self.fail, self.sent, self.doc_answers = {}, 0, {}, [], {}
 
     def request(self, method, path, body=None, **kw):
         p, _, qs = path.partition("?")
@@ -237,14 +301,18 @@ class DocStore:
         m = re.match(r"^/([^/]+)/_doc/(.+)$", p)
         assert m, path
         key = (m.group(1), m.group(2))
+        if self.doc_answers.get((method, *key)):
+            return self.doc_answers[(method, *key)].pop(0)
         params = dict(x.split("=", 1) for x in qs.split("&") if x)
         cur = self.docs.get(key)
+        phys = behind(key[0])
         if method == "GET":
             if cur is None:
-                return 404, {"found": False}
-            return 200, {"found": True, "_id": key[1], "_source": dict(cur[0]), "_seq_no": cur[1], "_primary_term": 1}
+                return doc_answer("GET", phys, key[1], False)
+            st, r = doc_answer("GET", phys, key[1], True, cur[0])
+            return st, dict(r, _seq_no=cur[1])
         if method == "DELETE":
-            return (200, {"result": "deleted"}) if self.docs.pop(key, None) is not None else (404, {"result": "not_found"})
+            return doc_answer("DELETE", phys, key[1], self.docs.pop(key, None) is not None)
         if method == "PUT":
             if params.get("op_type") == "create" and cur is not None:
                 return 409, {"error": {"type": "version_conflict_engine_exception"}}
@@ -252,5 +320,5 @@ class DocStore:
                 return 409, {"error": {"type": "version_conflict_engine_exception"}}
             self.seq += 1
             self.docs[key] = (dict(body), self.seq)
-            return (201 if cur is None else 200), {"result": "created" if cur is None else "updated"}
+            return doc_answer("PUT", phys, key[1], True, created=cur is None)
         raise AssertionError(path)

@@ -14,6 +14,11 @@ The universe is enumerated, not listed: an AST walk over every module of the pac
 No decision module may page with a `_doc` sort (review F12: it is unique only inside one shard); multi-page reads go through
 `reads.scan` (a PIT and `_shard_doc`).
 
+Document answers (review round 5, the F11 class: a malformed answer never certifies an erasure, a removal or an absence): no decision
+module sends a DELETE itself outside reads.py; a document delete goes through `reads.delete_doc`, which owns the request and accepts
+only HTTP 200 `deleted` or a verified absence about exactly the index and id sent. The only other DELETE is on RAW_DELETES with its
+reason. In the erasure modules a document read and a compare-and-set rewrite go through `reads.read_doc` and `reads.put_doc` too.
+
 The planted-bypass tests run the same checker over a copy of a guarded module with one extra unvalidated search, a validator call
 removed, a status discarded, a `_doc` cursor, or a new unclassified module, and require each to be reported.
 """
@@ -46,6 +51,17 @@ EXCLUDED = {
 }
 
 VALIDATORS = {"complete_hits", "complete_count"}
+
+# The only DELETE requests a decision module may send itself (outside reads.py), with the reason: none of them is a document delete.
+RAW_DELETES = {
+    ("gateway/keyowner.py", "invalidate"): "API-key invalidation (`/_security/api_key`): the invalidated ids are read from the answer",
+}
+# A request whose method is a parameter: (module, function) -> (forwarder name, position of the method among its call arguments, reason).
+# Every call of the forwarder in the module must pass a literal method other than DELETE.
+DYNAMIC_METHODS = {
+    ("gateway/class_reader.py", "ClassReader._send"): ("_send", 2, "the class reader's one request: its callers pass GET or POST"),
+}
+ERASURE_DIR = "erasure"
 VERIFIER_VALIDATORS = {"_complete", "_refreshed"}   # the verifier's own (DESIGN 14.7), accepted only in verifier/check.py
 
 # (module, function, method) -> (number of call sites, kind, reason). kind "checked": the status is compared in the function (verified);
@@ -56,6 +72,12 @@ ALLOWED = {
     ("gateway/reads.py", "aliases", "GET"): (1, "checked", "the checked exact-name alias lookup: a well-formed 200 about the name, or a 404 naming it, else it raises"),
     ("gateway/reads.py", "scan", "POST"): (1, "checked", "opening the PIT: status, id and _shards are verified (the page search is validated)"),
     ("gateway/reads.py", "scan", "DELETE"): (1, "best-effort", "closing the PIT: an unclosed PIT expires after keep_alive"),
+    ("gateway/reads.py", "delete_doc", "DELETE"): (1, "checked",
+        "THE document delete: HTTP 200 `deleted` or a verified absence (404 `not_found` or `absent`) about exactly the index and id sent"),
+    ("gateway/reads.py", "read_doc", "GET"): (1, "checked",
+        "THE document read: 200 `found` about exactly the index and id sent, None only for a verified absence, else it raises"),
+    ("gateway/reads.py", "put_doc", "PUT"): (1, "checked",
+        "THE checked document write: 200/201 `created`/`updated` about exactly the index and id sent, 409 is False, else it raises"),
     # --- erasure ------------------------------------------------------------------------------------------------------------------
     ("erasure/executor.py", "Executor.erase_subject", "POST"): (2, "best-effort",
         "refreshes: the first is redundant (every closure read is scan.find, which runs the checked reads.refresh); the second makes "
@@ -71,18 +93,11 @@ ALLOWED = {
     ("erasure/executor.py", "Executor._physical.one", "POST"): (1, "best-effort",
         "refresh before a purge; the purge reports what is left (checked stats read) and the verifier decides residue"),
     ("erasure/executor.py", "Executor._physical", "POST"): (1, "best-effort", "redundant: the residue read after it is scan.find"),
-    ("erasure/executor.py", "Executor._rewrite_node", "GET"): (1, "checked",
-        "a node to rewrite; a failed read counts 0 rewritten and the final scan.find residue read (complete) reports what remains"),
-    ("erasure/executor.py", "Executor._rewrite_node", "PUT"): (1, "checked", "the CAS rewrite (if_seq_no); a failure counts 0, as above"),
-    ("erasure/executor.py", "Executor._strip_or_delete_log_row", "GET"): (1, "checked", "a failed read raises ScanError"),
-    ("erasure/executor.py", "Executor._strip_or_delete_log_row", "PUT"): (1, "checked", "a failed CAS rewrite raises ScanError"),
-    ("erasure/pool_scope.py", "PoolEraser._del", "DELETE"): (1, "checked", "anything but 200 or 404 raises PoolEraseError"),
     ("erasure/purge.py", "deleted_count", "GET"): (1, "checked", "a failed stats read raises PurgeError"),
     ("erasure/purge.py", "ensure_expunge_threshold", "PUT"): (1, "checked", "if refused, the setting is read back and must be 0"),
     ("erasure/purge.py", "ensure_expunge_threshold", "GET"): (1, "checked", "the read-back; anything but 0 raises PurgeError"),
     ("erasure/purge.py", "purge_index", "POST"): (3, "checked",
         "refresh and flush are best effort before the merge; the forcemerge status is checked and the deleted count is read back"),
-    ("erasure/scan.py", "delete", "DELETE"): (1, "checked", "anything but 200 or 404 raises ScanError"),
     ("erasure/scan.py", "find_text", "POST"): (2, "best-effort",
         "NOT the closure: the string-search demonstration of E2, used only by the executor's broken variant"),
     # --- verifier -------------------------------------------------------------------------------------------------------------------
@@ -98,11 +113,9 @@ ALLOWED = {
     ("gateway/keyowner.py", "rotate", "GET"): (1, "checked", "the key owner's identity read; a failure raises RotationError"),
     ("gateway/keyowner.py", "rotate", "POST"): (1, "checked", "a failed key creation raises RotationError"),
     ("gateway/pool_admin.py", "PoolService._authz_put", "PUT"): (1, "checked", "a failed authz write is reported to the caller"),
-    ("gateway/pool_admin.py", "PoolService._authz_delete", "DELETE"): (1, "checked", "a failed authz delete is reported to the caller"),
     ("gateway/pool_admin.py", "PoolService.create", "PUT"): (1, "write",
         "the pool manifest; a failure is caught by create's handler, which drops the pool and answers unavailable"),
     ("gateway/pool_boot.py", "token_persister.persist", "PUT"): (1, "checked", "a failed token write raises"),
-    ("gateway/pool_boot.py", "load", "DELETE"): (1, "best-effort", "deleting an expired token record: the record is ignored anyway"),
     ("gateway/pool_tools.py", "PoolTools._leaf", "GET"): (1, "checked", "anything but 200 is no leaf: every caller then fails closed"),
     ("gateway/pool_tools.py", "PoolTools._pool_candidates", "POST"): (1, "checked",
         "recall candidates (_msearch): a ranked answer; a failed or partial response gives fewer candidates, never wider access"),
@@ -122,7 +135,6 @@ ALLOWED = {
     ("ingest/writer.py", "Writer.repair", "POST"): (2, "checked",
         "the source lookup (_mget): status, shape and every per-document answer are verified, only found:false deletes; and the "
         "trailing refresh (visibility only; the scans before it use the checked reads.refresh)"),
-    ("ingest/writer.py", "Writer.repair", "DELETE"): (1, "checked", "deleting an orphan projection: a failure raises"),
 }
 
 
@@ -213,9 +225,58 @@ def classify(call, qual, fn, validators):
     return ".".join(qual), method, validated, compared
 
 
+def _path_text(call) -> str:
+    """The literal parts of a request call's path argument (an f-string's constant pieces), for the document-answer rules."""
+    a = call.args[1] if len(call.args) > 1 else None
+    if isinstance(a, ast.Constant) and isinstance(a.value, str):
+        return a.value
+    if isinstance(a, ast.JoinedStr):
+        return "".join(v.value for v in a.values if isinstance(v, ast.Constant) and isinstance(v.value, str))
+    return ""
+
+
+def request_calls(source: str) -> list:
+    """(qualname, method, literal path text, line) of every `.request(` call of a module."""
+    out = []
+
+    def visit(node, qual):
+        for child in ast.iter_child_nodes(node):
+            q = qual + [child.name] if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) else qual
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute) and child.func.attr == "request":
+                method = child.args[0].value if child.args and isinstance(child.args[0], ast.Constant) else "?"
+                out.append((".".join(q), method, _path_text(child), child.lineno))
+            visit(child, q)
+
+    visit(ast.parse(source), [])
+    return out
+
+
+def doc_answer_findings(modules: dict) -> list:
+    """Round 5: no raw DELETE in a decision module outside reads.py (except RAW_DELETES), and no raw document read or compare-and-set
+    rewrite in an erasure module: those go through `reads.delete_doc`, `reads.read_doc` and `reads.put_doc`."""
+    bad = []
+    for module in sorted(m for m in modules if guarded(m) and m != "gateway/reads.py"):
+        for qual, method, path, line in request_calls(modules[module]):
+            if method == "?" and (module, qual) in DYNAMIC_METHODS:
+                fwd, pos, _ = DYNAMIC_METHODS[(module, qual)]
+                for n in ast.walk(ast.parse(modules[module])):
+                    if isinstance(n, ast.Call) and _name(n.func) == fwd and not (
+                            len(n.args) > pos and isinstance(n.args[pos], ast.Constant) and n.args[pos].value in ("GET", "POST", "PUT")):
+                        bad.append(f"{module}:{n.lineno}: a call of {fwd} without a literal GET, POST or PUT method")
+                continue
+            if method in ("DELETE", "?") and (module, qual) not in RAW_DELETES:
+                bad.append(f"{module}:{line}: {qual} sends a DELETE itself: a document delete goes through reads.delete_doc")
+            if module.split("/")[0] == ERASURE_DIR and "/_doc/" in path and (method == "GET" or (method == "PUT" and "if_seq_no" in path)):
+                bad.append(f"{module}:{line}: {qual} reads or rewrites a document itself: use reads.read_doc / reads.put_doc")
+    for module, qual in sorted(RAW_DELETES):
+        if module in modules and not any(q == qual and m == "DELETE" for q, m, _, _ in request_calls(modules[module])):
+            bad.append(f"{(module, qual)}: on RAW_DELETES but sends no DELETE (stale entry)")
+    return bad
+
+
 def findings(modules: dict) -> list:
     """Every violation of the guard over `modules` ({relative path: source})."""
-    bad = []
+    bad = doc_answer_findings(modules)
     for module in sorted(set(modules) - set(EXCLUDED)):
         if not guarded(module):
             bad.append(f"{module}: has ES requests but is neither guarded nor on EXCLUDED")
@@ -263,13 +324,13 @@ class ReadPaths(unittest.TestCase):
     def test_planted_unvalidated_search_is_caught(self):
         mods = request_modules()
         planted = dict(mods)
-        planted["erasure/pool_scope.py"] = mods["erasure/pool_scope.py"] + (
+        planted["erasure/scan.py"] = mods["erasure/scan.py"] + (
             "\n\ndef planted(er, pattern, body):\n"
             "    st, r = er.request('POST', f'/{pattern}/_search', body)\n"
             "    if st != 200:\n"
             "        raise RuntimeError\n"
             "    return r['hits']['hits']\n")
-        self.assertIn("('erasure/pool_scope.py', 'planted', 'POST'): an unvalidated ES request that is not on ALLOWED", findings(planted))
+        self.assertIn("('erasure/scan.py', 'planted', 'POST'): an unvalidated ES request that is not on ALLOWED", findings(planted))
 
     def test_planted_removed_validator_is_caught(self):
         mods = request_modules()
@@ -290,12 +351,50 @@ class ReadPaths(unittest.TestCase):
 
     def test_a_listed_checked_site_must_compare_its_status(self):
         mods = request_modules()
-        src = mods["erasure/scan.py"]
-        line = 'st, _ = es.request("DELETE", f"/{index}/_doc/{doc_id}")'
+        src = mods["erasure/purge.py"]
+        line = 'st, r = es.request("GET", f"/{index}/_stats/docs")'
         self.assertIn(line, src)
-        planted = dict(mods, **{"erasure/scan.py": src.replace(line, 'es.request("DELETE", f"/{index}/_doc/{doc_id}"); st = 200')})
-        self.assertIn("('erasure/scan.py', 'delete', 'DELETE'): listed as checked but no status of these calls is compared",
+        planted = dict(mods, **{"erasure/purge.py": src.replace(line, 'r = es.request("GET", f"/{index}/_stats/docs")[1]; st = 200')})
+        self.assertIn("('erasure/purge.py', 'deleted_count', 'GET'): listed as checked but no status of these calls is compared",
                       findings(planted))
+
+    def test_planted_raw_document_delete_is_caught_even_when_it_checks_the_status(self):
+        # the f16ea94 form of scan.delete: it compares the status (200 or 404), so the checked-status rule alone would pass it
+        mods = request_modules()
+        raw = ("\n\ndef planted(es, index, doc_id):\n"
+               "    st, _ = es.request(\"DELETE\", f\"/{index}/_doc/{doc_id}\")\n"
+               "    if st not in (200, 404):\n"
+               "        raise ScanError(st)\n"
+               "    return st == 200\n")
+        for module in ("erasure/scan.py", "gateway/pool_admin.py", "ingest/writer.py"):
+            with self.subTest(module):
+                planted = dict(mods, **{module: mods[module] + raw})
+                self.assertTrue(any(f.startswith(module + ":") and "planted sends a DELETE itself" in f for f in findings(planted)),
+                                findings(planted))
+
+    def test_planted_raw_erasure_document_read_or_rewrite_is_caught(self):
+        mods = request_modules()
+        for name, body in (("read", 'code, doc = st.request("GET", f"/{h.index}/_doc/{h.id}")'),
+                           ("rewrite", 'code, _ = st.request("PUT", f"/{h.index}/_doc/{h.id}?if_seq_no={n}&if_primary_term={t}", s)')):
+            with self.subTest(name):
+                planted = dict(mods, **{"erasure/executor.py": mods["erasure/executor.py"] +
+                                        f"\n\ndef planted(st, h, s, n, t):\n    {body}\n    return code\n"})
+                self.assertTrue(any(f.startswith("erasure/executor.py:") and "planted reads or rewrites a document itself" in f
+                                    for f in findings(planted)), findings(planted))
+
+    def test_a_forwarded_delete_method_is_caught(self):
+        mods = request_modules()
+        src = mods["gateway/class_reader.py"]
+        line = 'self._send(cls, kind, "GET", f"/{{index}}/_doc/{doc_id}", None, pool, search=False)'
+        self.assertIn(line, src)
+        planted = dict(mods, **{"gateway/class_reader.py": src.replace(line, line.replace('"GET"', '"DELETE"'))})
+        self.assertTrue(any("a call of _send without a literal GET, POST or PUT method" in f for f in findings(planted)), findings(planted))
+
+    def test_the_document_helpers_are_the_only_document_delete_and_erasure_read(self):
+        mods = request_modules()
+        self.assertEqual(doc_answer_findings(mods), [])
+        reads_calls = {(q, m) for q, m, _, _ in request_calls(mods["gateway/reads.py"])}
+        self.assertTrue({("delete_doc", "DELETE"), ("read_doc", "GET"), ("put_doc", "PUT")} <= reads_calls)
 
 
 if __name__ == "__main__":

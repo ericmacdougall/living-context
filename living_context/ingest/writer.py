@@ -834,10 +834,11 @@ class Writer:
                     # only a VERIFIED absence deletes: a per-document error (an unavailable shard) is not "the source is missing"
                     if not isinstance(d, dict) or "error" in d or d.get("found") not in (True, False):
                         raise WriterError("source lookup incomplete")
-                    if d["found"] is False:
-                        st, _ = self._es.request("DELETE", f"/{leaf}/_doc/{d['_id']}")
-                        if st not in (200, 404):
-                            raise WriterError("projection delete failed")
+                    if d["found"] is False:   # through the class alias: a confirmed delete or a verified absence, else it raises
+                        try:
+                            reads.delete_doc(self._es, leaf, d["_id"], alias=True)
+                        except (IncompleteRead, ValueError) as e:
+                            raise WriterError("projection delete failed") from e
                         out["projections_deleted"] += 1
                 after = hits[-1]["sort"][0]
         for cls in classes:

@@ -13,7 +13,7 @@ from typing import Any, Callable, Optional
 
 from ..policy import pools as pl
 from .pool_admin import PoolService
-from .reads import scan
+from .reads import IncompleteRead, delete_doc, scan
 from .sessions import Sessions
 
 PAGE = 1000   # documents per page of the start-up read; the read is paged until exhausted (no cap)
@@ -58,8 +58,10 @@ def load(authz: Callable[[], Any], tenant: str, directory: pl.PoolDirectory, ses
         try:
             rec = json.loads(s["rec_json"]) if "rec_json" in s else s["rec"]
             if float(rec.get("exp", 0)) <= now:   # an expired token is dead weight: delete its document (best effort)
-                authz().request("DELETE", f"/lc-{tenant}-authz/_doc/{s['_id']}")
-                out["expired_deleted"] += 1
+                try:   # counted only when this request deleted it; any other answer leaves it for the next start
+                    out["expired_deleted"] += delete_doc(authz(), f"lc-{tenant}-authz", s["_id"], alias=True)
+                except IncompleteRead:
+                    pass
                 continue
             sessions.restore_token(s["hash"], rec)
             out["tokens"] += 1

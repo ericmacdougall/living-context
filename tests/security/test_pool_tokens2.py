@@ -7,6 +7,7 @@ from living_context.config import Constants
 from living_context.gateway.sessions import TokenError
 from living_context.policy import pools as pl
 from tests.security.test_pool_tokens import Base, T, TB, UNAV, World, q
+from tests.unit.fake_es import unconfirmed_deletes
 
 
 class Tokens(Base):
@@ -331,6 +332,28 @@ class Revocation(Base):
         w.restart()
         self.assertEqual(w.dir.live_ops(T, "pt-user-alice", a), frozenset())
         self.assertIsNone(w.auth(tok, {a: q("query")}))
+
+
+    def test_a_grant_removal_stays_unconfirmed_until_its_authz_delete_is_confirmed(self):
+        # Round 5: at f16ea94 any 404 or 200 to the record's delete confirmed the removal, so compaction dropped its journal record and a
+        # restart rebuilt the grant from the authz copy, which still held it. Only a confirmed delete (or a verified absence) of exactly
+        # this record, through the authz alias, confirms it now.
+        for name in unconfirmed_deletes(f"lc-{T}-authz", "pg:x", strict=False):
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                w = World(tmp).start()
+                a = w.pool("alpha")
+                gid = f"pg:pt-user-alice:{a}"
+                w.authz.doc_answers[("DELETE", gid)] = unconfirmed_deletes(f"lc-{T}-authz", gid, strict=False)[name]
+                tok = w.mint("alice", {a: q("query")})
+                r = w.admin("pool_ungrant", who="user-alice", pool=a)
+                self.assertEqual((r["ok"], r["denied"], r["durable"]), (True, True, True))
+                self.assertIsNone(w.auth(tok, {a: q("query")}))
+                self.assertIn(gid, w.authz.docs)                      # the answer was no delete: the authz copy still holds the grant
+                w.rev.compact()
+                w.restart()
+                self.assertEqual(w.dir.live_ops(T, "pt-user-alice", a), frozenset())   # the journal kept the removal
+                self.assertIsNone(w.auth(tok, {a: q("query")}))
+                w.rev.clean_stop()
 
 
 if __name__ == "__main__":

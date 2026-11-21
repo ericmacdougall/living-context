@@ -27,6 +27,7 @@ from .class_reader import ClassReader, ReaderRefused
 from .pool_authz import VIEW, carry, view
 from .indices import POOL_KINDS, TENANT_CLS, physical_name, pool_index
 from .provision import PURGE_SETTINGS, SLOWLOG_OFF, mapping_for
+from .reads import IncompleteRead, delete_doc
 from .revocation import RevocationService, Refused as TenantClosed
 from .sessions import Record, Sessions
 
@@ -107,9 +108,12 @@ class PoolService:
             raise RuntimeError("authz write refused")
 
     def _authz_delete(self, doc_id: str) -> None:
-        st, _ = self._authz().request("DELETE", f"/lc-{self.tenant}-authz/_doc/{doc_id}?refresh=true")
-        if st not in (200, 404):
-            raise RuntimeError("authz delete refused")
+        """Only a confirmed delete or a verified absence of exactly this record (through the authz alias) lets the caller confirm a grant
+        removal; any other answer raises and the removal stays unconfirmed, so compaction keeps its journal record (review round 5)."""
+        try:
+            delete_doc(self._authz(), f"lc-{self.tenant}-authz", doc_id, "refresh=true", alias=True)
+        except IncompleteRead as e:
+            raise RuntimeError("authz delete refused") from e
 
     def _persist_pool(self, p: pl.Pool) -> None:
         self._authz_put(f"pp:{p.id}", _base(self.tenant, TENANT_CLS, "pool", [], pool=p.id, pool_cls=p.cls, pool_kind=p.kind,

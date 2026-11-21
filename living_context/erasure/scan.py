@@ -68,13 +68,15 @@ def find(es: EsClient, tenant: str, *, subjects: Iterable[str] = (), leaf_ids: I
 
 
 def delete(es: EsClient, found: Iterable[tuple]) -> int:
+    """Delete each (index, id, ...) found by a scan; the index is the hit's concrete `_index`, so the answer must name exactly it
+    (`reads.delete_doc`, strict). Returns how many this call deleted (a verified absence counts 0); any other answer raises `ScanError`
+    and nothing is certified (review round 5)."""
     n = 0
     for h in found:
-        index, doc_id = h[0], h[1]
-        st, _ = es.request("DELETE", f"/{index}/_doc/{doc_id}")
-        if st not in (200, 404):
-            raise ScanError(f"delete failed ({st})")
-        n += st == 200
+        try:
+            n += reads.delete_doc(es, h[0], h[1])
+        except reads.IncompleteRead as e:
+            raise ScanError("delete not confirmed") from e
     return n
 
 

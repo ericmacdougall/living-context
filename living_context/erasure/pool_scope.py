@@ -29,7 +29,7 @@ from ..gateway.es import EsClient
 from ..gateway.gate import WriteGate
 from ..gateway.indices import check_id, check_pool_id, pool_index
 from ..gateway.journal import TombstoneJournal
-from ..gateway.reads import IncompleteRead, aliases, refresh, scan
+from ..gateway.reads import IncompleteRead, aliases, delete_doc, refresh, scan
 from ..keystore.store import Keystore
 from . import purge
 
@@ -131,10 +131,14 @@ class PoolEraser:
 
     @staticmethod
     def _del(er, index: str, did: str, rc) -> None:
-        st, _ = er.request("DELETE", f"/{index}/_doc/{did}")
-        if st not in (200, 404):
-            raise PoolEraseError("delete failed")
-        rc.docs_deleted += st == 200
+        """Delete one document of the closure by the concrete `_index` its scan hit named (`reads.delete_doc`, strict). Counted only when
+        this request deleted it; a verified absence (the document or its index is not there: a resumed delete) is done as well. Any other
+        answer (an empty or foreign 404, a 200 that does not say `deleted`) raises before the pool's own records go, so the delete stays
+        resumable (review round 5)."""
+        try:
+            rc.docs_deleted += delete_doc(er, index, did)
+        except IncompleteRead as e:
+            raise PoolEraseError("delete not confirmed") from e
 
     def delete(self, cls: str, pool: str) -> PoolReceipt:
         check_pool_id(pool)

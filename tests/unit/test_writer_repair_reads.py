@@ -4,6 +4,7 @@ is missing". A scripted client answers each request; the repair must raise and s
 import unittest
 
 from living_context.ingest.writer import Writer, WriterError
+from tests.unit.fake_es import behind, doc_answer, unconfirmed_deletes
 
 T = "tena"
 OK = {"total": 1, "successful": 1, "skipped": 0, "failed": 0}
@@ -30,8 +31,8 @@ class Scripted:
             return self.leaf_page if self.leaf_pages == 1 else page([])
         if path.startswith("/_mget"):
             return 200, {"docs": [self.mget_doc]}
-        if method == "DELETE":
-            return 200, {"result": "deleted"}
+        if method == "DELETE":   # the answer Elasticsearch gives a delete through the class alias (the physical index named)
+            return doc_answer("DELETE", behind(f"lc-{T}-base-leaf"), path.split("/_doc/")[1].split("?")[0], True)
         raise AssertionError(path)
 
 
@@ -58,6 +59,22 @@ class RepairReads(unittest.TestCase):
                 es = Scripted({"_index": f"lc-{T}-src", "_id": "L1:1", "found": False}, **kw)
                 with self.assertRaises(WriterError):
                     repair(es)
+
+    def test_a_delete_answer_that_confirms_nothing_is_an_error(self):   # round 5: at f16ea94 any 404 or 200 counted as deleted
+        for name, answer in unconfirmed_deletes(f"lc-{T}-base-leaf", "L1:1", strict=False).items():
+            with self.subTest(name):
+                es = Scripted({"_index": f"lc-{T}-src", "_id": "L1:1", "found": False})
+                real = es.request
+                es.request = lambda m, p, b=None, real=real, answer=answer, **kw: answer if m == "DELETE" else real(m, p, b, **kw)
+                with self.assertRaises(WriterError):
+                    repair(es)
+
+    def test_a_verified_absence_through_the_alias_counts_as_before(self):
+        es = Scripted({"_index": f"lc-{T}-src", "_id": "L1:1", "found": False})
+        real = es.request
+        gone = doc_answer("DELETE", behind(f"lc-{T}-base-leaf"), "L1:1", False)   # a concurrent repair deleted it first
+        es.request = lambda m, p, b=None, **kw: gone if m == "DELETE" else real(m, p, b, **kw)
+        self.assertEqual(repair(es)["projections_deleted"], 1)
 
     def test_a_failed_delete_is_an_error(self):
         es = Scripted({"_index": f"lc-{T}-src", "_id": "L1:1", "found": False})
