@@ -292,8 +292,8 @@ class ResilientPort:
             inner.on_charge = self._charged
         if hasattr(inner, "admit"):                             # the inner port asks the gate again after its pacer, before its charge
             inner.admit, inner.on_halt = self._admit, self.halt
-        if hasattr(inner, "on_throttle"):
-            inner.on_throttle = self._on_throttle
+        if hasattr(inner, "on_outcome"):                        # throttles and refusals are decided under the inner charge lock
+            inner.on_outcome = self._on_outcome
         self._lost_keys = self._lost_in_flight(journal)
         # the stage runners key every call by its question or build group at every worker count (review F2): one key scheme, so a
         # resume with another worker count replays what was answered; a journal written under another scheme is refused here
@@ -366,10 +366,28 @@ class ResilientPort:
         return StagePaused("the provider asked for a wait of %.0f s, above the ceiling of %.0f s: the stage stops here; resume after %s"
                            % (float(retry_after), self._ra_ceiling, when), retry_after_s=float(retry_after))
 
-    def _on_throttle(self, retry_after: Optional[float]) -> None:
-        """Under the inner port's charge lock: a requested wait above the ceiling halts every worker before another charge."""
-        if retry_after is not None and float(retry_after) > self._ra_ceiling:
-            self.halt(self._ceiling_pause(retry_after))
+    def _decide(self, kind: str, exc: BaseException, attempts: int) -> Optional[BaseException]:
+        """THE place a throttle (`kind` "throttle") or an allowance refusal ("refusal") becomes a halt of the stage: returns the halt
+        (published to every worker) or None. `attempts` counts this call's outcomes so far, this one included. A throttle halts on a
+        requested wait above the ceiling or past `max_retries`; a refusal at a fixed concurrency at once, at an adaptive one past
+        `max_retries` refusals (its own, or all workers' since the last answer)."""
+        if kind == "throttle":
+            ra = getattr(exc, "retry_after_s", None)
+            h = self._ceiling_pause(ra) if ra is not None and float(ra) > self._ra_ceiling else exc if attempts > self._retries else None
+        else:
+            h = exc if (not self.slots.adaptive or max(attempts, self._bump()) > self._retries) else None
+        if h is not None:
+            self.halt(h)
+        return h
+
+    def _on_outcome(self, kind: str, exc: BaseException) -> None:
+        """Called by the inner port under its charge lock (review F1 of goodqa#16562): the decision is made and published before any
+        other worker can pass its last admission check; the handler below reuses it."""
+        self._tls.decision = (self._decide(kind, exc, getattr(self._tls, "attempt", 0) + 1),)
+
+    def _decision(self, kind: str, exc: BaseException, attempts: int) -> Optional[BaseException]:
+        d, self._tls.decision = getattr(self._tls, "decision", None), None
+        return d[0] if d is not None else self._decide(kind, exc, attempts)     # an inner port without the hook
 
     def _backoff_wait(self, delay: float) -> None:
         """The back-off, at the halt gate: a halt or the stop file ends it at once (the throttled call is asked again on resume)."""
@@ -446,7 +464,7 @@ class ResilientPort:
                 self._wait_gate()                 # a halt or back-off may have started while this worker waited for a slot
                 self.journal.append({"t": "pending", "key": key, "task": name, "count_before": self._budget.count(),
                                      "concurrency": self.slots.limit, "ts": self._clock()})
-                self._tls.key = key
+                self._tls.key, self._tls.attempt, self._tls.decision = key, attempt, None
                 try:
                     res = self._inner.call(task, inputs, ctx=ctx)
                 except NotAdmitted as e:
@@ -462,9 +480,8 @@ class ResilientPort:
                         self.limited += 1
                     self.journal.append({"t": "limited", "key": key, "task": name, "attempt": attempt, "ts": self._clock()})
                     attempt += 1
-                    if not self.slots.adaptive or max(attempt, self._bump()) > self._retries:
-                        self.halt(e)              # a fixed concurrency stops at once; an adaptive one after its bounded retries
-                        raise
+                    if self._decision("refusal", e, attempt) is not None:
+                        raise                     # a fixed concurrency stops at once; an adaptive one after its bounded retries
                     self.slots.halve("allowance refusal")
                     paused, retry_after = True, None
                 except StageLimited as e:
@@ -481,15 +498,11 @@ class ResilientPort:
                     self.journal.append({"t": "throttled", "key": key, "task": name, "attempt": attempt, "ts": self._clock()})
                     attempt += 1
                     retry_after = getattr(e, "retry_after_s", None)
-                    if retry_after is not None and float(retry_after) > self._ra_ceiling:
-                        # the provider asks for a longer wait than a run sits through: stop resumably now, with no retry spent
-                        # (the inner port has already halted every worker under its charge lock, `_on_throttle`)
-                        err = self._ceiling_pause(retry_after)
-                        self.halt(err)
-                        raise err from None
-                    if attempt > self._retries:   # per call: a burst of throttles in flight together halves and goes on
-                        self.halt(e)
+                    h = self._decision("throttle", e, attempt)   # above the ceiling, or past max_retries (per call): a halt
+                    if h is e:
                         raise
+                    if h is not None:
+                        raise h from None         # the ceiling pause, with no retry spent
                     self.slots.halve("throttle")
                     paused = True
                 except BudgetExceeded as e:

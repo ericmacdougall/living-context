@@ -314,8 +314,9 @@ class CappedPort:
         # call that stops the stage, so no worker charges after it
         self.admit: Callable[[bool], Any] = lambda block: False
         self.on_halt: Callable[[BaseException], None] = lambda exc: None
-        # set by ResilientPort: a throttle's Retry-After, seen under the charge lock (a wait above the run's ceiling halts there)
-        self.on_throttle: Callable[[Optional[float]], None] = lambda retry_after_s: None
+        # set by ResilientPort: every throttle or allowance refusal is reported here UNDER the charge lock, where the run decides
+        # whether it halts the stage, so no other worker charges between the outcome and that decision
+        self.on_outcome: Callable[[str, BaseException], None] = lambda kind, exc: None
         self._log.parent.mkdir(parents=True, exist_ok=True)
 
     def _check_prompt(self, prompt: str) -> None:
@@ -325,6 +326,11 @@ class CappedPort:
             raise PortRefused("a gold-style id is in the prompt")
         if any(m and m in prompt for m in self._forbidden):
             raise PortRefused("a forbidden marker is in the prompt")
+
+    def _outcome(self, kind: str, exc: BaseException) -> BaseException:
+        """A throttle or allowance refusal, reported to the run under `_lock` (the caller holds it) before it is raised."""
+        self.on_outcome(kind, exc)
+        return exc
 
     def _halting(self, exc: BaseException) -> BaseException:
         """A call that stops the stage halts every worker before its lock is released (the caller holds `_lock`)."""
@@ -371,7 +377,7 @@ class CappedPort:
             if refused and LIMIT.search("%s\n%s\n%s" % (ro.stderr or "", res_text, ro.stdout if ro.rc != 0 else "")):
                 row.update(limited=True, error="limit")
                 self._append(row)
-                raise AllowanceRefused("allowance limit response at call %d" % n)
+                raise self._outcome("refusal", AllowanceRefused("allowance limit response at call %d" % n))
             self._fail_streak = self._fail_streak + 1 if ro.rc != 0 else 0
             if self._fail_streak >= MAX_CLI_FAILURE_STREAK:
                 row.update(error="cli_error")
@@ -380,7 +386,7 @@ class CappedPort:
             if THROTTLE.search(ro.stderr or "") or (ro.rc != 0 and THROTTLE.search(ro.stdout or "")):
                 row.update(throttled=True, error="throttled")
                 self._append(row)
-                raise StagePaused("throttle response at call %d" % n)
+                raise self._outcome("throttle", StagePaused("throttle response at call %d" % n))
             env = self._envelope(ro.stdout)
             row.update(self._usage(env))
             text = env.get("result") if isinstance(env, dict) else None
@@ -437,8 +443,8 @@ class CappedPort:
             if rep.throttled:
                 row.update(throttled=True, error="throttled", retry_after_s=rep.retry_after_s)
                 self._append(row)
-                self.on_throttle(rep.retry_after_s)
-                raise StagePaused("throttled (HTTP %s) at call %d" % (rep.status, n), retry_after_s=rep.retry_after_s)
+                raise self._outcome("throttle", StagePaused("throttled (HTTP %s) at call %d" % (rep.status, n),
+                                                            retry_after_s=rep.retry_after_s))
             failed = bool(rep.error) or rep.text is None
             self._fail_streak = self._fail_streak + 1 if failed else 0
             if self._fail_streak >= MAX_CLI_FAILURE_STREAK:

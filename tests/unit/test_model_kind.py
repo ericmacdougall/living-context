@@ -28,7 +28,7 @@ from living_context.model.port import Task
 from tests.security.test_run_s2_es import Runner
 from tests.unit import test_run_h1_guards as hg, test_run_s3_parallel as s3p, test_run_s6h1 as t6
 from tests.unit.test_muse_api import OR_KEY, Stub, completion, err_body
-from tests.unit.test_parallel import in_threads, route_inputs, seeded_node_ids
+from tests.unit.test_parallel import SafeRunner, in_threads, route_inputs, seeded_node_ids
 
 MODEL = "meta/muse-spark-1.3-contributor"
 
@@ -425,42 +425,80 @@ class PacedHalt(unittest.TestCase):
                 self.assertFalse(bt.is_alive(), cond)          # it does not sleep out the minute
                 self.nothing_more(tmp, cond, up, b, bbox, port)
 
+    def race(self, port):
+        """A's call holds the charge lock while it records its outcome; B is started then and blocks on that lock. Returns
+        (A's error, B's error) once both end. When A releases the lock, B must already see the stage's decision."""
+        inner, b_at_lock, box = port._inner, threading.Event(), {}
+
+        class AtLock:
+            def __init__(self, real):
+                self.real = real
+
+            def __enter__(self):
+                if threading.current_thread().name == "B":
+                    b_at_lock.set()
+                return self.real.__enter__()
+
+            def __exit__(self, *x):
+                return self.real.__exit__(*x)
+        inner._lock = AtLock(inner._lock)
+        append = inner._append
+
+        def a_records(row):
+            if threading.current_thread().name == "A" and "bt" not in box:
+                box["bt"], box["bbox"] = started(lambda: port.scoped("qb").call(Task.ROUTE, route_inputs(2)), "B")
+                self.assertTrue(b_at_lock.wait(10))
+                time.sleep(0.3)
+            append(row)
+        inner._append = a_records
+        a, abox = started(lambda: port.scoped("qa").call(Task.ROUTE, route_inputs(1)), "A")
+        a.join(10)
+        box["bt"].join(10)
+        return abox.get("err"), box["bbox"].get("err")
+
     def test_a_call_that_stops_the_stage_halts_the_others_before_its_charge_lock_is_released(self):
-        # B reaches the charge lock while A, holding it, records its mismatch: when A releases it, B must already see the halt
-        for cond in ("quota", "mismatch", "ceiling"):
+        # every outcome that stops the stage: a billing refusal, a mismatch, a wait above the ceiling, a throttle past its retries
+        for cond in ("quota", "mismatch", "ceiling", "exhausted"):
             with self.subTest(cond=cond), tempfile.TemporaryDirectory() as tmp:
-                up = Upstream(retry_after=7200, throttle=(1,)) if cond == "ceiling" else Upstream(**{cond: (1,)})
-                stop = cc.StagePaused if cond == "ceiling" else cc.StageLimited
-                b, port, _ = port_over(self, tmp, up, concurrency=2)
-                inner, b_at_lock, box = port._inner, threading.Event(), {}
-
-                class AtLock:
-                    def __init__(self, real):
-                        self.real = real
-
-                    def __enter__(self):
-                        if threading.current_thread().name == "B":
-                            b_at_lock.set()
-                        return self.real.__enter__()
-
-                    def __exit__(self, *x):
-                        return self.real.__exit__(*x)
-                inner._lock = AtLock(inner._lock)
-                append = inner._append
-
-                def a_records(row):              # A holds the charge lock here; B is sent to it and given time to block on it
-                    if threading.current_thread().name == "A" and "bt" not in box:
-                        box["bt"], box["bbox"] = started(lambda: port.scoped("qb").call(Task.ROUTE, route_inputs(2)), "B")
-                        self.assertTrue(b_at_lock.wait(10))
-                        time.sleep(0.3)
-                    append(row)
-                inner._append = a_records
-                a, abox = started(lambda: port.scoped("qa").call(Task.ROUTE, route_inputs(1)), "A")
-                a.join(10)
-                box["bt"].join(10)
-                self.assertIsInstance(abox.get("err"), stop, cond)
-                self.assertIsInstance(box["bbox"].get("err"), stop, cond)
+                up = (Upstream(retry_after=7200, throttle=(1,)) if cond == "ceiling" else Upstream(throttle=(1,)) if cond == "exhausted"
+                      else Upstream(**{cond: (1,)}))
+                stop = cc.StagePaused if cond in ("ceiling", "exhausted") else cc.StageLimited
+                b, port, _ = port_over(self, tmp, up, concurrency=2, max_retries=0 if cond == "exhausted" else 3)
+                aerr, berr = self.race(port)
+                self.assertIsInstance(aerr, stop, cond)
+                self.assertIsInstance(berr, stop, cond)
                 self.assertEqual((b.count(), up.n), (1, 1), cond)
+
+    def test_a_cli_allowance_refusal_halts_the_others_before_its_charge_lock_is_released(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp, sent = Path(tmp), []
+            b = Budget(tmp / "counter", 1000)
+
+            def refuses(prompt):
+                sent.append(1)
+                return cc.RunOut(1, "", "You've hit your usage limit", 0.01)
+            inner = cc.CappedPort(refuses, b, tmp / "calls.jsonl", model_id="m")
+            port = ResilientPort(inner, b, Journal(tmp / "journal.jsonl"), tmp / "STOP", concurrency=2, sleep=lambda s: None)
+            aerr, berr = self.race(port)
+            self.assertIsInstance(aerr, cc.AllowanceRefused)
+            self.assertIsInstance(berr, cc.AllowanceRefused)
+            self.assertEqual((b.count(), len(sent)), (1, 1))
+
+    def test_each_allowance_refusal_is_decided_once(self):
+        # adaptive, max_retries 2: two refusals then an answer go on; counted twice, the second would halt the stage
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp, sent = Path(tmp), []
+            b = Budget(tmp / "counter", 1000)
+            ok = cc.CappedPort(SafeRunner(), b, tmp / "x.jsonl", model_id="m")._run
+
+            def refuses_twice(prompt):
+                sent.append(1)
+                return cc.RunOut(1, "", "You've hit your usage limit", 0.01) if len(sent) <= 2 else ok(prompt)
+            inner = cc.CappedPort(refuses_twice, b, tmp / "calls.jsonl", model_id="m")
+            port = ResilientPort(inner, b, Journal(tmp / "journal.jsonl"), tmp / "STOP", concurrency=4, adaptive=True,
+                                 start_concurrency=4, max_retries=2, sleep=lambda s: None)
+            self.assertTrue(port.scoped("q").call(Task.ROUTE, route_inputs(1)).ok)
+            self.assertEqual((port.limited, b.count(), len(sent)), (2, 3, 3))
 
     def test_a_call_held_by_a_back_off_takes_a_new_pacer_turn_before_its_charge(self):
         # workers released together from a back-off must not charge in one unpaced burst
