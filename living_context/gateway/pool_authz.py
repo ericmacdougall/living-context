@@ -12,9 +12,10 @@ adds its pools and operations to it (union across calls), and a call that checks
 passes `carry=False` and then `carry(...)` the pools it actually reads (S). The server re-runs the collected needs under the shared side
 of the send fence at every hand-off (`recheck`, through `PoolTools.send_ok`).
 
-Visibility (review F16, round 4). Every operation that names or returns a pool without reading its content (pool_list, pool_describe, the
-pool_create receipt) passes the ONE live visibility check, `sees`, and carries the pseudo-need `VIEW` for each pool it names, which the
-hand-off re-runs through `sees` like any content need. `sees` is POOLS 2.7 applied to a pool's directory entry (id, label, card, class,
+Visibility (review F16, round 4). The operations that return pools without reading their content (pool_list, pool_describe) pass the
+ONE live visibility check, `sees`, at the call (`view`), and every answer that names a pool carries the pseudo-need `VIEW` for it (the
+pool_create receipt too, whose call is the administrator check, `sees`'s administrator lane), which the hand-off re-runs through `sees`
+like any content need. `sees` is POOLS 2.7 applied to a pool's directory entry (id, label, card, class,
 kind, private flag, state), which is administrator text visible to grantees (4.1):
 * a scoped token sees a pool when SOME operation of its scope on that pool passes check 4 now (active, in scope, held in the live grant
   table, class in the read or write set);

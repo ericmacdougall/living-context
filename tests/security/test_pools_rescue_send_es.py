@@ -23,14 +23,21 @@ class SendFenceE2E(SocketE2E):
     # the parent's own end-to-end test runs in its module; only the setup is shared here
     test_f6_mint_pools_review_and_revocation_through_the_socket_from_the_composition_root = None
 
+    k = 0
+
     def setUp(self):
         super().setUp()
+        # pools persist across the tests of the class (the tenant is reset per class) and labels are unique per tenant, so each test
+        # names its pools with its own letter
+        SendFenceE2E.k += 1
+        self.tag = "".join(chr(ord("a") + int(d)) for d in str(SendFenceE2E.k))
         ln = self.line
         adm = ln.mint(b"user-admin", {"session": "plain"})
         self.assertTrue(adm.get("ok"), adm)
         self.adm = adm["token"]
-        self.A = ln.call(self.adm, op="pool_create", cls="base", kind="team", label="fence alpha")["pool"]
-        self.B = ln.call(self.adm, op="pool_create", cls="base", kind="team", label="fence bravo")["pool"]
+        made = [ln.call(self.adm, op="pool_create", cls="base", kind="team", label=f"fence {w} {self.tag}") for w in ("alpha", "bravo")]
+        self.assertTrue(all(m.get("ok") for m in made), made)
+        self.A, self.B = (m["pool"] for m in made)
         for p in (self.A, self.B):
             self.assertTrue(ln.call(self.adm, op="pool_grant", who="user-carol", pool=p, ops=["query", "save"])["ok"])
         self.tok = self.scoped(b"user-carol", {self.A: ["query", "save"], self.B: ["query", "save"]}, "conv-fence")
@@ -137,7 +144,7 @@ class SendFenceE2E(SocketE2E):
 
     # ---- F16 (round 4): seeing a pool ---------------------------------------------------------------------------------------------
     def carded(self):
-        c = self.conn().call(self.adm, op="pool_create", cls="base", kind="team", label="fence carded", card=CARD)
+        c = self.conn().call(self.adm, op="pool_create", cls="base", kind="team", label=f"fence carded {self.tag}", card=CARD)
         self.assertTrue(c.get("ok"), c)
         self.assertTrue(self.conn().call(self.adm, op="pool_grant", who="user-carol", pool=c["pool"], ops=["query", "save"])["ok"])
         return c["pool"], self.scoped(b"user-carol", {c["pool"]: ["query", "save"], self.A: ["query", "save"]}, "conv-f16")

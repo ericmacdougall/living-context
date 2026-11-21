@@ -184,7 +184,8 @@ class ReplyNeedsGuard(unittest.TestCase):
         self.assertTrue({"pool_fetch", "pool_save", "pool_update", "pool_hold_show"} <= {op for op, _, _ in uncovered}, uncovered)
         # the directory answers checked at the call but not carried (round 3: list, describe and the create receipt were exempt)
         real_view = pool_admin.view
-        uncovered, _ = findings([mock.patch.object(pool_admin, "view", lambda *a, **kw: real_view(*a, **{**kw, "carry_needs": False}))])
+        uncovered, _ = findings([mock.patch.object(pool_admin, "view", lambda *a, **kw: real_view(*a, **{**kw, "carry_needs": False})),
+                                 mock.patch.object(pool_admin, "carry", lambda needs: None)])
         got = {(op, caller) for op, caller, _ in uncovered}
         self.assertTrue({("pool_list", c) for c in ("scoped", "member", "admin")} | {("pool_describe", c) for c in ("scoped", "member",
                         "admin")} | {("pool_create", "admin")} <= got, uncovered)

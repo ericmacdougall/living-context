@@ -310,9 +310,9 @@ Each entry names the passages, the reading the build follows and the test that k
   the token no longer resolving): it carries no pool and nothing the revoked token could read.
 - Seeing a pool (POOLS 2.4, 2.7, 4.1; F16, round 4). The earlier reading that `pool_list` and `pool_describe` answer metadata, checked by
   the token alone at the hand-off and by mint-time scope at the call, is withdrawn: a card is administrator text visible to grantees, and
-  2.7 counts "not granted" as unavailable. Every operation that names or returns a pool passes ONE live visibility check
-  (`pool_authz.sees`) at the call and carries the pseudo-need `VIEW` for each pool it names, which the send hand-off re-runs under the
-  fence (`pool_authz.recheck`), so an ungrant, a detach or a revoke between build and hand-off aborts a built listing, description or
+  2.7 counts "not granted" as unavailable. `pool_list` and `pool_describe` pass ONE live visibility check (`pool_authz.sees`) at the
+  call, and every answer that names a pool carries the pseudo-need `VIEW` for it (the `pool_create` receipt too, whose call is the
+  administrator check), which the send hand-off re-runs under the fence (`pool_authz.recheck`), so an ungrant, a detach or a revoke between build and hand-off aborts a built listing, description or
   create receipt whole. ASSUMPTION (which operations confer visibility, not settled by POOLS): a scoped token sees a pool when SOME
   operation of its scope on that pool passes check 4 now (active, in scope, live grant, class in the read set for query, retract and
   review or the write set for save and update); a plain session of a tenant administrator sees every pool of its tenant in any state

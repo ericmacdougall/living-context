@@ -11,10 +11,10 @@
   On start the directory is built from the authz copy and THEN the journal is applied on top, so a removed grant stays removed.
 * Every pool-related refusal is the one `unavailable` answer (2.7). A caller who is not entitled to see a pool gets the same
   answer for a pool that does not exist.
-* Seeing a pool (pool_list, pool_describe, the pool_create receipt) is the one live visibility check `pool_authz.sees` at the call (a
-  scoped token: some scope operation passes check 4 now; a tenant administrator's plain session: every pool; any other plain session:
-  some operation passes check 4 now), and every pool an answer names is carried with `VIEW`, so the send hand-off re-checks it under the
-  fence and an ungrant, detach or revoke aborts a built answer (review F16).
+* Seeing a pool (pool_list, pool_describe) is the one live visibility check `pool_authz.sees` at the call (a scoped token: some scope
+  operation passes check 4 now; a tenant administrator's plain session: every pool; any other plain session: some operation passes
+  check 4 now), and every pool an answer names (the pool_create receipt included, whose call is the administrator check) is carried
+  with `VIEW`, so the send hand-off re-checks it under the fence and an ungrant, detach or revoke aborts a built answer (review F16).
 """
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from typing import Any, Callable, Mapping, Optional
 from ..policy import ClassLattice, Principal, Role
 from ..policy import pools as pl
 from .class_reader import ClassReader, ReaderRefused
-from .pool_authz import view
+from .pool_authz import VIEW, carry, view
 from .indices import POOL_KINDS, TENANT_CLS, physical_name, pool_index
 from .provision import PURGE_SETTINGS, SLOWLOG_OFF, mapping_for
 from .revocation import RevocationService, Refused as TenantClosed
@@ -146,7 +146,7 @@ class PoolService:
             if not self._is_admin(p) and not self._b["member"]:
                 return UNAVAILABLE   # the same answer a missing pool gets
             if op == "pool_create":
-                return self.create(p, rec, req)
+                return self.create(p, req)
             if op == "pool_detach":
                 return self.set_state(req.get("pool"), pl.DETACHED)
             if op == "pool_reattach":
@@ -161,7 +161,7 @@ class PoolService:
             return UNAVAILABLE
         return REFUSED
 
-    def create(self, p: Principal, rec: Optional[Record], req: Mapping[str, Any]) -> dict:
+    def create(self, p: Principal, req: Mapping[str, Any]) -> dict:
         cls, kind, label, card = req.get("cls"), req.get("kind"), req.get("label"), req.get("card", "")
         if not isinstance(cls, str) or not self.lattice.declared(cls):
             return UNAVAILABLE
@@ -178,8 +178,9 @@ class PoolService:
         except Exception:
             self.dir.drop(self.tenant, pool.id)
             return UNAVAILABLE
-        if pool.id not in self._view(rec, [pool.id]):   # the receipt names the pool: carried with VIEW like every answer that does
-            return UNAVAILABLE
+        # the receipt names the pool: carried with VIEW, so the hand-off re-checks that the caller sees it (review F16). At the call the
+        # authority is the administrator check in `handle`, which is `pool_authz.sees`'s administrator lane for a pool that exists.
+        carry({pool.id: {VIEW}})
         return {"ok": True, "pool": pool.id}
 
     def list(self, p: Principal, rec: Optional[Record]) -> dict:
