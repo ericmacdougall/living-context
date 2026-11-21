@@ -54,8 +54,8 @@ def _int(v: Any) -> bool:
 
 def _shards_complete(body: Any) -> bool:
     shards = body.get("_shards") if isinstance(body, dict) else None
-    return isinstance(shards, dict) and shards.get("failed") == 0 and _int(shards.get("total")) \
-        and shards.get("successful") == shards.get("total")
+    return isinstance(shards, dict) and _int(shards.get("failed")) and shards["failed"] == 0 and _int(shards.get("total")) \
+        and _int(shards.get("successful")) and shards["successful"] == shards["total"]   # integers only: False == 0 and True == 1
 
 
 # ---- search and count -----------------------------------------------------------------------------------------------------------
@@ -86,11 +86,12 @@ def complete_count(status: int, body: Any) -> int:
 
 
 def broadcast(status: int, body: Any) -> None:
-    """A refresh, flush or force merge that reached every primary: HTTP 200 and a `_shards` section with integer counts and no failed
-    shard (an unassigned replica is not a failure; a primary that did not act is one)."""
+    """A refresh, flush or force merge that no shard failed: HTTP 200 and a `_shards` section with integer counts and `failed` 0. The
+    cluster counts an unassigned copy as neither successful nor failed, so this cannot prove that every primary acted (an unassigned
+    replica is normal); the reads that rely on a refresh are complete searches, which refuse while a primary is unassigned."""
     shards = body.get("_shards") if isinstance(body, dict) else None
-    if status != 200 or not isinstance(shards, dict) or shards.get("failed") != 0 or not _int(shards.get("total")) \
-            or not _int(shards.get("successful")):
+    if status != 200 or not isinstance(shards, dict) or not _int(shards.get("failed")) or shards["failed"] != 0 \
+            or not _int(shards.get("total")) or not _int(shards.get("successful")):
         raise IncompleteRead("broadcast operation failed")
 
 

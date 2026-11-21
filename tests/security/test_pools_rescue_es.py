@@ -21,6 +21,7 @@ from living_context.erasure import pool_scope, scan
 from living_context.erasure.pool_scope import PoolEraser
 from living_context.gateway import reads
 from living_context.gateway.indices import physical_name, pool_index
+from living_context.verifier import check
 from tests.security.test_pools_es import Base, T
 
 P = "prescue000000001"   # a pool id (16 characters) no other test uses
@@ -152,9 +153,9 @@ class AliasShapesES(Base):
         self.assertEqual(reads.setting_value(*adm.request("GET", f"/{self.alias}/_settings/{key}?flat_settings=true"), self.alias, key, True),
                          "0")
         reads.broadcast(*adm.request("POST", f"/{self.alias}/_forcemerge?only_expunge_deletes=true"))
-        st, r = adm.request("GET", f"/_resolve/index/lc-{T}-rescue*")
-        self.assertEqual(st, 200, r)
-        self.assertTrue({self.phys, self.bare} <= {x.get("name") for x in r["indices"]}, r)
+        # the listing the verifier's residue check reads (verifier/check.py pool_residue), judged by its own `_listed`
+        names = check._listed(*adm.request("GET", f"/_resolve/index/lc-{T}-*"), "round 6 shapes")
+        self.assertTrue({self.phys, self.bare} <= set(names), names)
         fresh = f"lc-{T}-rescuefresh"
         self.addCleanup(adm.request, "DELETE", f"/{fresh}")
         reads.index_created(*adm.request("PUT", f"/{fresh}", {"settings": {"number_of_shards": 1, "number_of_replicas": 0}}), fresh)

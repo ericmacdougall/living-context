@@ -6,6 +6,7 @@ function that sends a request (`<client>.request(...)`, or a call of another suc
 refuse every answer of MALFORMED with `IncompleteRead`, and accept one well-formed answer (the control, so a judge that refuses
 everything cannot pass). A helper given a permanently malformed answer must refuse at its first request (it never spins)."""
 import ast
+import copy
 import unittest
 from pathlib import Path
 
@@ -69,46 +70,105 @@ HELPER_CASES = {
 PREDICATES = {"version_conflict": "the typed 409 test of `doc_written`: a bool, never an accepted answer"}
 
 
-# The document judges look inside the body, so a malformed answer can also be a well-formed one with one field wrong. Each case starts
-# from the answer the cluster gives (tests/unit/fake_es.py, pinned by tests/security/test_pools_rescue_es.py) and breaks one field at a
-# time: dropped, or set to each WRONG value. Every such answer must be refused, and so must the right body under any other status.
+# Every judge looks inside the body, so a malformed answer can also be a well-formed one with one field wrong. Each case of FIELD_CASES
+# starts from the answer the cluster gives (tests/unit/fake_es.py and tests/security/test_pools_rescue_es.py pin these shapes) and
+# breaks one field at a time, at any depth: the field dropped (a dictionary key; dropping a list item can leave a valid answer), or set
+# to each wrong value listed for it. Every such answer must be refused, and so must the unbroken body under any other status.
+STATUSES = (200, 201, 404, 409, 500, 503)
+PHYS = IX + "-p0a0b0c0d"
+OTHER = "lc-tenb-base-ctl"
+SH = {"total": 1, "successful": 1, "failed": 0}
+# a complete `_shards` section (searches, counts, points in time): every shard successful, none failed, integers only
+COMPLETE = [(("_shards",), ("x", None)), (("_shards", "failed"), (1, "0", False, None)), (("_shards", "total"), ("1", True, None)),
+            (("_shards", "successful"), (0, "1", True, None))]
+# a broadcast (refresh, flush, force merge, stats): no failed shard, integer counts (an unassigned copy is not counted as failed)
+BROADCAST = [(("_shards",), ("x", None)), (("_shards", "failed"), (1, "0", False, None)), (("_shards", "total"), ("1", True, None)),
+             (("_shards", "successful"), ("1", True, None))]
+# a write or delete acknowledgement: the primary applied it
+LANDED = [(("_shards",), ("x", None)), (("_shards", "successful"), (0, "1", True, None)), (("_shards", "failed"), ("0", True, None))]
+SEQ = [(("_seq_no",), ("1", -1, True, None)), (("_primary_term",), (0, "1", True, None))]
+ABOUT = [(("_index",), (OTHER, IX + "-pnothex00", 7)), (("_id",), ("d2", 7))]
+
+
+def at(prefix, fields):
+    return [(prefix + path, wrong) for path, wrong in fields]
+
+
 FOUND, NOT_FOUND = doc_answer("GET", IX, DID, True, {})[1], doc_answer("GET", IX, DID, False)[1]
 WROTE, DELETED, NOT_THERE = doc_answer("PUT", IX, DID, True)[1], doc_answer("DELETE", IX, DID, True)[1], doc_answer("DELETE", IX, DID, False)[1]
-WRONG = {
-    "_index": ("lc-tenb-base-ctl", IX + "-pnothex00", 7),
-    "_id": ("d2", 7),
-    "found": ("true", 1, None),
-    "result": ("noop", None),
-    "_seq_no": ("1", -1, True, None),
-    "_primary_term": (0, "1", True, None),
-    "_source": ("x", [], None),
-    "_shards": ({"total": 1, "successful": 0, "failed": 0}, {"total": 1, "successful": 1}, "x"),
-}
-STATUSES = (200, 201, 404, 409, 500, 503)
-# case -> (validator, the arguments after (status, body), the statuses it accepts this body under, how the body sits in the answer,
-#          the well-formed body, the fields the judge must check)
+HITS = {"timed_out": False, "_shards": SH, "hits": {"hits": [{"_index": IX, "_id": DID}]}}
+HITS_OFF = [(("timed_out",), (True, "false", None)), (("terminated_early",), (True,)), *COMPLETE, (("hits",), ("x", None, [])),
+            (("hits", "hits"), ("x", None, {})), (("hits", "hits", 0), ("x", None))]
+STATS = {"_shards": SH, "_all": {"primaries": {"docs": {"deleted": 2}}}, "indices": {IX: {"primaries": {"docs": {"deleted": 2}}}}}
+
+# case -> (validator, the arguments after (status, body), the statuses it accepts this body under, the well-formed body,
+#          [(path into the body, the wrong values for that field)])
 FIELD_CASES = {
-    "doc_read found": ("doc_read", (IX, DID, True), (200,), lambda d: d, FOUND,
-                       ("_index", "_id", "found", "_seq_no", "_primary_term", "_source")),
-    "doc_read absent": ("doc_read", (IX, DID, True), (404,), lambda d: d, NOT_FOUND, ("_index", "_id", "found")),
-    "doc_written": ("doc_written", (IX, DID, True), (200, 201), lambda d: d, WROTE,
-                    ("_index", "_id", "result", "_seq_no", "_primary_term", "_shards")),
-    "doc_deleted": ("doc_deleted", (IX, DID, True), (200,), lambda d: d, DELETED,
-                    ("_index", "_id", "result", "_seq_no", "_primary_term", "_shards")),
-    "doc_deleted not there": ("doc_deleted", (IX, DID, True), (404,), lambda d: d, NOT_THERE,
-                              ("_index", "_id", "result", "_seq_no", "_primary_term")),
-    "mget_items found": ("mget_items", ([(IX, DID)], True), (200,), lambda d: {"docs": [d]}, FOUND,
-                         ("_index", "_id", "found", "_seq_no", "_primary_term", "_source")),
-    "mget_items absent": ("mget_items", ([(IX, DID)], True), (200,), lambda d: {"docs": [d]}, NOT_FOUND, ("_index", "_id", "found")),
+    "complete_hits": ("complete_hits", (), (200,), HITS, HITS_OFF),
+    "complete_search": ("complete_search", (), (200,), HITS, HITS_OFF),
+    "complete_count": ("complete_count", (), (200,), {"count": 3, "_shards": SH}, [(("count",), ("3", -1, True, 3.0, None)), *COMPLETE]),
+    "broadcast": ("broadcast", (), (200,), {"_shards": SH}, BROADCAST),
+    "alias_answer": ("alias_answer", (IX,), (200,), {PHYS: {"aliases": {IX: {}}}},
+                     [((PHYS,), ("x", None, {})), ((PHYS, "aliases"), ("x", None, [], {})), ((OTHER + "-p0a0b0c0d",), ({"aliases": {}},))]),
+    "pit_answer": ("pit_answer", (IX, True), (200,), {"id": "pit1", "_shards": SH}, [(("id",), ("", 7, None)), *COMPLETE]),
+    "doc_read found": ("doc_read", (IX, DID, True), (200,), FOUND,
+                       [*ABOUT, (("found",), ("true", 1, None)), *SEQ, (("_source",), ("x", [], None))]),
+    "doc_read absent": ("doc_read", (IX, DID, True), (404,), NOT_FOUND, [*ABOUT, (("found",), ("false", 0, None))]),
+    "doc_written": ("doc_written", (IX, DID, True), (200, 201), WROTE, [*ABOUT, (("result",), ("noop", None)), *SEQ, *LANDED]),
+    "doc_deleted": ("doc_deleted", (IX, DID, True), (200,), DELETED, [*ABOUT, (("result",), ("noop", None)), *SEQ, *LANDED]),
+    "doc_deleted not there": ("doc_deleted", (IX, DID, True), (404,), NOT_THERE, [*ABOUT, (("result",), ("noop", None)), *SEQ]),
+    "mget_items found": ("mget_items", ([(IX, DID)], True), (200,), {"docs": [FOUND]},
+                         [(("docs",), ("x", None, [], {})), *at(("docs", 0), [*ABOUT, (("found",), ("true", 1, None)), *SEQ,
+                                                                           (("_source",), ("x", [], None)), (("error",), ({},))])]),
+    "mget_items absent": ("mget_items", ([(IX, DID)], True), (200,), {"docs": [NOT_FOUND]},
+                          at(("docs", 0), [*ABOUT, (("found",), ("false", 0, None)), (("error",), ({"type": "index_not_found_exception"},))])),
+    "acknowledged": ("acknowledged", (), (200,), {"acknowledged": True}, [(("acknowledged",), (False, "true", 1, None))]),
+    "index_created": ("index_created", (IX,), (200,), {"acknowledged": True, "shards_acknowledged": True, "index": IX},
+                      [(("acknowledged",), (False, "true", 1, None)), (("index",), (OTHER, PHYS, None))]),
+    "setting_value": ("setting_value", (IX, "index.k", True), (200,), {IX: {"settings": {"index.k": "0"}}},
+                      [((IX,), ("x", None, {})), ((IX, "settings"), ("x", None, {})), ((OTHER,), ({"settings": {"index.k": "0"}},))]),
+    "deleted_docs": ("deleted_docs", (IX, True), (200,), STATS,
+                     [*BROADCAST, (("_all",), ("x", None)), (("_all", "primaries", "docs", "deleted"), ("2", 3, None)),
+                      (("indices",), ("x", None, {})), (("indices", IX), ("x", None)), (("indices", IX, "primaries"), ("x", None)),
+                      (("indices", IX, "primaries", "docs"), ("x", None)), (("indices", IX, "primaries", "docs", "deleted"), ("2", -1, True, 3, None)),
+                      (("indices", OTHER), ({"primaries": {"docs": {"deleted": 2}}},))]),
+    "api_keys_active": ("api_keys_active", ("lc-",), (200,), {"api_keys": [{"id": "k1", "name": "lc-tena-reader", "invalidated": False}]},
+                        [(("api_keys",), ("x", None, {})), (("api_keys", 0), ("x", None)), (("api_keys", 0, "id"), ("", 7, None)),
+                         (("api_keys", 0, "name"), ("other-reader", 7, None)), (("api_keys", 0, "invalidated"), ("false", 0, None))]),
+    "api_keys_invalidated": ("api_keys_invalidated", (), (200,),
+                             {"error_count": 0, "invalidated_api_keys": ["k1"], "previously_invalidated_api_keys": []},
+                             [(("error_count",), (1, "0", False, None)), (("invalidated_api_keys",), ("k1", None, {})),
+                              (("invalidated_api_keys", 0), (7, None)), (("previously_invalidated_api_keys",), ("x", None))]),
+    "api_key_created": ("api_key_created", ("lc-tena-reader",), (200,), {"id": "k1", "name": "lc-tena-reader", "encoded": "eA=="},
+                        [(("id",), ("", 7, None)), (("name",), ("lc-tena-writer", None)), (("encoded",), ("", 7, None))]),
 }
 
 
-def one_field_off(good, fields, absent_case):
-    """(what, body) for every body that differs from `good` by one field of `fields`: the field dropped, or set to a WRONG value."""
-    for f in fields:
-        yield f"{f} dropped", {k: v for k, v in good.items() if k != f}
-        for v in WRONG[f] + (("false", 0) if f == "found" and absent_case else ()):
-            yield f"{f}={v!r}", dict(good, **{f: v})
+def _put(body, path, value, drop=False):
+    """A deep copy of `body` with the field at `path` set to `value` (or, `drop`, removed)."""
+    out = copy.deepcopy(body)
+    x = out
+    for k in path[:-1]:
+        x = x[k]
+    if drop:
+        del x[path[-1]]
+    else:
+        x[path[-1]] = value
+    return out
+
+
+def one_field_off(good, fields):
+    """(what, body) for every body that differs from `good` by one field: a present dictionary key dropped, or a field set to each of
+    its wrong values."""
+    for path, wrong in fields:
+        name = ".".join(map(str, path))
+        parent = good
+        for k in path[:-1]:
+            parent = parent[k]
+        if isinstance(parent, dict) and path[-1] in parent:
+            yield f"{name} dropped", _put(good, path, None, drop=True)
+        for v in wrong:
+            yield f"{name}={v!r}", _put(good, path, v)
 
 
 class Client:
@@ -182,29 +242,31 @@ class Contract(unittest.TestCase):
 
 
 class FieldShapes(unittest.TestCase):
-    def test_every_document_judge_is_covered_here(self):
-        self.assertEqual({v[0] for v in FIELD_CASES.values()}, {"doc_read", "doc_written", "doc_deleted", "mget_items"})
+    def test_every_validator_has_field_cases(self):
+        # VALIDATORS is itself checked against the AST enumeration of reads.py (Contract above), so a new judge fails here until it
+        # has cases of its own
+        self.assertEqual({v[0] for v in FIELD_CASES.values()}, set(reads.VALIDATORS))
 
     def test_control_each_judge_accepts_the_answer_of_the_cluster(self):
-        for case, (name, args, ok, wrap, good, _) in FIELD_CASES.items():
+        for case, (name, args, ok, good, _) in FIELD_CASES.items():
             for st in ok:
                 with self.subTest(case, status=st):
-                    getattr(reads, name)(st, wrap(dict(good)), *args)
+                    getattr(reads, name)(st, copy.deepcopy(good), *args)
 
     def test_one_field_off_is_refused(self):
-        for case, (name, args, ok, wrap, good, fields) in FIELD_CASES.items():
-            for what, body in one_field_off(good, fields, "found" in good and good["found"] is False):
+        for case, (name, args, ok, good, fields) in FIELD_CASES.items():
+            for what, body in one_field_off(good, fields):
                 for st in ok:
                     with self.subTest(case, field=what, status=st):
                         with self.assertRaises(reads.IncompleteRead):
-                            getattr(reads, name)(st, wrap(body), *args)
+                            getattr(reads, name)(st, body, *args)
 
     def test_the_right_body_under_another_status_is_refused(self):
-        for case, (name, args, ok, wrap, good, _) in FIELD_CASES.items():
+        for case, (name, args, ok, good, _) in FIELD_CASES.items():
             for st in set(STATUSES) - set(ok):
                 with self.subTest(case, status=st):
                     with self.assertRaises(reads.IncompleteRead):
-                        getattr(reads, name)(st, wrap(dict(good)), *args)
+                        getattr(reads, name)(st, copy.deepcopy(good), *args)
 
     def test_a_multi_get_item_with_an_error_is_not_an_absence(self):
         item = {"_index": IX, "_id": DID, "error": {"type": "index_not_found_exception", "index": IX}}
