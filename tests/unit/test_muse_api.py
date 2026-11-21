@@ -323,6 +323,9 @@ class Responses(Base):
         self.assertEqual(ra({"Retry-After": "7"}), 7)
         self.assertEqual(ra({"Retry-After": "172800"}), 172800)
         self.assertEqual(ra({"Retry-After": "9" * 40}), ma.RETRY_AFTER_MAX_S)          # held at a representable maximum
+        for digits in (4301, 5000):          # past Python's integer string limit: held too, never a ValueError after the charge
+            self.assertEqual(ra({"Retry-After": "9" * digits}), ma.RETRY_AFTER_MAX_S)
+        self.assertEqual(ra({"Retry-After": "0" * 5000 + "7"}), 7)                      # leading zeros are still the number
         dated = ra({"Retry-After": email.utils.formatdate(time.time() + 7200, usegmt=True)})
         self.assertTrue(7100 <= dated <= 7200, dated)
         self.assertEqual(ra({"Retry-After": email.utils.formatdate(time.time() - 600, usegmt=True)}), 0)   # a date passed: no wait

@@ -449,7 +449,9 @@ class MusePort:
             return None
         s = str(v).strip()
         if s.isascii() and s.isdigit():
-            return min(int(s), RETRY_AFTER_MAX_S)
+            s = s.lstrip("0") or "0"
+            # more digits than the maximum has is above it; never int() an unbounded string (Python limits its length)
+            return RETRY_AFTER_MAX_S if len(s) > len(str(RETRY_AFTER_MAX_S)) else min(int(s), RETRY_AFTER_MAX_S)
         try:
             when = email.utils.parsedate_to_datetime(s)
         except (TypeError, ValueError, IndexError, OverflowError):
