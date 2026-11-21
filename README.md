@@ -88,9 +88,10 @@ more gold sessions, n = 59) gives A0 0.441, A0+LEN 0.458, A1 0.475, tree-only
   run.
 - **Post hoc.** A1 minus A0 is +0.126 on the 30 questions also used in the
   earlier pilot and +0.021 [-0.052, +0.096] on the other 64.
-- A length effect is present (A1 brings in longer sessions than it drops), but
-  a length prior alone barely moves recall (A0+LEN minus A0 is +0.005), so it
-  does not explain A1.
+- A length explanation has not been tested. The length prior (A0+LEN) was
+  fitted on these same 94 questions and changes recall on one of them, so it is
+  too weak a control; the length-matched random list the plan also registers was
+  not run.
 - An earlier 30-question pilot on a different model (Claude Sonnet) had the
   tree alone as the best arm; on this larger pilot with a different model it is
   the worst. Model, n, pool and tree depth all changed, and the 30 questions are

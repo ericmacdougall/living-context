@@ -14,7 +14,7 @@ are means.
 | Arm | What it is |
 |---|---|
 | A0 | Flat hybrid search (BM25 over text, title and entities, plus e5 dense, fused). No model calls. |
-| A0+LEN | A0 re-ranked with a session-length prior (control for "the tree just prefers long sessions"). |
+| A0+LEN | A0's top 50 re-ranked by RRF score plus beta times ln(session tokens); beta chosen from a seven-value grid on these same 94 questions (in-sample). A weak control: it changes recall on 1 of 94. |
 | A1 | Tree recall fused with the direct flat list by reciprocal-rank fusion (RRF). |
 | A1-tree-only | The tree list alone. |
 | SHUFFLED-SUMMARIES | Tree with summaries shuffled across nodes (negative control; should be near chance). |
@@ -64,9 +64,11 @@ tree-only 0.322.
   will be tightened by an amendment before the confirmatory questions run.
 - **Per question:** A1 against A0, recall up on 17, down on 8, same on 69.
   Tree-only against A0: up 18, down 27.
-- **A length effect is present.** A1 brings in longer sessions than it drops
-  (length-entrant percentile shift +0.07, CI [0.02, 0.12]), but A0+LEN alone
-  barely moves (+0.005), so a length prior alone does not explain A1.
+- **The length explanation is untested.** The project's analysis reports that A1
+  brings in longer sessions than it drops (length-entrant percentile shift
+  +0.07, CI [0.02, 0.12]; not recomputable from the ledgers). A0+LEN was fitted
+  in-sample and changes one question of 94, so it does not rule a length effect
+  in or out.
 - **Post hoc.** A1 minus A0 is +0.126 on the 30 questions also used in S2 and
   +0.021 [-0.052, +0.096] on the other 64. Tree-only is shorter than 10 sessions
   on 42 of 94 questions (mean 7.3); against A0 cut to the same length it is
