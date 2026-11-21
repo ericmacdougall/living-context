@@ -8,11 +8,12 @@ authors:
 repository-code: "https://github.com/ericmacdougall/living-context"
 license: BUSL-1.1
 version: 0.1.0-dev
+date-released: 2026-11-21
 abstract: >-
   Layered, self-reorganising long-term memory for AI agents: size-bounded
-  leaves under a recursive summary tree, recall by parallel fan-out, graph
-  cross-links and an evidence-driven reorganisation loop. Experimental; the
-  method is not proven.
+  leaves under a recursive summary tree, recall by fan-out down the tree fused
+  with flat search. Graph cross-links and an evidence-driven reorganisation loop
+  are designed and not evaluated. Experimental; the method is not proven.
 keywords:
   - agent memory
   - retrieval
